@@ -1,0 +1,290 @@
+---
+title: Workflows
+description: Create repeatable multi-step workflows with phases, arguments, and agent fan-out.
+---
+
+Workflows let you define repeatable, project-specific automation that runs from the TUI. A workflow can collect arguments, report progress through phases, run steps in sequence, fan out work in parallel, and call agents for model-generated results.
+
+## Run a workflow
+
+Open the TUI:
+
+```bash frame="none"
+opencode
+```
+
+Start a workflow with `/workflow` followed by the workflow file name:
+
+```bash frame="none"
+/workflow release_notes version="1.4.0" audience="engineering team"
+```
+
+You can also open the workflow dashboard:
+
+```bash frame="none"
+/workflows
+```
+
+The dashboard shows recent runs, their status, current phase, logs, and per-agent telemetry.
+
+---
+
+## Create a workflow
+
+Create TypeScript or JavaScript files in `.opencode/workflows/`. The file name becomes the workflow command name.
+
+The easiest way to create workflows is using the `workflow()` helper, which provides type-safety for arguments and context.
+
+Create `.opencode/workflows/release_notes.ts`:
+
+```ts title=".opencode/workflows/release_notes.ts" {1,3}
+import { workflow } from "@opencode-ai/plugin"
+
+export default workflow({
+  name: "Release Notes",
+  description: "Draft release notes from a version and audience.",
+  phases: ["collect", "draft", "review", "summary"],
+  arguments: {
+    version: {
+      type: "string",
+      description: "Version to summarize.",
+    },
+    audience: {
+      type: "string",
+      default: "users",
+      description: "Who the release notes are written for.",
+    },
+  },
+
+  async run(args, ctx) {
+    const version = args.version ?? "next"
+    const audience = args.audience ?? "users"
+
+    ctx.setPhase("collect")
+    ctx.log(`Collecting release context for ${version}`)
+
+    ctx.setPhase("draft")
+    const draft = await ctx.agent({
+      agent: "build",
+      prompt: `Draft release notes for ${version}. Audience: ${audience}.`,
+    })
+
+    ctx.setPhase("review")
+    const reviews = await ctx.parallel([
+      () => ctx.agent({ agent: "plan", prompt: `Review for clarity:\n${draft.text}` }),
+      () => ctx.agent({ agent: "general", prompt: `Review for missing risks:\n${draft.text}` }),
+    ])
+
+    ctx.setPhase("summary")
+    return await ctx.agent({
+      agent: "build",
+      prompt: [
+        "Produce the final release notes.",
+        `Draft:\n${draft.text}`,
+        `Reviews:\n${reviews.map((item) => item.text).join("\n\n")}`,
+      ].join("\n\n"),
+    })
+  },
+})
+```
+
+Run it:
+
+```bash frame="none"
+/workflow release_notes version="1.4.0" audience="engineering team"
+```
+
+---
+
+## Metadata
+
+Each workflow defines metadata to describe how it appears in autocomplete and the workflow dashboard.
+
+```ts
+import { workflow } from "@opencode-ai/plugin"
+
+export default workflow({
+  name: "Release Notes",
+  description: "Draft release notes from a version and audience.",
+  phases: ["collect", "draft", "review", "summary"],
+  arguments: {
+    version: {
+      type: "string",
+      description: "Version to summarize.",
+    },
+  },
+  async run(args, ctx) {
+    // ...
+  },
+})
+```
+
+- `name` is the display name shown in the dashboard.
+- `description` appears in autocomplete and workflow lists.
+- `phases` defines the progress matrix shown in the run detail view.
+- `arguments` powers autocomplete for workflow parameters.
+
+Arguments support `type`, `default`, and `description`.
+
+---
+
+## Arguments
+
+Pass arguments as `name=value` pairs.
+
+```bash frame="none"
+/workflow release_notes version=1.4.0 audience="engineering team"
+```
+
+Use quotes for string values with spaces:
+
+```bash frame="none"
+/workflow release_notes audience="internal platform team"
+```
+
+You can also use `--name=value`:
+
+```bash frame="none"
+/workflow release_notes --version=1.4.0
+```
+
+Inside the workflow, arguments are available as `args`. When using `workflow()`, argument types are inferred from the `arguments` definition.
+
+```ts
+import { workflow } from "@opencode-ai/plugin"
+
+export default workflow({
+  name: "Example",
+  arguments: {
+    version: { type: "string" },
+  },
+  async run(args, ctx) {
+    const version = args.version ?? "next"
+  },
+})
+```
+
+---
+
+## Context API
+
+The second argument to `run` is `ctx`. Use it to update progress, emit logs, and run work.
+
+---
+
+### Phases and logs
+
+Use phases to keep the dashboard readable.
+
+```ts
+ctx.setPhase("collect")
+ctx.log("Collecting project context")
+```
+
+---
+
+### Agents
+
+Use `ctx.agent` when a step should ask an OpenCode agent to produce an answer.
+
+```ts
+const result = await ctx.agent({
+  agent: "plan",
+  prompt: "Review this migration plan for risks.",
+})
+
+ctx.log(result.text)
+```
+
+The returned value contains:
+
+- `text` - the model response as text.
+- `data` - the response payload. Currently this is the same text value unless structured output is added by the workflow runtime.
+
+---
+
+### Parallel fan-out
+
+Use `ctx.parallel` to run independent steps at the same time and wait for all of them.
+
+```ts
+const results = await ctx.parallel([
+  () => ctx.agent({ agent: "plan", prompt: "Find architecture risks." }),
+  () => ctx.agent({ agent: "general", prompt: "Find missing test coverage." }),
+])
+```
+
+This is useful for fan-out phases where multiple agents can inspect the same input from different perspectives.
+
+---
+
+### Pipelines
+
+Use `ctx.pipeline` when each step depends on the previous step's output.
+
+```ts
+const result = await ctx.pipeline(["initial input"], [
+  async (input) => {
+    ctx.setPhase("draft")
+    return await ctx.agent({ agent: "build", prompt: `Draft from:\n${input}` })
+  },
+  async (draft) => {
+    ctx.setPhase("review")
+    return await ctx.agent({ agent: "plan", prompt: `Review:\n${draft.text}` })
+  },
+])
+```
+
+Use pipelines for fan-in work, where one stage prepares input for the next.
+
+---
+
+## Patterns
+
+### Fan-out and fan-in
+
+A common workflow shape is:
+
+1. Collect or generate a brief.
+2. Fan out to multiple agents with `ctx.parallel`.
+3. Merge the results.
+4. Send the merged context to a final summarizing agent.
+
+```ts
+import { workflow } from "@opencode-ai/plugin"
+
+export default workflow({
+  name: "Fan Out Summary",
+  phases: ["brief", "parallel", "summary"],
+  async run(args, ctx) {
+  ctx.setPhase("brief")
+  const brief = await ctx.agent({ agent: "build", prompt: "Create a task brief." })
+
+  ctx.setPhase("parallel")
+  const findings = await ctx.parallel([
+    () => ctx.agent({ agent: "plan", prompt: `Check risks:\n${brief.text}` }),
+    () => ctx.agent({ agent: "general", prompt: `Check opportunities:\n${brief.text}` }),
+  ])
+
+  ctx.setPhase("summary")
+  return await ctx.agent({
+    agent: "build",
+    prompt: findings.map((item) => item.text).join("\n\n"),
+  })
+  },
+})
+```
+
+---
+
+## Dashboard
+
+Use `/workflows` to inspect previous runs.
+
+From a workflow run detail view:
+
+- **Enter** opens telemetry for the selected phase.
+- **Esc** or **B** goes back.
+- **Up** and **Down** select phases.
+
+The dashboard persists workflow run history, so completed and failed runs remain visible after they finish.

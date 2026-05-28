@@ -50,6 +50,8 @@ import { useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
+import { DialogWorkflow } from "../dialog-workflow"
+import { parseWorkflowArgs } from "./workflow-autocomplete"
 import {
   confirmWorkspaceFileChanges,
   openWorkspaceSelect,
@@ -1162,6 +1164,26 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
+    } else if (inputText.trim() === "/workflows") {
+      dialog.replace(() => <DialogWorkflow />)
+    } else if (inputText.startsWith("/workflow") || inputText.startsWith("/worfklow")) {
+      const firstLine = inputText.split("\n")[0]
+      const [, name, ...args] = firstLine.split(" ").filter(Boolean)
+      if (!name) {
+        dialog.replace(() => <DialogWorkflow />)
+      } else {
+        void sdk.client.workflow
+          .start({ name, workflowStartPayload: { args: parseWorkflowArgs(args.join(" ")) } })
+          .then((result) => {
+            if (!result.data) {
+              toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
+              return
+            }
+            toast.show({ message: `Started workflow ${name}`, variant: "info" })
+            if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
+          })
+          .catch(toast.error)
+      }
     } else if (
       inputText.startsWith("/") &&
       iife(() => {

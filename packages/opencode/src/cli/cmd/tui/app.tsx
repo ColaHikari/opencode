@@ -79,10 +79,12 @@ import {
 
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
+import { DialogWorkflow } from "./component/dialog-workflow"
 
 const appGlobalBindingCommands = [
   "session.list",
   "session.new",
+  "workflow.list",
   "session.quick_switch.1",
   "session.quick_switch.2",
   "session.quick_switch.3",
@@ -592,6 +594,15 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
             type: "home",
           })
           dialog.clear()
+        },
+      },
+      {
+        name: "workflow.list",
+        title: "Open workflows",
+        category: "Workflow",
+        slashName: "workflows",
+        run: () => {
+          dialog.replace(() => <DialogWorkflow />)
         },
       },
       {

@@ -21,6 +21,15 @@ import { useBindings, useCommandSlashes, useOpencodeModeStack } from "../../keym
 import { Reference } from "@/reference/reference"
 import { ConfigReference } from "@/config/reference"
 import { displayCharAt, mentionTriggerIndex } from "@/cli/cmd/prompt-display"
+import {
+  isWorkflowCommandInput,
+  listWorkflowInfos,
+  workflowArgContext,
+  workflowAutocompleteTriggerIndex,
+  workflowCommandOption,
+  workflowNameQuery,
+  workflowOptions,
+} from "./workflow-autocomplete"
 
 function removeLineRange(input: string) {
   const hashIndex = input.lastIndexOf("#")
@@ -154,6 +163,18 @@ export function Autocomplete(props: {
   createEffect(() => {
     const next = filter()
     setSearch(next ? next : "")
+  })
+
+  const workflowNameSearch = createMemo(() => {
+    if (!store.visible) return
+    props.value
+    return workflowNameQuery(props.input().plainText, props.input().cursorOffset)
+  })
+
+  const workflowArgSearch = createMemo(() => {
+    if (!store.visible) return
+    props.value
+    return workflowArgContext(props.input().plainText, props.input().cursorOffset)
   })
 
   // When the filter changes due to how TUI works, the mousemove might still be triggered
@@ -544,7 +565,7 @@ export function Autocomplete(props: {
   )
 
   const commands = createMemo((): AutocompleteOption[] => {
-    const results: AutocompleteOption[] = [...slashes()]
+    const results: AutocompleteOption[] = [...slashes(), workflowCommandOption(props.input())]
 
     for (const serverCommand of sync.data.command) {
       if (serverCommand.source === "skill") continue
@@ -572,20 +593,23 @@ export function Autocomplete(props: {
     }))
   })
 
-  const options = createMemo((prev: AutocompleteOption[] | undefined) => {
-    const filesValue = files()
-    const referenceFilesValue = referenceFiles()
-    const referenceSearchValue = referenceSearch()
-    const agentsValue = agents()
-    const referenceAliasesValue = referenceAliases()
-    const commandsValue = commands()
+  const [workflowInfos] = createResource(
+    () => workflowNameSearch() !== undefined || workflowArgSearch() !== undefined,
+    (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
+    { initialValue: [] },
+  )
 
+  const options = createMemo((prev: AutocompleteOption[] | undefined) => {
+    const workflow = workflowOptions(props.input(), workflowInfos(), {
+      arg: workflowArgSearch(),
+      name: workflowNameSearch(),
+    })
     const mixed: AutocompleteOption[] =
       store.visible === "@"
-        ? referenceSearchValue
-          ? referenceFilesValue || []
-          : [...referenceAliasesValue, ...agentsValue, ...(filesValue || []), ...mcpResources()]
-        : [...commandsValue]
+        ? referenceSearch()
+          ? referenceFiles() || []
+          : [...referenceAliases(), ...agents(), ...(files() || []), ...mcpResources()]
+        : (workflow ?? commands())
 
     const searchValue = search()
 
@@ -743,7 +767,12 @@ export function Autocomplete(props: {
 
   function hide() {
     const text = props.input().plainText
-    if (store.visible === "/" && !text.endsWith(" ") && text.startsWith("/")) {
+    if (
+      store.visible === "/" &&
+      !text.endsWith(" ") &&
+      text.startsWith("/") &&
+      !isWorkflowCommandInput(text)
+    ) {
       const cursor = props.input().logicalCursor
       props.input().deleteRange(0, 0, cursor.row, cursor.col)
       // Sync the prompt store immediately since onContentChange is async
@@ -769,6 +798,11 @@ export function Autocomplete(props: {
       },
       onInput(value) {
         if (store.visible) {
+          const nestedSlashIndex = workflowAutocompleteTriggerIndex(value, props.input().cursorOffset)
+          if (store.visible === "/" && nestedSlashIndex !== undefined) {
+            setStore("index", nestedSlashIndex)
+            return
+          }
           if (
             // Typed text before the trigger
             props.input().cursorOffset <= store.index ||
@@ -790,6 +824,13 @@ export function Autocomplete(props: {
         if (value.startsWith("/") && !value.slice(0, offset).match(/\s/)) {
           show("/")
           setStore("index", 0)
+          return
+        }
+
+        const nestedSlashIndex = workflowAutocompleteTriggerIndex(value, offset)
+        if (nestedSlashIndex !== undefined) {
+          show("/")
+          setStore("index", nestedSlashIndex)
           return
         }
 
@@ -862,9 +903,12 @@ export function Autocomplete(props: {
                 {option().display}
               </text>
               <Show when={option().description}>
-                <text fg={index === store.selected ? selectedForeground(theme) : theme.textMuted} wrapMode="none">
-                  {option().description}
-                </text>
+                <>
+                  <text flexShrink={0}> </text>
+                  <text fg={index === store.selected ? selectedForeground(theme) : theme.textMuted} wrapMode="none">
+                    {option().description}
+                  </text>
+                </>
               </Show>
             </box>
           )}

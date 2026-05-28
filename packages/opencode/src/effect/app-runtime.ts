@@ -46,6 +46,7 @@ import { Vcs } from "@/project/vcs"
 import { Reference } from "@/reference/reference"
 import { Workspace } from "@/control-plane/workspace"
 import { Worktree } from "@/worktree"
+import { Workflow } from "@/workflow/workflow"
 import { Pty } from "@/pty"
 import { PtyTicket } from "@/pty/ticket"
 import { Installation } from "@/installation"
@@ -105,6 +106,7 @@ export const AppLayer = Layer.mergeAll(
   Reference.defaultLayer,
   Workspace.defaultLayer,
   Worktree.appLayer,
+  Workflow.defaultLayer,
   Pty.defaultLayer,
   PtyTicket.defaultLayer,
   Installation.defaultLayer,

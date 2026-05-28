@@ -1,0 +1,51 @@
+import { Workflow } from "@/workflow/workflow"
+import { Effect } from "effect"
+import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { InstanceHttpApi } from "../api"
+import { type StartPayload, WorkflowApiError } from "../groups/workflow"
+
+function apiError(error: Workflow.InvalidError | Workflow.NotFoundError) {
+  if (error._tag === "WorkflowInvalidError") return new WorkflowApiError({ message: error.message, workflow: error.path })
+  return new WorkflowApiError({ message: `Workflow not found: ${error.name}`, workflow: error.name })
+}
+
+export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow", (handlers) =>
+  Effect.gen(function* () {
+    const workflow = yield* Workflow.Service
+
+    const list = Effect.fn("WorkflowHttpApi.list")(function* () {
+      return yield* workflow.list().pipe(Effect.mapError(apiError))
+    })
+
+    const runs = Effect.fn("WorkflowHttpApi.runs")(function* () {
+      return yield* workflow.runs()
+    })
+
+    const get = Effect.fn("WorkflowHttpApi.get")(function* (ctx: { params: { id: string } }) {
+      return (yield* workflow.get(ctx.params.id)) ?? null
+    })
+
+    const start = Effect.fn("WorkflowHttpApi.start")(function* (ctx: {
+      params: { name: string }
+      payload?: StartPayload
+    }) {
+      return yield* workflow.start({ name: ctx.params.name, args: ctx.payload?.args }).pipe(Effect.mapError(apiError))
+    })
+
+    const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: string } }) {
+      return (yield* workflow.cancel(ctx.params.id)) ?? null
+    })
+
+    const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: string } }) {
+      return yield* workflow.remove(ctx.params.id)
+    })
+
+    return handlers
+      .handle("list", list)
+      .handle("runs", runs)
+      .handle("get", get)
+      .handle("start", start)
+      .handle("cancel", cancel)
+      .handle("remove", remove)
+  }),
+)

@@ -3,6 +3,7 @@ import {
   createContext,
   createEffect,
   createMemo,
+  createResource,
   createSignal,
   For,
   Match,
@@ -62,6 +63,7 @@ import { DialogConfirm } from "@tui/ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
+import { DialogWorkflow } from "../../component/dialog-workflow"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { LANGUAGE_EXTENSIONS } from "@/lsp/language"
@@ -143,6 +145,7 @@ const sessionBindingCommands = [
   "session.copy",
   "session.export",
   "session.child.first",
+  "session.workflow.open",
   "session.parent",
   "session.child.next",
   "session.child.previous",
@@ -247,6 +250,13 @@ export function Session() {
   const toast = useToast()
   const sdk = useSDK()
   const editor = useEditorContext()
+  const [workflowRun] = createResource(
+    () => route.sessionID,
+    async (sessionID) => {
+      const result = await sdk.client.workflow.runs()
+      return result.data?.find((run) => run.session_id === sessionID)
+    },
+  )
 
   createEffect(() => {
     const sessionID = route.sessionID
@@ -419,6 +429,8 @@ export function Session() {
     navigate({
       type: "session",
       sessionID,
+      workflowRunID: route.workflowRunID,
+      workflowReturnSessionID: route.workflowReturnSessionID,
     })
     const status = sync.data.session_status[sessionID]
     if (status?.type === "retry") void DialogAlert.show(dialog, "Retry Error", status.message)
@@ -439,6 +451,12 @@ export function Session() {
     if (next >= sessions.length) next = 0
     if (next < 0) next = sessions.length - 1
     if (sessions[next]) enterChild(sessions[next].id)
+  }
+
+  function openWorkflowRun() {
+    const run = workflowRun()
+    if (!run) return
+    dialog.replace(() => <DialogWorkflow openRunID={run.id} />)
   }
 
   function childSessionHandler(func: () => void) {
@@ -1017,12 +1035,31 @@ export function Session() {
       },
     },
     {
+      title: "Open workflow details",
+      value: "session.workflow.open",
+      category: "Session",
+      hidden: true,
+      enabled: !!workflowRun(),
+      run: () => {
+        openWorkflowRun()
+      },
+    },
+    {
       title: "Go to parent session",
       value: "session.parent",
       category: "Session",
       hidden: true,
       enabled: !!session()?.parentID,
       run: childSessionHandler(() => {
+        if (route.workflowRunID) {
+          navigate(
+            route.workflowReturnSessionID
+              ? { type: "session", sessionID: route.workflowReturnSessionID }
+              : { type: "home" },
+          )
+          dialog.replace(() => <DialogWorkflow openRunID={route.workflowRunID} />)
+          return
+        }
         const parentID = session()?.parentID
         if (parentID) {
           navigate({
@@ -1087,6 +1124,7 @@ export function Session() {
   }))
 
   const revertInfo = createMemo(() => session()?.revert)
+  const workflowShortcut = useCommandShortcut("session.workflow.open")
   const revertMessageID = createMemo(() => revertInfo()?.messageID)
 
   const revertDiffFiles = createMemo(() => getRevertDiffFiles(revertInfo()?.diff ?? ""))
@@ -1248,6 +1286,18 @@ export function Session() {
                     </Switch>
                   )}
                 </For>
+                <Show when={workflowRun()}>
+                  {(run) => (
+                    <box paddingTop={1} paddingLeft={3}>
+                      <text fg={theme.text}>
+                        {workflowShortcut()}
+                        <span style={{ fg: theme.textMuted }}>
+                          {" "}open workflow details for {run().workflow} ({run().id.replace(/^job_/, "#")})
+                        </span>
+                      </text>
+                    </box>
+                  )}
+                </Show>
               </scrollbox>
               <box flexShrink={0}>
                 <Show when={permissions().length > 0}>
