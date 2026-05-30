@@ -23,23 +23,8 @@ function timestamp(value: unknown) {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function formatDuration(run: WorkflowRun) {
-  return formatElapsed(run.started_at, run.completed_at)
-}
-
 function formatShortDuration(run: WorkflowRun) {
   return formatShortElapsed(run.started_at, run.completed_at)
-}
-
-function formatElapsed(started_at: unknown, completed_at?: unknown) {
-  const start = timestamp(started_at)
-  if (!start) return "--:--"
-  const seconds = Math.max(0, Math.floor(((timestamp(completed_at) ?? Date.now()) - start) / 1000))
-  return `${Math.floor(seconds / 3600)
-    .toString()
-    .padStart(2, "0")}:${Math.floor((seconds % 3600) / 60)
-    .toString()
-    .padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}`
 }
 
 function formatShortElapsed(started_at: unknown, completed_at?: unknown) {
@@ -53,14 +38,14 @@ function formatShortElapsed(started_at: unknown, completed_at?: unknown) {
     .padStart(2, "0")}m`
 }
 
-function formatStarted(value: unknown) {
+function formatStartedShort(value: unknown) {
   const time = timestamp(value)
-  if (!time) return "unknown"
+  if (!time) return "--"
   const date = new Date(time)
-  return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, "0")}-${date
-    .getDate()
+  return `${(date.getMonth() + 1).toString().padStart(2, "0")}-${date.getDate().toString().padStart(2, "0")} ${date
+    .getHours()
     .toString()
-    .padStart(2, "0")} ${date.getHours().toString().padStart(2, "0")}:${date.getMinutes().toString().padStart(2, "0")}`
+    .padStart(2, "0")}:${date.getMinutes().toString().padStart(2, "0")}`
 }
 
 function statusIcon(status: WorkflowRun["status"]) {
@@ -267,6 +252,63 @@ function fitColumns(left: string, right: string, width: number) {
   return `${prefix.padEnd(Math.max(0, size - suffix.length - 1))} ${suffix}`
 }
 
+function fitCell(value: string, width: number, align: "left" | "right" = "left") {
+  const text = Locale.truncate(value, Math.max(1, width))
+  return align === "right" ? text.padStart(width) : text.padEnd(width)
+}
+
+function shortRunID(run: WorkflowRun) {
+  return `#${run.id.replace(/^job_/, "").slice(-8)}`
+}
+
+function statusLabel(status: WorkflowRun["status"]) {
+  if (status === "completed") return "done"
+  if (status === "cancelled") return "cancel"
+  return status
+}
+
+function dashboardPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
+  if (run.status !== "running") return run.status === "completed" ? "complete" : (run.current_phase ?? run.status)
+  return formatPhase(run, workflow)
+}
+
+function dashboardWidths(width: number) {
+  const total = Math.max(72, width)
+  const fixed = 2 + 10 + 8 + 11 + 7 + 8 + 7
+  const available = Math.max(24, total - fixed)
+  const workflow = Math.min(30, Math.max(14, Math.floor(available * 0.42)))
+  return { workflow, phase: Math.max(12, available - workflow) }
+}
+
+function dashboardRowText(
+  input: {
+    marker: string
+    id: string
+    workflow: string
+    status: string
+    started: string
+    duration: string
+    phase: string
+    tokens: string
+  },
+  width: number,
+) {
+  const columns = dashboardWidths(width)
+  return Locale.truncate(
+    [
+      fitCell(input.marker, 2),
+      fitCell(input.id, 10),
+      fitCell(input.workflow, columns.workflow),
+      fitCell(input.status, 8),
+      fitCell(input.started, 11),
+      fitCell(input.duration, 7, "right"),
+      fitCell(input.phase, columns.phase),
+      fitCell(input.tokens, 8, "right"),
+    ].join(" "),
+    width,
+  )
+}
+
 function sectionTitle(title: string, width: number) {
   return ` ${title} ${"─".repeat(Math.max(0, width - title.length - 2))}`
 }
@@ -275,19 +317,6 @@ function scrollIndexIntoView(scroll: ScrollBoxRenderable | undefined, index: num
   if (!scroll) return
   if (index < scroll.scrollTop) scroll.scrollBy(index - scroll.scrollTop)
   if (index >= scroll.scrollTop + scroll.height) scroll.scrollBy(index - scroll.scrollTop - scroll.height + 1)
-}
-
-function rowText(columns: string[]) {
-  return [
-    columns[0].padEnd(2),
-    columns[1].padEnd(8),
-    Locale.truncate(columns[2], 20).padEnd(22),
-    columns[3].padEnd(12),
-    columns[4].padEnd(17),
-    columns[5].padEnd(10),
-    Locale.truncate(columns[6], 24).padEnd(26),
-    columns[7],
-  ].join(" ")
 }
 
 export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string; openAgentID?: string }) {
@@ -312,6 +341,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   const workflows = createMemo(() => data()?.workflows ?? [])
   const selected = createMemo(() => runs()[store.selected])
   const activeWorkers = createMemo(() => runs().filter((run) => run.status === "running").length)
+  const tableWidth = createMemo(() => Math.max(40, dimensions().width - 5))
   const spentThisMonth = createMemo(() => {
     const start = new Date()
     start.setDate(1)
@@ -430,17 +460,29 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     >
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.text} attributes={TextAttributes.BOLD}>
-          OpenCode Workflows Master Dashboard
+          OpenCode Workflows
         </text>
         <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
           esc
         </text>
       </box>
-      <text fg={theme.textMuted}>Select a run and press [Enter] to inspect isolated step metadata.</text>
-      <text fg={theme.textMuted}>
-        {rowText(["", "ID", "WORKFLOW NAME", "STATUS", "STARTED", "DURATION", "ACTIVE PHASE", "TOKENS"])}
+      <text fg={theme.textMuted}>Select a run and press [Enter] to inspect phases, agents, and results.</text>
+      <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+        {dashboardRowText(
+          {
+            marker: "",
+            id: "RUN",
+            workflow: "WORKFLOW",
+            status: "STATUS",
+            started: "STARTED",
+            duration: "DUR",
+            phase: "PHASE",
+            tokens: "TOKENS",
+          },
+          tableWidth(),
+        )}
       </text>
-      <text fg={theme.textMuted}>{"─".repeat(Math.max(40, dimensions().width - 5))}</text>
+      <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
 
       <scrollbox
         ref={(element: ScrollBoxRenderable) => (scroll = element)}
@@ -470,17 +512,20 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                 onMouseDown={() => setStore("selected", index())}
                 onMouseUp={openSelected}
               >
-                <text fg={active() ? selectedForeground(theme) : theme.text}>
-                  {rowText([
-                    active() ? "❯" : "",
-                    run.id.replace(/^job_/, "#"),
-                    run.workflow,
-                    `${statusIcon(run.status)} ${run.status.toUpperCase()}`,
-                    formatStarted(run.started_at),
-                    formatDuration(run),
-                    formatPhase(run, workflow(run)),
-                    formatTokens(runUsage(run).tokens.total),
-                  ])}
+                <text fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
+                  {dashboardRowText(
+                    {
+                      marker: active() ? "›" : "",
+                      id: shortRunID(run),
+                      workflow: run.workflow,
+                      status: `${statusIcon(run.status)} ${statusLabel(run.status)}`,
+                      started: formatStartedShort(run.started_at),
+                      duration: formatShortDuration(run),
+                      phase: dashboardPhase(run, workflow(run)),
+                      tokens: formatShortTokens(runUsage(run).tokens.total),
+                    },
+                    tableWidth(),
+                  )}
                 </text>
               </box>
             )
@@ -488,7 +533,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
         </For>
       </scrollbox>
 
-      <text fg={theme.textMuted}>{"─".repeat(Math.max(40, dimensions().width - 5))}</text>
+      <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.textMuted}>
           Spent this month: {formatCost(spentThisMonth())} | Active Background Workers: {activeWorkers()}
