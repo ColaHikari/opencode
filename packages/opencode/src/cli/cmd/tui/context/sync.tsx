@@ -520,17 +520,19 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         },
         async sync(sessionID: string) {
           if (fullSyncedSessions.has(sessionID)) return
-          const [session, messages, todo, diff] = await Promise.all([
-            sdk.client.session.get({ sessionID }, { throwOnError: true }),
-            sdk.client.session.messages({ sessionID, limit: 100 }),
-            sdk.client.session.todo({ sessionID }),
-            sdk.client.session.diff({ sessionID }),
+          const session = await sdk.client.session.get({ sessionID }, { throwOnError: true })
+          const info = session.data
+          if (!info) return
+          const [messages, todo, diff] = await Promise.all([
+            sdk.client.session.messages({ sessionID, directory: info.directory, workspace: info.workspaceID, limit: 100 }),
+            sdk.client.session.todo({ sessionID, directory: info.directory, workspace: info.workspaceID }),
+            sdk.client.session.diff({ sessionID, directory: info.directory, workspace: info.workspaceID }),
           ])
           setStore(
             produce((draft) => {
               const match = Binary.search(draft.session, sessionID, (s) => s.id)
-              if (match.found) draft.session[match.index] = session.data!
-              if (!match.found) draft.session.splice(match.index, 0, session.data!)
+              if (match.found) draft.session[match.index] = info
+              if (!match.found) draft.session.splice(match.index, 0, info)
               draft.todo[sessionID] = todo.data ?? []
               const infos: (typeof draft.message)[string] = []
               for (const message of messages.data ?? []) {

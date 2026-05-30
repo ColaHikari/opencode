@@ -7,9 +7,10 @@ import { useSDK } from "@tui/context/sdk"
 import { selectedForeground, useTheme } from "@tui/context/theme"
 import { useDialog } from "@tui/ui/dialog"
 import { useToast } from "@tui/ui/toast"
-import { createEffect, createMemo, createResource, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useBindings } from "../keymap"
+import * as Clipboard from "../util/clipboard"
 import { getScrollAcceleration } from "../util/scroll"
 
 type WorkflowData = {
@@ -26,6 +27,10 @@ function formatDuration(run: WorkflowRun) {
   return formatElapsed(run.started_at, run.completed_at)
 }
 
+function formatShortDuration(run: WorkflowRun) {
+  return formatShortElapsed(run.started_at, run.completed_at)
+}
+
 function formatElapsed(started_at: unknown, completed_at?: unknown) {
   const start = timestamp(started_at)
   if (!start) return "--:--"
@@ -37,10 +42,15 @@ function formatElapsed(started_at: unknown, completed_at?: unknown) {
     .padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}`
 }
 
-function formatTime(value: unknown) {
-  const time = timestamp(value)
-  if (!time) return "unknown"
-  return new Date(time).toLocaleTimeString()
+function formatShortElapsed(started_at: unknown, completed_at?: unknown) {
+  const start = timestamp(started_at)
+  if (!start) return "--"
+  const seconds = Math.max(0, Math.floor(((timestamp(completed_at) ?? Date.now()) - start) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m${(seconds % 60).toString().padStart(2, "0")}s`
+  return `${Math.floor(seconds / 3600)}h${Math.floor((seconds % 3600) / 60)
+    .toString()
+    .padStart(2, "0")}m`
 }
 
 function formatStarted(value: unknown) {
@@ -50,10 +60,7 @@ function formatStarted(value: unknown) {
   return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, "0")}-${date
     .getDate()
     .toString()
-    .padStart(2, "0")} ${date.getHours().toString().padStart(2, "0")}:${date
-    .getMinutes()
-    .toString()
-    .padStart(2, "0")}`
+    .padStart(2, "0")} ${date.getHours().toString().padStart(2, "0")}:${date.getMinutes().toString().padStart(2, "0")}`
 }
 
 function statusIcon(status: WorkflowRun["status"]) {
@@ -83,6 +90,7 @@ function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
     : Array.from(
         new Set([
           ...run.logs.flatMap((item) => (item.phase ? [item.phase] : [])),
+          ...run.agents.flatMap((agent) => (agent.phase ? [agent.phase] : [])),
           ...(run.current_phase ? [run.current_phase] : []),
         ]),
       )
@@ -109,18 +117,6 @@ function phaseIcon(status: ReturnType<typeof phaseStatus>) {
   return "◌"
 }
 
-function formatValue(value: unknown) {
-  if (value === undefined) return ""
-  return typeof value === "string" ? value : JSON.stringify(value, null, 2)
-}
-
-function formatResult(value: unknown) {
-  if (!value || typeof value !== "object") return formatValue(value)
-  if ("final" in value && typeof value.final === "string") return value.final
-  if ("summary" in value && typeof value.summary === "string") return value.summary
-  return formatValue(value)
-}
-
 function runUsage(run: WorkflowRun) {
   const cost = run.agents.reduce((total, agent) => total + (agent.cost ?? 0), 0)
   const tokens = run.agents.reduce(
@@ -131,8 +127,7 @@ function runUsage(run: WorkflowRun) {
       cache: total.cache + (agent.tokens?.cache.read ?? 0) + (agent.tokens?.cache.write ?? 0),
       total:
         total.total +
-        (agent.tokens?.total ??
-          (agent.tokens ? agent.tokens.input + agent.tokens.output + agent.tokens.reasoning : 0)),
+        (agent.tokens?.total ?? (agent.tokens ? agent.tokens.input + agent.tokens.output + agent.tokens.reasoning : 0)),
     }),
     { input: 0, output: 0, reasoning: 0, cache: 0, total: 0 },
   )
@@ -144,9 +139,142 @@ function formatTokens(value: number) {
   return new Intl.NumberFormat().format(value)
 }
 
+function formatShortTokens(value: number) {
+  if (value <= 0) return "--"
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1).replace(/\.0$/, "")}k`
+  return value.toString()
+}
+
 function formatCost(value: number) {
   if (value <= 0) return "--"
   return `$${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`
+}
+
+function agentTokens(agent: WorkflowRun["agents"][number]) {
+  return agent.tokens?.total ?? (agent.tokens ? agent.tokens.input + agent.tokens.output + agent.tokens.reasoning : 0)
+}
+
+function phaseAgents(run: WorkflowRun, phase?: string) {
+  if (!phase) return run.agents
+  return run.agents.filter((agent) => agent.phase === phase)
+}
+
+type WorkflowPhaseRow = { type: "agent"; agent: WorkflowRun["agents"][number] } | { type: "result" }
+
+function resultPhase(run: WorkflowRun, phases: readonly string[]) {
+  if (run.result === undefined) return
+  if (run.current_phase && phases.includes(run.current_phase)) return run.current_phase
+  return phases.at(-1)
+}
+
+function phaseRows(run: WorkflowRun, phases: readonly string[], phase?: string): WorkflowPhaseRow[] {
+  const rows: WorkflowPhaseRow[] = phaseAgents(run, phase).map((agent) => ({ type: "agent", agent }))
+  if (phase && phase === resultPhase(run, phases)) rows.push({ type: "result" })
+  return rows
+}
+
+function phaseProgress(run: WorkflowRun, phases: readonly string[], phase: string) {
+  const rows = phaseRows(run, phases, phase)
+  if (rows.length === 0) return ""
+  return `${rows.filter((row) => row.type === "result" || row.agent.status !== "running").length}/${rows.length}`
+}
+
+function agentProgress(run: WorkflowRun) {
+  if (run.agents.length === 0) return "0 agents"
+  return `${run.agents.filter((agent) => agent.status !== "running").length}/${run.agents.length} agents`
+}
+
+function agentLabel(agent: WorkflowRun["agents"][number]) {
+  return agent.agent ?? `agent:${agent.id}`
+}
+
+function modelLabel(agent: WorkflowRun["agents"][number]) {
+  if (!agent.model) return "default"
+  const model = agent.model.split("/").at(-1) ?? agent.model
+  return model.replace(/^claude-/, "Claude ").replace(/-/g, " ")
+}
+
+function agentMetrics(agent: WorkflowRun["agents"][number]) {
+  return [
+    agentTokens(agent) > 0 ? `${formatShortTokens(agentTokens(agent))} tok` : undefined,
+    agent.cost && agent.cost > 0 ? formatCost(agent.cost) : undefined,
+    formatShortElapsed(agent.started_at, agent.completed_at),
+  ]
+    .filter((item) => item !== undefined)
+    .join(" · ")
+}
+
+function phaseRowLabel(row: WorkflowPhaseRow) {
+  if (row.type === "result") return "workflow:result"
+  return agentLabel(row.agent)
+}
+
+function phaseRowModel(row: WorkflowPhaseRow) {
+  if (row.type === "result") return "local workflow"
+  return modelLabel(row.agent)
+}
+
+function phaseRowMetrics(run: WorkflowRun, row: WorkflowPhaseRow) {
+  if (row.type === "result") return `0 tok · ${formatShortDuration(run)}`
+  return agentMetrics(row.agent)
+}
+
+function phaseRowIcon(row: WorkflowPhaseRow) {
+  if (row.type === "result") return "✔"
+  return agentIcon(row.agent.status)
+}
+
+function phaseRowTitle(phase: string | undefined, rows: readonly WorkflowPhaseRow[]) {
+  const agents = rows.filter((row) => row.type === "agent").length
+  const result = rows.some((row) => row.type === "result")
+  if (!result) return `${phase ?? "Phase"} · ${agents} agents`
+  if (agents === 0) return `${phase ?? "Phase"} · result`
+  return `${phase ?? "Phase"} · ${agents} agents + result`
+}
+
+function workflowResultText(result: unknown) {
+  if (typeof result === "string") return result
+  if (result && typeof result === "object" && "summary" in result && typeof result.summary === "string") {
+    return result.summary
+  }
+  return JSON.stringify(result, null, 2) ?? String(result)
+}
+
+function wrapResultText(result: unknown, width: number) {
+  const limit = Math.max(20, width)
+  return workflowResultText(result)
+    .split("\n")
+    .flatMap((line) => {
+      if (line.length === 0) return [""]
+      const chunks = [] as string[]
+      let rest = line
+      while (rest.length > limit) {
+        const index = rest.lastIndexOf(" ", limit) > 0 ? rest.lastIndexOf(" ", limit) : limit
+        chunks.push(rest.slice(0, index))
+        rest = rest.slice(index).trimStart()
+      }
+      chunks.push(rest)
+      return chunks
+    })
+}
+
+function fitColumns(left: string, right: string, width: number) {
+  const size = Math.max(1, width)
+  if (!right) return Locale.truncate(left, size)
+  const suffix = Locale.truncate(right, size)
+  const prefix = Locale.truncate(left, Math.max(1, size - suffix.length - 1))
+  return `${prefix.padEnd(Math.max(0, size - suffix.length - 1))} ${suffix}`
+}
+
+function sectionTitle(title: string, width: number) {
+  return ` ${title} ${"─".repeat(Math.max(0, width - title.length - 2))}`
+}
+
+function scrollIndexIntoView(scroll: ScrollBoxRenderable | undefined, index: number) {
+  if (!scroll) return
+  if (index < scroll.scrollTop) scroll.scrollBy(index - scroll.scrollTop)
+  if (index >= scroll.scrollTop + scroll.height) scroll.scrollBy(index - scroll.scrollTop - scroll.height + 1)
 }
 
 function rowText(columns: string[]) {
@@ -162,7 +290,7 @@ function rowText(columns: string[]) {
   ].join(" ")
 }
 
-export function DialogWorkflow(props?: { openRunID?: string }) {
+export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string; openAgentID?: string }) {
   const dialog = useDialog()
   const sdk = useSDK()
   const toast = useToast()
@@ -209,9 +337,21 @@ export function DialogWorkflow(props?: { openRunID?: string }) {
     const run = runs().find((item) => item.id === props.openRunID)
     if (!run || workflows().length === 0) return
     openedInitial = true
-    dialog.replace(() => <DialogWorkflowRun id={run.id} initial={run} workflows={workflows()} />, undefined, {
-      notifyClose: false,
-    })
+    dialog.replace(
+      () => (
+        <DialogWorkflowRun
+          id={run.id}
+          initial={run}
+          workflows={workflows()}
+          initialPhase={props.openPhase}
+          initialAgentID={props.openAgentID}
+        />
+      ),
+      undefined,
+      {
+        notifyClose: false,
+      },
+    )
   })
 
   onMount(() => {
@@ -280,7 +420,14 @@ export function DialogWorkflow(props?: { openRunID?: string }) {
   }))
 
   return (
-    <box width={dimensions().width} height={dimensions().height - 1} paddingLeft={2} paddingRight={2} paddingBottom={1} gap={1}>
+    <box
+      width={dimensions().width}
+      height={dimensions().height - 1}
+      paddingLeft={2}
+      paddingRight={2}
+      paddingBottom={1}
+      gap={1}
+    >
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.text} attributes={TextAttributes.BOLD}>
           OpenCode Workflows Master Dashboard
@@ -346,42 +493,126 @@ export function DialogWorkflow(props?: { openRunID?: string }) {
         <text fg={theme.textMuted}>
           Spent this month: {formatCost(spentThisMonth())} | Active Background Workers: {activeWorkers()}
         </text>
-        <text fg={theme.textMuted}>[Enter] View Details | [X] Kill workflow run | [D] Delete history | [Esc]/[B] Exit</text>
+        <text fg={theme.textMuted}>
+          [Enter] View Details | [X] Kill workflow run | [D] Delete history | [Esc]/[B] Exit
+        </text>
       </box>
     </box>
   )
 }
 
-function DialogWorkflowRun(props: { id: string; initial: WorkflowRun; workflows: WorkflowInfo[] }) {
+function DialogWorkflowRun(props: {
+  id: string
+  initial: WorkflowRun
+  workflows: WorkflowInfo[]
+  initialPhase?: string
+  initialAgentID?: string
+}) {
   const dialog = useDialog()
   const route = useRoute()
   const sdk = useSDK()
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
+  const [copyNotice, setCopyNotice] = createSignal(false)
   dialog.setSize("fullscreen")
-  let scroll: ScrollBoxRenderable | undefined
+  let phaseScroll: ScrollBoxRenderable | undefined
+  let agentScroll: ScrollBoxRenderable | undefined
+  let copyNoticeTimeout: ReturnType<typeof setTimeout> | undefined
 
   const [run, { refetch }] = createResource(async () => {
     const result = await sdk.client.workflow.get({ id: props.id })
     return result.data ?? props.initial
   })
   const current = createMemo(() => run() ?? props.initial)
-  const usage = createMemo(() => runUsage(current()))
   const workflow = createMemo(() => props.workflows.find((item) => item.name === current().workflow))
   const phases = createMemo(() => runPhases(current(), workflow()))
-  const [store, setStore] = createStore({ runID: "", selectedPhase: 0, view: "overview" as "overview" | "telemetry" })
+  const [store, setStore] = createStore({
+    runID: "",
+    selectedPhase: 0,
+    selectedAgent: 0,
+    resultOffset: 0,
+  })
+  const selectedPhase = createMemo(() => phases()[store.selectedPhase] ?? phases()[0])
+  const selectedPhaseRows = createMemo(() => phaseRows(current(), phases(), selectedPhase()))
+  const selectedRow = createMemo(() => selectedPhaseRows()[store.selectedAgent])
+  const selectedResult = createMemo(() => selectedRow()?.type === "result" && current().result !== undefined)
+  const phasePanelWidth = createMemo(() => Math.min(44, Math.max(28, Math.floor((dimensions().width - 6) * 0.28))))
+  const agentPanelWidth = createMemo(() => Math.max(24, dimensions().width - phasePanelWidth() - 8))
+  const resultLines = createMemo(() => wrapResultText(current().result, agentPanelWidth() - 4))
+  const resultBodyLines = createMemo(() => Math.max(1, dimensions().height - 14))
+  const visibleResultLines = createMemo(() =>
+    resultLines().slice(store.resultOffset, store.resultOffset + resultBodyLines()),
+  )
+  const headerWidth = createMemo(() => Math.max(20, dimensions().width - 4))
+  const description = createMemo(() => {
+    const summary = workflow()?.meta.description ?? `Run ${current().id.replace(/^job_/, "#")}`
+    if (phases().length === 0) return summary
+    return `${summary}, across ${phases().length} phases`
+  })
 
   createEffect(() => {
     if (store.runID === current().id) return
+    const initialIndex = props.initialPhase ? phases().indexOf(props.initialPhase) : -1
+    const initialRows = initialIndex >= 0 ? phaseRows(current(), phases(), props.initialPhase) : []
+    const initialAgentIndex = props.initialAgentID
+      ? initialRows.findIndex((row) => row.type === "agent" && row.agent.id === props.initialAgentID)
+      : -1
     const currentPhase = current().current_phase
-    const next = currentPhase ? phases().indexOf(currentPhase) : 0
+    const currentIndex = currentPhase ? phases().indexOf(currentPhase) : -1
+    const currentRows = currentPhase ? phaseRows(current(), phases(), currentPhase).length : 0
+    const resultIndex = phases().findIndex((phase) => phase === resultPhase(current(), phases()))
+    const agentIndex = phases().findIndex((phase) => current().agents.some((agent) => agent.phase === phase))
+    const next =
+      initialIndex >= 0
+        ? initialIndex
+        : currentIndex >= 0 && currentRows > 0
+          ? currentIndex
+          : resultIndex >= 0
+            ? resultIndex
+            : agentIndex
     setStore("runID", current().id)
     if (next >= 0) {
       setStore("selectedPhase", next)
+      setStore("selectedAgent", initialAgentIndex >= 0 ? initialAgentIndex : 0)
+      setStore("resultOffset", 0)
       return
     }
-    if (store.selectedPhase >= phases().length) setStore("selectedPhase", 0)
+    if (store.selectedPhase >= phases().length) {
+      setStore("selectedPhase", 0)
+      setStore("selectedAgent", 0)
+      setStore("resultOffset", 0)
+    }
+  })
+
+  createEffect(() => {
+    if (store.selectedPhase < phases().length) return
+    setStore("selectedPhase", Math.max(0, phases().length - 1))
+    setStore("selectedAgent", 0)
+    setStore("resultOffset", 0)
+  })
+
+  createEffect(() => {
+    if (store.selectedAgent < selectedPhaseRows().length) return
+    setStore("selectedAgent", Math.max(0, selectedPhaseRows().length - 1))
+    setStore("resultOffset", 0)
+  })
+
+  createEffect(() => {
+    if (!selectedResult()) return
+    if (store.resultOffset <= Math.max(0, resultLines().length - resultBodyLines())) return
+    setStore("resultOffset", Math.max(0, resultLines().length - resultBodyLines()))
+  })
+
+  createEffect(() => {
+    const index = store.selectedPhase
+    requestAnimationFrame(() => scrollIndexIntoView(phaseScroll, index))
+  })
+
+  createEffect(() => {
+    const index = store.selectedAgent
+    if (selectedResult()) return
+    requestAnimationFrame(() => scrollIndexIntoView(agentScroll, index))
   })
 
   onMount(() => {
@@ -389,6 +620,10 @@ function DialogWorkflowRun(props: { id: string; initial: WorkflowRun; workflows:
       if (current().status === "running") void refetch()
     }, 1000)
     onCleanup(() => clearInterval(interval))
+  })
+
+  onCleanup(() => {
+    if (copyNoticeTimeout) clearTimeout(copyNoticeTimeout)
   })
 
   const back = () => dialog.replace(() => <DialogWorkflow />, undefined, { notifyClose: false })
@@ -403,43 +638,17 @@ function DialogWorkflowRun(props: { id: string; initial: WorkflowRun; workflows:
       .catch(toast.error)
   }
 
-  function selectedPhase() {
-    return phases()[store.selectedPhase] ?? phases()[0]
-  }
-
-  function selectedPhaseStatus() {
-    const phase = selectedPhase()
-    if (!phase) return "pending" as const
-    return phaseStatus(current(), phases(), phase)
-  }
-
-  function selectedPhaseLogs() {
-    const phase = selectedPhase()
-    if (!phase) return current().logs
-    return current().logs.filter((item) => item.phase === phase)
-  }
-
-  function selectedPhaseAgents() {
-    const phase = selectedPhase()
-    if (!phase) return current().agents
-    return current().agents.filter((agent) => agent.phase === phase)
-  }
-
-  function openTelemetry() {
-    setStore("view", "telemetry")
-  }
-
-  function closeTelemetry() {
-    setStore("view", "overview")
-  }
-
   function openAgentSession() {
-    const sessionID = selectedPhaseAgents().find((agent) => agent.session_id)?.session_id ?? current().agents.find((agent) => agent.session_id)?.session_id
+    const row = selectedRow()
+    if (row?.type === "result") return
+    const sessionID = row?.agent.session_id
     if (!sessionID) return
     route.navigate({
       type: "session",
       sessionID,
       workflowRunID: current().id,
+      workflowPhase: selectedPhase(),
+      workflowAgentID: row.agent.id,
       workflowReturnSessionID: route.data.type === "session" ? route.data.sessionID : undefined,
     })
     dialog.clear()
@@ -449,234 +658,289 @@ function DialogWorkflowRun(props: { id: string; initial: WorkflowRun; workflows:
     if (phases().length === 0) return
     const next = Math.max(0, Math.min(phases().length - 1, store.selectedPhase + direction))
     setStore("selectedPhase", next)
+    setStore("selectedAgent", 0)
+    setStore("resultOffset", 0)
+  }
+
+  function moveAgent(direction: number) {
+    if (selectedPhaseRows().length === 0) return
+    setStore(
+      "selectedAgent",
+      (store.selectedAgent + direction + selectedPhaseRows().length) % selectedPhaseRows().length,
+    )
+    setStore("resultOffset", 0)
+  }
+
+  function pageResult(direction: number) {
+    setStore(
+      "resultOffset",
+      Math.max(0, Math.min(Math.max(0, resultLines().length - resultBodyLines()), store.resultOffset + direction)),
+    )
+  }
+
+  function copySelectedResponse() {
+    const row = selectedRow()
+    const text = row?.type === "result" ? workflowResultText(current().result) : row?.agent.output
+    if (!text?.trim()) {
+      toast.show({ message: "No response to copy", variant: "info" })
+      return
+    }
+    void Clipboard.copy(text)
+      .then(() => {
+        setCopyNotice(true)
+        if (copyNoticeTimeout) clearTimeout(copyNoticeTimeout)
+        copyNoticeTimeout = setTimeout(() => setCopyNotice(false), 1800)
+        toast.show({ message: "Workflow response copied to clipboard", variant: "success" })
+      })
+      .catch(() => toast.show({ message: "Failed to copy workflow response", variant: "error" }))
   }
 
   useBindings(() => ({
-    bindings:
-      store.view === "overview"
-        ? [
-            { key: "b", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
-            { key: "escape", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
-            { key: "return", desc: "Open phase telemetry", group: "Workflow", cmd: openTelemetry },
-            { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancel },
-            { key: "up,k", desc: "Previous phase", group: "Workflow", cmd: () => movePhase(-1) },
-            { key: "down,j", desc: "Next phase", group: "Workflow", cmd: () => movePhase(1) },
-            {
-              key: "pageup,ctrl+b",
-              desc: "Page workflow details up",
-              group: "Workflow",
-              cmd: () => scroll?.scrollBy(-(scroll?.height ?? 10)),
-            },
-            {
-              key: "pagedown,ctrl+f",
-              desc: "Page workflow details down",
-              group: "Workflow",
-              cmd: () => scroll?.scrollBy(scroll?.height ?? 10),
-            },
-          ]
-        : [
-            { key: "b", desc: "Back to phase overview", group: "Workflow", cmd: closeTelemetry },
-            { key: "escape", desc: "Back to phase overview", group: "Workflow", cmd: closeTelemetry },
-            { key: "o", desc: "Open selected subagent", group: "Workflow", cmd: openAgentSession },
-            { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancel },
-            { key: "up,k", desc: "Scroll telemetry up", group: "Workflow", cmd: () => scroll?.scrollBy(-1) },
-            { key: "down,j", desc: "Scroll telemetry down", group: "Workflow", cmd: () => scroll?.scrollBy(1) },
-            {
-              key: "pageup,ctrl+b",
-              desc: "Page telemetry up",
-              group: "Workflow",
-              cmd: () => scroll?.scrollBy(-(scroll?.height ?? 10)),
-            },
-            {
-              key: "pagedown,ctrl+f",
-              desc: "Page telemetry down",
-              group: "Workflow",
-              cmd: () => scroll?.scrollBy(scroll?.height ?? 10),
-            },
-          ],
+    bindings: [
+      { key: "b", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
+      { key: "escape", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
+      { key: "return,o", desc: "Open selected subagent", group: "Workflow", cmd: openAgentSession },
+      { key: "y", desc: "Copy selected response", group: "Workflow", cmd: copySelectedResponse },
+      { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancel },
+      { key: "up,k", desc: "Previous phase", group: "Workflow", cmd: () => movePhase(-1) },
+      { key: "down,j", desc: "Next phase", group: "Workflow", cmd: () => movePhase(1) },
+      { key: "left,h", desc: "Previous phase agent", group: "Workflow", cmd: () => moveAgent(-1) },
+      { key: "right,l", desc: "Next phase agent", group: "Workflow", cmd: () => moveAgent(1) },
+      {
+        key: "pageup,ctrl+b",
+        desc: "Page workflow details up",
+        group: "Workflow",
+        cmd: () =>
+          selectedResult() ? pageResult(-resultBodyLines()) : agentScroll?.scrollBy(-(agentScroll?.height ?? 10)),
+      },
+      {
+        key: "pagedown,ctrl+f",
+        desc: "Page workflow details down",
+        group: "Workflow",
+        cmd: () =>
+          selectedResult() ? pageResult(resultBodyLines()) : agentScroll?.scrollBy(agentScroll?.height ?? 10),
+      },
+    ],
   }))
 
+  function PhaseRowItem(props: { row: WorkflowPhaseRow; index: () => number }) {
+    const active = createMemo(() => props.index() === store.selectedAgent)
+    const color = createMemo(() => {
+      if (active()) return theme.primary
+      if (props.row.type === "result") return theme.text
+      if (props.row.agent.status === "failed") return theme.error
+      if (props.row.agent.status === "completed") return theme.text
+      return theme.textMuted
+    })
+    const labelWidth = createMemo(() => Math.min(30, Math.max(14, Math.floor(agentPanelWidth() * 0.32))))
+    const rowText = createMemo(() =>
+      fitColumns(
+        `${active() ? "›" : phaseRowIcon(props.row)} ${Locale.truncate(phaseRowLabel(props.row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(props.row)}`,
+        phaseRowMetrics(current(), props.row),
+        agentPanelWidth() - 2,
+      ),
+    )
+
+    return (
+      <text
+        fg={active() ? theme.primary : color()}
+        wrapMode="none"
+        overflow="hidden"
+        onMouseDown={() => setStore("selectedAgent", props.index())}
+      >
+        {rowText()}
+      </text>
+    )
+  }
+
   return (
-    <box width={dimensions().width} height={dimensions().height - 1} paddingLeft={2} paddingRight={2} gap={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme.text} attributes={TextAttributes.BOLD}>
-          Workflow {current().id.replace(/^job_/, "#")}: {workflow()?.meta.name ?? current().workflow}
+    <box
+      width={dimensions().width}
+      height={dimensions().height - 1}
+      paddingLeft={2}
+      paddingRight={2}
+      paddingBottom={1}
+      gap={1}
+    >
+      <box height={2} flexShrink={0}>
+        <text fg={theme.primary} attributes={TextAttributes.BOLD} wrapMode="none" overflow="hidden">
+          {fitColumns(
+            workflow()?.meta.name ?? current().workflow,
+            `${agentProgress(current())} · ${formatShortDuration(current())}`,
+            headerWidth(),
+          )}
         </text>
-        <text fg={theme.textMuted} onMouseUp={back}>
-          esc/b
+        <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+          {fitColumns(description(), `${statusIcon(current().status)} ${current().status}`, headerWidth())}
         </text>
-      </box>
-      <box flexDirection="row" gap={2}>
-        <text fg={theme.text}>
-          Status: {statusIcon(current().status)} {current().status.toUpperCase()}
-        </text>
-        <text fg={theme.textMuted}>Elapsed: {formatDuration(current())}</text>
-        <text fg={theme.textMuted}>Tokens: {formatTokens(usage().tokens.total)}</text>
-        <text fg={theme.textMuted}>Cost: {formatCost(usage().cost)}</text>
       </box>
 
-      <scrollbox
-        ref={(element: ScrollBoxRenderable) => (scroll = element)}
+      <box
         flexGrow={1}
         minHeight={0}
-        verticalScrollbarOptions={{ visible: true }}
-        horizontalScrollbarOptions={{ visible: false }}
-        scrollAcceleration={getScrollAcceleration()}
+        flexDirection="row"
+        border={["top", "bottom", "left", "right"]}
+        borderColor={theme.border}
       >
-        <Show
-          when={store.view === "overview"}
-          fallback={
-            <box>
-              <box paddingTop={1}>
-                <text fg={theme.accent} attributes={TextAttributes.BOLD}>
-                  LIVE CONTEXT STREAM LOGS{selectedPhase() ? ` (${selectedPhase()} · ${selectedPhaseStatus()})` : ""}:
-                </text>
-              </box>
-              <WorkflowLogs logs={selectedPhaseLogs()} />
-
-              <box paddingTop={1}>
-                <text fg={theme.accent} attributes={TextAttributes.BOLD}>
-                  SUB-AGENT INSTANCE TELEMETRY:
-                </text>
-              </box>
-              <box paddingLeft={1}>
-                <text fg={theme.textMuted}>Selected phase: {selectedPhase()}</text>
-              </box>
-              <Show
-                when={selectedPhaseAgents().length}
-                fallback={
-                  <box paddingLeft={1}>
-                    <text fg={theme.textMuted}>No agent nodes recorded for this phase.</text>
-                  </box>
-                }
-              >
-                <For each={selectedPhaseAgents()}>
-                  {(agent) => (
-                    <box paddingLeft={1} paddingTop={1}>
-                      <text fg={theme.text}>
-                        ┌─ Agent Node #{agent.id} (Model: {agent.model ?? "default"})
-                      </text>
-                      <text fg={theme.textMuted}>│ Phase : {agent.phase ?? selectedPhase()}</text>
-                      <Show when={agent.session_id}>
-                        <text fg={theme.textMuted}>│ Session: {agent.session_id}</text>
-                      </Show>
-                      <text fg={agent.status === "failed" ? theme.error : theme.textMuted}>
-                        │ Status: {agentIcon(agent.status)} {agent.status}
-                      </text>
-                      <text fg={theme.textMuted} overflow="hidden" wrapMode="none">
-                        │ Input : {agent.prompt.split("\n")[0]}
-                      </text>
-                      <text fg={theme.textMuted}>
-                        │ Metric: {formatElapsed(agent.started_at, agent.completed_at)} elapsed ·{" "}
-                        {formatTokens(agent.tokens?.total ?? 0)} tokens · {formatCost(agent.cost ?? 0)}
-                      </text>
-                      <Show when={agent.error}>
-                        <text fg={theme.error}>│ Error : {agent.error}</text>
-                      </Show>
-                      <Show when={agent.output}>
-                        <text fg={theme.textMuted} wrapMode="word">
-                          │ Output: {agent.output}
-                        </text>
-                      </Show>
-                      <text fg={theme.text}>
-                        └────────────────────────────────────────────────────────────────────────────
-                      </text>
-                    </box>
-                  )}
-                </For>
-              </Show>
-            </box>
-          }
-        >
-          <box>
-            <box paddingTop={1}>
-              <text fg={theme.accent} attributes={TextAttributes.BOLD}>
-                PHASES PROGRESSION MATRIX:
-              </text>
-            </box>
+        <box width={phasePanelWidth()} paddingLeft={1} paddingRight={1} minHeight={0}>
+          <text fg={theme.text} wrapMode="none">
+            {sectionTitle("Phases", phasePanelWidth() - 2)}
+          </text>
+          <scrollbox
+            ref={(element: ScrollBoxRenderable) => (phaseScroll = element)}
+            flexGrow={1}
+            minHeight={0}
+            verticalScrollbarOptions={{ visible: false }}
+            horizontalScrollbarOptions={{ visible: false }}
+            scrollAcceleration={getScrollAcceleration()}
+          >
             <For each={phases()}>
               {(phase, index) => {
                 const status = createMemo(() => phaseStatus(current(), phases(), phase))
-                const logs = createMemo(() => current().logs.filter((item) => item.phase === phase))
                 const active = createMemo(() => index() === store.selectedPhase)
+                const marker = createMemo(() =>
+                  active() ? "›" : status() === "pending" ? `${index() + 1}` : phaseIcon(status()),
+                )
+                const color = createMemo(() => {
+                  if (active()) return theme.primary
+                  if (status() === "completed") return theme.text
+                  if (status() === "failed") return theme.error
+                  return theme.textMuted
+                })
                 return (
-                  <box paddingLeft={1}>
-                    <text fg={active() ? theme.primary : status() === "failed" ? theme.error : theme.textMuted}>
-                      {active() ? "❯ " : "  "}
-                      {phaseIcon(status())} {index() + 1}. {phase} [{status()}. Logs: {logs().length}]
+                  <box
+                    flexDirection="row"
+                    width="100%"
+                    onMouseDown={() => {
+                      setStore("selectedPhase", index())
+                      setStore("selectedAgent", 0)
+                    }}
+                  >
+                    <text
+                      width={3}
+                      fg={
+                        active()
+                          ? theme.primary
+                          : status() === "completed"
+                            ? theme.success
+                            : status() === "failed"
+                              ? theme.error
+                              : theme.textMuted
+                      }
+                      wrapMode="none"
+                    >
+                      {marker()}
+                    </text>
+                    <box flexGrow={1} minWidth={0}>
+                      <text fg={color()} wrapMode="none" overflow="hidden">
+                        {active() ? `${index() + 1} ${phase}` : phase}
+                      </text>
+                    </box>
+                    <text fg={active() ? theme.primary : theme.textMuted} flexShrink={0} wrapMode="none">
+                      {phaseProgress(current(), phases(), phase)}
                     </text>
                   </box>
                 )
               }}
             </For>
-
-            <box paddingTop={1}>
-              <text fg={theme.textMuted}>Press [Enter] to open phase telemetry.</text>
+          </scrollbox>
+        </box>
+        <box width={1} border={["left"]} borderColor={theme.border} />
+        <box flexGrow={1} minWidth={0} paddingLeft={1} paddingRight={1} minHeight={0}>
+          <text fg={theme.text} wrapMode="none" overflow="hidden">
+            {sectionTitle(phaseRowTitle(selectedPhase(), selectedPhaseRows()), agentPanelWidth() - 2)}
+          </text>
+          <Show
+            when={!selectedResult()}
+            fallback={
+              <box flexShrink={0}>
+                <Show
+                  when={selectedPhaseRows().length}
+                  fallback={
+                    <box paddingLeft={1}>
+                      <text fg={theme.textMuted}>No agent runs or workflow result recorded for this phase.</text>
+                    </box>
+                  }
+                >
+                  <For each={selectedPhaseRows()}>{(row, index) => <PhaseRowItem row={row} index={index} />}</For>
+                </Show>
+              </box>
+            }
+          >
+            <scrollbox
+              ref={(element: ScrollBoxRenderable) => (agentScroll = element)}
+              flexGrow={1}
+              minHeight={0}
+              verticalScrollbarOptions={{ visible: false }}
+              horizontalScrollbarOptions={{ visible: false }}
+              scrollAcceleration={getScrollAcceleration()}
+            >
+              <Show
+                when={selectedPhaseRows().length}
+                fallback={
+                  <box paddingLeft={1}>
+                    <text fg={theme.textMuted}>No agent runs or workflow result recorded for this phase.</text>
+                  </box>
+                }
+              >
+                <For each={selectedPhaseRows()}>{(row, index) => <PhaseRowItem row={row} index={index} />}</For>
+              </Show>
+              <Show when={current().error}>
+                <box paddingTop={1} paddingLeft={1}>
+                  <text fg={theme.error} wrapMode="word">
+                    Error: {current().error}
+                  </text>
+                </box>
+              </Show>
+            </scrollbox>
+          </Show>
+          <Show when={selectedResult()}>
+            <box height={1} flexShrink={0} border={["top"]} borderColor={theme.border} />
+            <box flexGrow={1} minHeight={0} paddingLeft={1} paddingRight={1}>
+              <For each={visibleResultLines()}>
+                {(line) => (
+                  <text fg={theme.text} wrapMode="none" overflow="hidden">
+                    {line}
+                  </text>
+                )}
+              </For>
+              <Show when={current().error}>
+                <box paddingTop={1} paddingLeft={1}>
+                  <text fg={theme.error} wrapMode="word">
+                    Error: {current().error}
+                  </text>
+                </box>
+              </Show>
             </box>
+          </Show>
+        </box>
+      </box>
 
-            <Show when={current().result !== undefined}>
-              <box paddingTop={1}>
-                <text fg={theme.accent} attributes={TextAttributes.BOLD}>
-                  RESULT:
-                </text>
-              </box>
-              <box paddingLeft={1}>
-                <text fg={theme.text} wrapMode="word">
-                  {formatResult(current().result)}
-                </text>
-              </box>
-            </Show>
-          </box>
-        </Show>
-
-        <Show when={current().error}>
-          <box paddingTop={1}>
-            <text fg={theme.error} attributes={TextAttributes.BOLD}>
-              ERROR:
-            </text>
-          </box>
-          <box paddingLeft={1}>
-            <text fg={theme.error}>{current().error}</text>
-          </box>
-        </Show>
-      </scrollbox>
-
-      <text fg={theme.textMuted}>{"─".repeat(Math.max(40, dimensions().width - 5))}</text>
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.textMuted}>
-          {store.view === "overview"
-            ? "[↑/↓] Select phase | [Enter] Open telemetry | [X] Kill workflow run | [Esc/B] Back"
-            : "[↑/↓] Scroll telemetry | [O] Open selected subagent | [X] Kill workflow run | [Esc/B] Back to overview"}
+          [↑/↓] Phase | [←/→] Agent/result | [Y] Copy response | [Enter/O] Open agent | [X] Kill run | [Esc/B] Back
         </text>
         <Show when={current().status === "running"}>
           <text fg={theme.primary}>live</text>
         </Show>
       </box>
+      <Show when={copyNotice()}>
+        <box
+          position="absolute"
+          right={4}
+          bottom={3}
+          paddingLeft={2}
+          paddingRight={2}
+          paddingTop={1}
+          paddingBottom={1}
+          backgroundColor={theme.backgroundPanel}
+          border={["left", "right"]}
+          borderColor={theme.success}
+        >
+          <text fg={theme.text}>Response copied to clipboard</text>
+        </box>
+      </Show>
       <box height={0.5} />
     </box>
-  )
-}
-
-function WorkflowLogs(props: { logs: WorkflowRun["logs"] }) {
-  const { theme } = useTheme()
-  return (
-    <Show
-      when={props.logs.length}
-      fallback={
-        <box paddingLeft={1}>
-          <text fg={theme.textMuted}>No workflow logs emitted yet.</text>
-        </box>
-      }
-    >
-      <For each={props.logs}>
-        {(log) => (
-          <box paddingLeft={1}>
-            <text fg={theme.textMuted} overflow="hidden" wrapMode="none">
-              [{formatTime(log.time)}] {log.phase ? `[${log.phase}]` : "SYS"}: {log.message}
-            </text>
-          </box>
-        )}
-      </For>
-    </Show>
   )
 }

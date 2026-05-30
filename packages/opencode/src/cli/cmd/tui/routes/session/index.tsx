@@ -430,6 +430,8 @@ export function Session() {
       type: "session",
       sessionID,
       workflowRunID: route.workflowRunID,
+      workflowPhase: route.workflowPhase,
+      workflowAgentID: route.workflowAgentID,
       workflowReturnSessionID: route.workflowReturnSessionID,
     })
     const status = sync.data.session_status[sessionID]
@@ -1051,13 +1053,19 @@ export function Session() {
       hidden: true,
       enabled: !!session()?.parentID,
       run: childSessionHandler(() => {
-        if (route.workflowRunID) {
+        const workflowRunID = route.workflowRunID
+        const workflowPhase = route.workflowPhase
+        const workflowAgentID = route.workflowAgentID
+        const workflowReturnSessionID = route.workflowReturnSessionID
+        if (workflowRunID) {
           navigate(
-            route.workflowReturnSessionID
-              ? { type: "session", sessionID: route.workflowReturnSessionID }
+            workflowReturnSessionID
+              ? { type: "session", sessionID: workflowReturnSessionID }
               : { type: "home" },
           )
-          dialog.replace(() => <DialogWorkflow openRunID={route.workflowRunID} />)
+          dialog.replace(() => (
+            <DialogWorkflow openRunID={workflowRunID} openPhase={workflowPhase} openAgentID={workflowAgentID} />
+          ))
           return
         }
         const parentID = session()?.parentID
@@ -1480,10 +1488,15 @@ function UserMessage(props: {
 function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
   const ctx = use()
   const local = useLocal()
-  const { theme } = useTheme()
+  const { theme, syntax } = useTheme()
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() => Model.name(ctx.providers(), props.message.providerID, props.message.modelID))
+  const structured = createMemo(() => {
+    if (props.parts.some((part) => part.type === "text" && part.text.trim())) return
+    if (props.message.structured === undefined) return
+    return "```json\n" + JSON.stringify(props.message.structured, null, 2) + "\n```"
+  })
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1516,6 +1529,20 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           )
         }}
       </For>
+      <Show when={structured()}>
+        <box id={"structured-" + props.message.id} paddingLeft={3} marginTop={1} flexShrink={0}>
+          <markdown
+            syntaxStyle={syntax()}
+            streaming={false}
+            internalBlockMode="top-level"
+            content={structured() ?? ""}
+            tableOptions={{ style: "grid" }}
+            conceal={ctx.conceal()}
+            fg={theme.markdownText}
+            bg={theme.background}
+          />
+        </box>
+      </Show>
       <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>

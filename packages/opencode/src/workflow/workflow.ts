@@ -6,28 +6,16 @@ import { Identifier } from "@/id/id"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
-import { MessageV2 } from "@/session/message-v2"
 import { SessionID } from "@/session/schema"
 import { Database, desc } from "@/storage/db"
+import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import type { DeepMutable } from "@opencode-ai/core/schema"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { eq } from "drizzle-orm"
 import { APICallError } from "ai"
 import path from "path"
 import { pathToFileURL } from "url"
-import {
-  Cause,
-  Clock,
-  Context,
-  Deferred,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Scope,
-  Schema,
-  SynchronizedRef,
-} from "effect"
+import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Scope, Schema, SynchronizedRef } from "effect"
 import { WorkflowRunTable } from "./workflow.sql"
 
 export const Argument = Schema.Struct({
@@ -250,23 +238,21 @@ async function loadModule(file: string): Promise<Module> {
   const imported = (await import(
     `${pathToFileURL(file).href}?mtime=${(await Bun.file(file).stat()).mtimeMs}`
   )) as Record<string, unknown>
-  const module = (typeof imported.default === "object" && imported.default !== null ? imported.default : imported) as Record<
-    string,
-    unknown
-  >
+  const module = (
+    typeof imported.default === "object" && imported.default !== null ? imported.default : imported
+  ) as Record<string, unknown>
   const parsed = decodeMeta(module.meta, { errors: "all", propertyOrder: "original" })
   if (Exit.isFailure(parsed)) throw new InvalidError({ path: file, message: Cause.pretty(parsed.cause) })
-  if (typeof module.run !== "function")
-    throw new InvalidError({ path: file, message: "Missing run(args, ctx) export" })
+  if (typeof module.run !== "function") throw new InvalidError({ path: file, message: "Missing run(args, ctx) export" })
   return {
     meta: parsed.value,
     run: module.run as Module["run"],
   }
 }
 
-function assistantText(message: MessageV2.WithParts) {
+function assistantText(message: SessionLegacy.WithParts) {
   return message.parts
-    .filter((part): part is MessageV2.TextPart => part.type === "text" && part.text.trim().length > 0)
+    .filter((part): part is SessionLegacy.TextPart => part.type === "text" && part.text.trim().length > 0)
     .map((part) => part.text)
     .join("\n")
 }
@@ -500,14 +486,20 @@ export const layer = Layer.effect(
                 parts: [{ type: "text", text: agentInput.prompt }],
               })
               node.message_id = message.info.id
-              node.output = message.info.role === "assistant" && message.info.structured !== undefined ? JSON.stringify(message.info.structured, null, 2) : assistantText(message)
+              node.output =
+                message.info.role === "assistant" && message.info.structured !== undefined
+                  ? JSON.stringify(message.info.structured, null, 2)
+                  : assistantText(message)
               if (message.info.role === "assistant") {
                 node.model = `${message.info.providerID}/${message.info.modelID}`
                 node.cost = message.info.cost
                 node.tokens = message.info.tokens
               }
               return {
-                data: message.info.role === "assistant" && message.info.structured !== undefined ? message.info.structured : node.output,
+                data:
+                  message.info.role === "assistant" && message.info.structured !== undefined
+                    ? message.info.structured
+                    : node.output,
                 text: node.output,
               }
             }),

@@ -1461,7 +1461,7 @@ export const layer = Layer.effect(
 
             if (structured !== undefined) {
               handle.message.structured = structured
-              handle.message.finish = handle.message.finish ?? "stop"
+              handle.message.finish = "stop"
               yield* sessions.updateMessage(handle.message)
               return "break" as const
             }
