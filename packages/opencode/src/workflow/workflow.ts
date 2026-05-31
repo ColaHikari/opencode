@@ -215,40 +215,27 @@ function fromRow(row: Row): Run {
 }
 
 function persistRun(db: Database.Interface["db"], active: Active) {
+  const data = {
+    id: active.run.id,
+    session_id: active.run.session_id ?? null,
+    workflow: active.run.workflow,
+    status: active.run.status,
+    started_at: active.run.started_at,
+    completed_at: active.run.completed_at ?? null,
+    current_phase: active.run.current_phase ?? null,
+    args: active.run.args ?? null,
+    definition: active.run.definition ?? null,
+    logs: active.run.logs,
+    agents: active.run.agents,
+    result: active.run.result ?? null,
+    error: active.run.error ?? null,
+  }
   return db
     .insert(WorkflowRunTable)
-    .values({
-      id: active.run.id,
-      session_id: active.run.session_id ?? null,
-      workflow: active.run.workflow,
-      status: active.run.status,
-      started_at: active.run.started_at,
-      completed_at: active.run.completed_at ?? null,
-      current_phase: active.run.current_phase ?? null,
-      args: active.run.args ?? null,
-      definition: active.run.definition ?? null,
-      logs: active.run.logs,
-      agents: active.run.agents,
-      result: active.run.result ?? null,
-      error: active.run.error ?? null,
-    })
+    .values(data)
     .onConflictDoUpdate({
       target: WorkflowRunTable.id,
-      set: {
-        workflow: active.run.workflow,
-        session_id: active.run.session_id ?? null,
-        status: active.run.status,
-        started_at: active.run.started_at,
-        completed_at: active.run.completed_at ?? null,
-        current_phase: active.run.current_phase ?? null,
-        args: active.run.args ?? null,
-        definition: active.run.definition ?? null,
-        logs: active.run.logs,
-        agents: active.run.agents,
-        result: active.run.result ?? null,
-        error: active.run.error ?? null,
-        time_updated: Date.now(),
-      },
+      set: { ...data, time_updated: Date.now() },
     })
     .run()
     .pipe(Effect.orDie)
@@ -312,18 +299,14 @@ async function discover(directories: readonly string[]) {
           ),
         )
       )
-        .flat()
-        .map((file) => ({
-          dir,
-          file,
-        })),
+        .flat(),
     ),
   )
   return entries
     .flat()
-    .map((entry) => ({
-      name: path.basename(entry.file, path.extname(entry.file)),
-      path: entry.file,
+    .map((file) => ({
+      name: path.basename(file, path.extname(file)),
+      path: file,
     }))
     .toSorted((a, b) => a.name.localeCompare(b.name))
 }
@@ -337,7 +320,6 @@ function createContext(input: {
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
   persist: () => void
 }): ContextApi {
-  const limit = 4
   return {
     budgetRemaining: Number.POSITIVE_INFINITY,
     setPhase(phase: string) {
@@ -349,7 +331,7 @@ function createContext(input: {
       input.persist()
     },
     async parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
-      const concurrency = Math.max(1, options?.concurrencyLimit ?? limit)
+      const concurrency = Math.max(1, options?.concurrencyLimit ?? 4)
       const results: T[] = []
       let index = 0
       await Promise.all(

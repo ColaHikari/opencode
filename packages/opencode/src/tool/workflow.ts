@@ -456,12 +456,11 @@ export const WorkflowTool = Tool.define(
               )
             }
             const previous = exists ? yield* fs.readFileString(filepath) : ""
-            const diff = trimDiff(createTwoFilesPatch(filepath, filepath, previous, params.source))
             yield* ctx.ask({
               permission: "edit",
               patterns: [path.relative(instance.worktree, filepath)],
               always: ["*"],
-              metadata: { filepath, diff },
+              metadata: { filepath, diff: trimDiff(createTwoFilesPatch(filepath, filepath, previous, params.source)) },
             })
             yield* fs.writeWithDirs(filepath, params.source)
             yield* format.file(filepath).pipe(Effect.ignore)
