@@ -5,7 +5,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { Identifier } from "@/id/id"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
-import { SessionPrompt } from "@/session/prompt"
+import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Database, desc } from "@/storage/db"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
@@ -39,6 +39,15 @@ export const Info = Schema.Struct({
   meta: Meta,
 }).annotate({ identifier: "WorkflowInfo" })
 export type Info = Schema.Schema.Type<typeof Info>
+
+export const Definition = Schema.Struct({
+  name: Schema.String,
+  path: Schema.String,
+  meta: Meta,
+  source: Schema.optional(Schema.String),
+  temporary: Schema.optional(Schema.Boolean),
+}).annotate({ identifier: "WorkflowDefinition" })
+export type Definition = DeepMutable<Schema.Schema.Type<typeof Definition>>
 
 export const Status = Schema.Literals(["running", "completed", "failed", "cancelled"])
 export type Status = Schema.Schema.Type<typeof Status>
@@ -83,6 +92,8 @@ export const Run = Schema.Struct({
   id: Schema.String,
   session_id: Schema.optional(Schema.String),
   workflow: Schema.String,
+  args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  definition: Schema.optional(Definition),
   status: Status,
   started_at: Schema.Number,
   completed_at: Schema.optional(Schema.Number),
@@ -99,6 +110,26 @@ export const StartInput = Schema.Struct({
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
 }).annotate({ identifier: "WorkflowStartInput" })
 export type StartInput = Schema.Schema.Type<typeof StartInput>
+
+export type PromptOps = {
+  prompt: (input: SessionPrompt.PromptInput) => Effect.Effect<SessionLegacy.WithParts, unknown>
+}
+
+export type StartOptions = StartInput & {
+  prompt?: PromptOps
+  source?: string
+  temporary?: boolean
+}
+
+export type WaitInput = {
+  id: string
+  timeout?: number
+}
+
+export type WaitResult = {
+  run?: Run
+  timedOut: boolean
+}
 
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("WorkflowNotFoundError", {
   name: Schema.String,
@@ -133,7 +164,6 @@ type Module = {
 type Active = {
   run: Run
   done: Deferred.Deferred<Run>
-  args?: Record<string, unknown>
   fiber?: Fiber.Fiber<void, unknown>
 }
 
@@ -146,7 +176,8 @@ export interface Interface {
   readonly list: () => Effect.Effect<Info[], InvalidError>
   readonly runs: () => Effect.Effect<Run[]>
   readonly get: (id: string) => Effect.Effect<Run | undefined>
-  readonly start: (input: StartInput) => Effect.Effect<Run, InvalidError | NotFoundError>
+  readonly start: (input: StartOptions) => Effect.Effect<Run, InvalidError | NotFoundError>
+  readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
   readonly cancel: (id: string) => Effect.Effect<Run | undefined>
   readonly remove: (id: string) => Effect.Effect<boolean>
 }
@@ -170,6 +201,8 @@ function fromRow(row: Row): Run {
     id: row.id,
     session_id: row.session_id ?? undefined,
     workflow: row.workflow,
+    args: row.args ?? undefined,
+    definition: row.definition ?? undefined,
     status: row.status,
     started_at: row.started_at,
     completed_at: row.completed_at ?? undefined,
@@ -193,7 +226,8 @@ function persistRun(active: Active) {
         started_at: active.run.started_at,
         completed_at: active.run.completed_at ?? null,
         current_phase: active.run.current_phase ?? null,
-        args: active.args ?? null,
+        args: active.run.args ?? null,
+        definition: active.run.definition ?? null,
         logs: active.run.logs,
         agents: active.run.agents,
         result: active.run.result ?? null,
@@ -208,7 +242,8 @@ function persistRun(active: Active) {
           started_at: active.run.started_at,
           completed_at: active.run.completed_at ?? null,
           current_phase: active.run.current_phase ?? null,
-          args: active.args ?? null,
+          args: active.run.args ?? null,
+          definition: active.run.definition ?? null,
           logs: active.run.logs,
           agents: active.run.agents,
           result: active.run.result ?? null,
@@ -232,6 +267,17 @@ function errorText(error: unknown) {
 
 function isInvalidError(error: unknown): error is InvalidError {
   return typeof error === "object" && error !== null && Reflect.get(error, "_tag") === "WorkflowInvalidError"
+}
+
+function mutableMeta(meta: Meta): Definition["meta"] {
+  return {
+    name: meta.name,
+    description: meta.description,
+    phases: meta.phases ? [...meta.phases] : undefined,
+    arguments: meta.arguments
+      ? Object.fromEntries(Object.entries(meta.arguments).map(([name, argument]) => [name, { ...argument }]))
+      : undefined,
+  }
 }
 
 async function loadModule(file: string): Promise<Module> {
@@ -283,6 +329,10 @@ async function discover(directories: readonly string[]) {
     .toSorted((a, b) => a.name.localeCompare(b.name))
 }
 
+function projectConfigDir(ctx: { directory: string; worktree: string }) {
+  return path.join(ctx.worktree === "/" ? ctx.directory : ctx.worktree, ".opencode")
+}
+
 function createContext(input: {
   active: Active
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
@@ -326,13 +376,41 @@ function createContext(input: {
   }
 }
 
+export function fmt(list: Info[]) {
+  const described = list.filter((workflow) => workflow.meta.description !== undefined)
+  if (described.length === 0) return "No workflows are currently available."
+  return [
+    "<available_workflows>",
+    ...described
+      .toSorted((a, b) => a.name.localeCompare(b.name))
+      .flatMap((workflow) => [
+        "  <workflow>",
+        `    <name>${workflow.name}</name>`,
+        `    <description>${workflow.meta.description}</description>`,
+        `    <path>${pathToFileURL(workflow.path).href}</path>`,
+        ...(workflow.meta.phases?.length ? [`    <phases>${workflow.meta.phases.join(", ")}</phases>`] : []),
+        ...(workflow.meta.arguments
+          ? [
+              "    <arguments>",
+              ...Object.entries(workflow.meta.arguments).map(
+                ([name, arg]) =>
+                  `      <argument name="${name}" type="${arg.type ?? "string"}">${arg.description ?? ""}</argument>`,
+              ),
+              "    </arguments>",
+            ]
+          : []),
+        "  </workflow>",
+      ]),
+    "</available_workflows>",
+  ].join("\n")
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const config = yield* Config.Service
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
-    const prompts = yield* SessionPrompt.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* () {
         return {
@@ -357,7 +435,8 @@ export const layer = Layer.effect(
     })
 
     const list: Interface["list"] = Effect.fn("Workflow.list")(function* () {
-      const directories = yield* config.directories()
+      const ctx = yield* InstanceState.context
+      const directories = [...new Set([...(yield* config.directories()), projectConfigDir(ctx)])]
       const workflows = yield* Effect.promise(() => discover(directories))
       return yield* Effect.forEach(
         workflows,
@@ -422,33 +501,42 @@ export const layer = Layer.effect(
           id,
           session_id: session.id,
           workflow: workflow.name,
+          args: input.args ?? undefined,
+          definition: {
+            name: workflow.name,
+            path: workflow.path,
+            meta: mutableMeta(module.meta),
+            source: input.source,
+            temporary: input.temporary,
+          },
           status: "running",
           started_at,
           logs: [],
           agents: [],
         },
         done,
-        args: input.args ?? undefined,
       }
       yield* SynchronizedRef.update(s.runs, (runs) => new Map(runs).set(id, active))
       persistRun(active)
-      yield* prompts
-        .prompt({
-          sessionID: session.id,
-          noReply: true,
-          parts: [
-            {
-              type: "text",
-              text: [
-                `Workflow started: ${module.meta.name}`,
-                `Run ID: ${id}`,
-                "",
-                module.meta.description ?? "Use the workflow dashboard to inspect phases, agent runs, and results.",
-              ].join("\n"),
-            },
-          ],
-        })
-        .pipe(Effect.ignore)
+      if (input.prompt) {
+        yield* input.prompt
+          .prompt({
+            sessionID: session.id,
+            noReply: true,
+            parts: [
+              {
+                type: "text",
+                text: [
+                  `Workflow started: ${module.meta.name}`,
+                  `Run ID: ${id}`,
+                  "",
+                  module.meta.description ?? "Use the workflow dashboard to inspect phases, agent runs, and results.",
+                ].join("\n"),
+              },
+            ],
+          })
+          .pipe(Effect.ignore)
+      }
       const bridge = yield* EffectBridge.make()
 
       const agent = (agentInput: AgentInput) => {
@@ -463,6 +551,8 @@ export const layer = Layer.effect(
         }
         active.run.agents.push(node)
         persistRun(active)
+        const prompt = input.prompt
+        if (!prompt) return Promise.reject(new Error("Workflow agent execution requires prompt operations"))
         return bridge
           .promise(
             Effect.gen(function* () {
@@ -478,7 +568,7 @@ export const layer = Layer.effect(
               if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
               node.session_id = session.id
               persistRun(active)
-              const message = yield* prompts.prompt({
+              const message = yield* prompt.prompt({
                 sessionID: session.id,
                 agent: selected.name,
                 model: modelInfo,
@@ -538,6 +628,21 @@ export const layer = Layer.effect(
       return snapshot(active)
     })
 
+    const wait: Interface["wait"] = Effect.fn("Workflow.wait")(function* (input) {
+      const run = yield* get(input.id)
+      if (!run) return { timedOut: false }
+      if (run.status !== "running") return { run, timedOut: false }
+
+      const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(input.id)
+      if (!active) return { run, timedOut: true }
+      if (input.timeout === undefined) return { run: yield* Deferred.await(active.done), timedOut: false }
+      if (input.timeout <= 0) return { run: snapshot(active), timedOut: true }
+
+      const done = yield* Deferred.await(active.done).pipe(Effect.timeoutOption(input.timeout))
+      if (done._tag === "Some") return { run: done.value, timedOut: false }
+      return { run: snapshot(active), timedOut: true }
+    })
+
     const cancel: Interface["cancel"] = Effect.fn("Workflow.cancel")(function* (id) {
       const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
       if (!active) return
@@ -566,12 +671,11 @@ export const layer = Layer.effect(
       return !!row || !!active
     })
 
-    return Service.of({ list, runs, get, start, cancel, remove })
+    return Service.of({ list, runs, get, start, wait, cancel, remove })
   }),
 )
 
 export const defaultLayer = layer.pipe(
-  Layer.provide(SessionPrompt.defaultLayer),
   Layer.provide(Session.defaultLayer),
   Layer.provide(Agent.defaultLayer),
   Layer.provide(Provider.defaultLayer),

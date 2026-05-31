@@ -273,11 +273,26 @@ function dashboardPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
 }
 
 function dashboardWidths(width: number) {
-  const total = Math.max(72, width)
-  const fixed = 2 + 10 + 8 + 11 + 7 + 8 + 7
-  const available = Math.max(24, total - fixed)
-  const workflow = Math.min(30, Math.max(14, Math.floor(available * 0.42)))
-  return { workflow, phase: Math.max(12, available - workflow) }
+  const total = Math.min(width, 150)
+  const phase = total < 104 ? 8 : 12
+  const fixed = 2 + 10 + 8 + 11 + 7 + phase + 8 + 8
+  const available = Math.max(28, total - fixed)
+  const workflow = Math.min(26, Math.max(14, Math.floor(available * 0.38)))
+  return { workflow, phase, input: Math.max(14, available - workflow), total }
+}
+
+function workflowInput(run: WorkflowRun) {
+  if (!run.args || Object.keys(run.args).length === 0) return "--"
+  return Object.entries(run.args)
+    .map(([key, value]) => `${key}=${formatInputValue(value)}`)
+    .join(" ")
+}
+
+function formatInputValue(value: unknown) {
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  if (value === null) return "null"
+  return JSON.stringify(value) ?? String(value)
 }
 
 function dashboardRowText(
@@ -285,6 +300,7 @@ function dashboardRowText(
     marker: string
     id: string
     workflow: string
+    input: string
     status: string
     started: string
     duration: string
@@ -300,12 +316,13 @@ function dashboardRowText(
       fitCell(input.id, 10),
       fitCell(input.workflow, columns.workflow),
       fitCell(input.status, 8),
-      fitCell(input.started, 11),
-      fitCell(input.duration, 7, "right"),
+      fitCell(input.started, 12),
+      fitCell(input.duration, 7),
       fitCell(input.phase, columns.phase),
-      fitCell(input.tokens, 8, "right"),
+      fitCell(input.tokens, 8),
+      fitCell(input.input, columns.input),
     ].join(" "),
-    width,
+    columns.total,
   )
 }
 
@@ -473,6 +490,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
             marker: "",
             id: "RUN",
             workflow: "WORKFLOW",
+            input: "INPUT",
             status: "STATUS",
             started: "STARTED",
             duration: "DUR",
@@ -518,6 +536,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                       marker: active() ? "›" : "",
                       id: shortRunID(run),
                       workflow: run.workflow,
+                      input: workflowInput(run),
                       status: `${statusIcon(run.status)} ${statusLabel(run.status)}`,
                       started: formatStartedShort(run.started_at),
                       duration: formatShortDuration(run),

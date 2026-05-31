@@ -1,17 +1,20 @@
 import { Workflow } from "@/workflow/workflow"
+import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { type StartPayload, WorkflowApiError } from "../groups/workflow"
 
 function apiError(error: Workflow.InvalidError | Workflow.NotFoundError) {
-  if (error._tag === "WorkflowInvalidError") return new WorkflowApiError({ message: error.message, workflow: error.path })
+  if (error._tag === "WorkflowInvalidError")
+    return new WorkflowApiError({ message: error.message, workflow: error.path })
   return new WorkflowApiError({ message: `Workflow not found: ${error.name}`, workflow: error.name })
 }
 
 export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow", (handlers) =>
   Effect.gen(function* () {
     const workflow = yield* Workflow.Service
+    const prompt = yield* SessionPrompt.Service
 
     const list = Effect.fn("WorkflowHttpApi.list")(function* () {
       return yield* workflow.list().pipe(Effect.mapError(apiError))
@@ -29,7 +32,9 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       params: { name: string }
       payload?: StartPayload
     }) {
-      return yield* workflow.start({ name: ctx.params.name, args: ctx.payload?.args }).pipe(Effect.mapError(apiError))
+      return yield* workflow
+        .start({ name: ctx.params.name, args: ctx.payload?.args, prompt })
+        .pipe(Effect.mapError(apiError))
     })
 
     const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: string } }) {

@@ -15,6 +15,7 @@ import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
+import { Workflow } from "@/workflow/workflow"
 
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
@@ -43,6 +44,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
+    const workflow = yield* Workflow.Service
 
     return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
@@ -63,22 +65,39 @@ export const layer = Layer.effect(
       }),
 
       skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
-        if (Permission.disabled(["skill"], agent.permission).has("skill")) return
+        const disabled = Permission.disabled(["skill", "workflow"], agent.permission)
 
-        const list = yield* skill.available(agent)
+        const skillList = disabled.has("skill") ? [] : yield* skill.available(agent)
+        const workflowList = disabled.has("workflow")
+          ? []
+          : yield* workflow.list().pipe(Effect.catch(() => Effect.succeed([])))
 
         return [
-          "Skills provide specialized instructions and workflows for specific tasks.",
-          "Use the skill tool to load a skill when a task matches its description.",
-          // the agents seem to ingest the information about skills a bit better if we present a more verbose
-          // version of them here and a less verbose version in tool description, rather than vice versa.
-          Skill.fmt(list, { verbose: true }),
-        ].join("\n")
+          skillList.length
+            ? [
+                "Skills provide specialized instructions and workflows for specific tasks.",
+                "Use the skill tool to load a skill when a task matches its description.",
+                // the agents seem to ingest the information about skills a bit better if we present a more verbose
+                // version of them here and a less verbose version in tool description, rather than vice versa.
+                Skill.fmt(skillList, { verbose: true }),
+              ].join("\n")
+            : undefined,
+          workflowList.length
+            ? [
+                "Workflows are project-local multi-step automations that can run agents, phases, and structured processes.",
+                "Do not use workflows by default. Use the workflow tool only when the user asks for a workflow, asks to create one, or clearly confirms workflow automation.",
+                'Use the workflow tool with action="read" for details before starting a workflow if the arguments or behavior are unclear.',
+                Workflow.fmt(workflowList),
+              ].join("\n")
+            : undefined,
+        ]
+          .filter((section): section is string => section !== undefined)
+          .join("\n\n")
       }),
     })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(Layer.mergeAll(Skill.defaultLayer, Workflow.defaultLayer)))
 
 export * as SystemPrompt from "./system"

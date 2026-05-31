@@ -1,6 +1,6 @@
 import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core"
 import { Timestamps } from "../storage/schema.sql"
-import type { AgentRun, LogEntry, Status } from "./workflow"
+import type { AgentRun, Definition, LogEntry, Status } from "./workflow"
 
 export const WorkflowRunTable = sqliteTable(
   "workflow_run",
@@ -13,6 +13,7 @@ export const WorkflowRunTable = sqliteTable(
     completed_at: integer(),
     current_phase: text(),
     args: text({ mode: "json" }).$type<Record<string, unknown>>(),
+    definition: text({ mode: "json" }).$type<Definition>(),
     logs: text({ mode: "json" }).notNull().$type<LogEntry[]>(),
     agents: text({ mode: "json" }).notNull().$type<AgentRun[]>(),
     result: text({ mode: "json" }).$type<unknown>(),

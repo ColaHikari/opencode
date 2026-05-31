@@ -55,18 +55,31 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
       const workflow = yield* Workflow.Service
       const run = yield* workflow.start({ name: "hello", args: { value: 42 } })
       expect(run.status).toBe("running")
-      function wait(): Effect.Effect<Workflow.Run> {
-        return Effect.gen(function* () {
-          const current = yield* workflow.get(run.id)
-          if (current?.status === "completed") return current
-          yield* Effect.sleep("10 millis")
-          return yield* wait()
-        })
-      }
-      const done = yield* wait()
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
       expect(done.current_phase).toBe("run")
       expect(done.logs.map((item) => item.message)).toContain("running")
+      expect(done.args).toEqual({ value: 42 })
+      expect(done.definition?.name).toBe("hello")
+      expect(done.definition?.path.endsWith("hello.js")).toBe(true)
       expect(done.result).toEqual({ value: 42 })
+    }),
+  )
+
+  it.instance("preserves temporary workflow source in run definition", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const source = `export const meta = { name: "Temporary" }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`
+      yield* Effect.promise(() => writeWorkflow(test.directory, "temporary", source))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "temporary", args: { value: 99 }, source, temporary: true })
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
+      expect(done.definition?.temporary).toBe(true)
+      expect(done.definition?.source).toBe(source)
+      expect(done.result).toEqual({ value: 99 })
     }),
   )
 

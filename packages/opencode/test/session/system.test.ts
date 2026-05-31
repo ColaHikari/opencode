@@ -6,6 +6,7 @@ import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
 import { SystemPrompt } from "../../src/session/system"
 import { testEffect } from "../lib/effect"
+import { Workflow } from "../../src/workflow/workflow"
 
 const skills: Skill.Info[] = [
   {
@@ -44,6 +45,34 @@ const it = testEffect(
   SystemPrompt.layer.pipe(
     Layer.provide(
       Layer.succeed(
+        Workflow.Service,
+        Workflow.Service.of({
+          list: () =>
+            Effect.succeed([
+              {
+                name: "release_notes",
+                path: "/tmp/release_notes.ts",
+                meta: {
+                  name: "Release Notes",
+                  description: "Draft release notes.",
+                  phases: ["draft", "review"],
+                  arguments: {
+                    version: { type: "string", description: "Version to summarize." },
+                  },
+                },
+              },
+            ]),
+          runs: () => Effect.succeed([]),
+          get: () => Effect.succeed(undefined),
+          start: () => Effect.fail(new Workflow.NotFoundError({ name: "test" })),
+          wait: () => Effect.succeed({ timedOut: false }),
+          cancel: () => Effect.succeed(undefined),
+          remove: () => Effect.succeed(false),
+        }),
+      ),
+    ),
+    Layer.provide(
+      Layer.succeed(
         Skill.Service,
         Skill.Service.of({
           get: (name) => Effect.succeed(skills.find((skill) => skill.name === name)),
@@ -79,6 +108,9 @@ describe("session.system", () => {
       expect(middle).toBeGreaterThan(alpha)
       expect(zeta).toBeGreaterThan(middle)
       expect(output).not.toContain("manual-skill")
+      expect(output).toContain("<available_workflows>")
+      expect(output).toContain("<name>release_notes</name>")
+      expect(output).toContain("Do not use workflows by default")
     }),
   )
 })

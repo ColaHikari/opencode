@@ -2620,6 +2620,14 @@ export type WorkflowApiError = {
   workflow?: string
 }
 
+export type WorkflowDefinition = {
+  name: string
+  path: string
+  meta: WorkflowMeta
+  source?: string
+  temporary?: boolean
+}
+
 export type WorkflowLogEntry = {
   time: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   phase?: string
@@ -2656,6 +2664,10 @@ export type WorkflowRun = {
   id: string
   session_id?: string
   workflow: string
+  args?: {
+    [key: string]: unknown
+  }
+  definition?: WorkflowDefinition
   status: "running" | "completed" | "failed" | "cancelled"
   started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"

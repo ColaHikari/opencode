@@ -7,6 +7,7 @@ import {
   createSignal,
   For,
   Match,
+  onCleanup,
   on,
   onMount,
   Show,
@@ -51,6 +52,7 @@ import { webSearchProviderLabel, type WebSearchTool } from "@/tool/websearch"
 import type { TaskTool } from "@/tool/task"
 import type { QuestionTool } from "@/tool/question"
 import type { SkillTool } from "@/tool/skill"
+import type { WorkflowTool } from "@/tool/workflow"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import { useSDK } from "@tui/context/sdk"
 import { useEditorContext } from "@tui/context/editor"
@@ -250,11 +252,25 @@ export function Session() {
   const toast = useToast()
   const sdk = useSDK()
   const editor = useEditorContext()
+  const latestWorkflowToolRunID = createMemo(() =>
+    messages()
+      .flatMap((message) => sync.data.part[message.id] ?? [])
+      .filter((part): part is ToolPart => part.type === "tool" && part.tool === "workflow")
+      .map((part) => workflowMetadata(part.state.status === "pending" ? undefined : part.state.metadata).runId)
+      .findLast((runId): runId is string => typeof runId === "string"),
+  )
   const [workflowRun] = createResource(
-    () => route.sessionID,
-    async (sessionID) => {
+    () => {
+      const runID = route.workflowRunID ?? latestWorkflowToolRunID()
+      return runID ? `run:${runID}` : `session:${route.sessionID}`
+    },
+    async (source) => {
+      if (source.startsWith("run:")) {
+        const result = await sdk.client.workflow.get({ id: source.slice(4) })
+        return result.data
+      }
       const result = await sdk.client.workflow.runs()
-      return result.data?.find((run) => run.session_id === sessionID)
+      return result.data?.find((run) => run.session_id === source.slice(8))
     },
   )
 
@@ -458,7 +474,9 @@ export function Session() {
   function openWorkflowRun() {
     const run = workflowRun()
     if (!run) return
-    dialog.replace(() => <DialogWorkflow openRunID={run.id} />)
+    dialog.replace(() => (
+      <DialogWorkflow openRunID={run.id} openPhase={route.workflowPhase} openAgentID={route.workflowAgentID} />
+    ))
   }
 
   function childSessionHandler(func: () => void) {
@@ -1058,11 +1076,7 @@ export function Session() {
         const workflowAgentID = route.workflowAgentID
         const workflowReturnSessionID = route.workflowReturnSessionID
         if (workflowRunID) {
-          navigate(
-            workflowReturnSessionID
-              ? { type: "session", sessionID: workflowReturnSessionID }
-              : { type: "home" },
-          )
+          navigate(workflowReturnSessionID ? { type: "session", sessionID: workflowReturnSessionID } : { type: "home" })
           dialog.replace(() => (
             <DialogWorkflow openRunID={workflowRunID} openPhase={workflowPhase} openAgentID={workflowAgentID} />
           ))
@@ -1300,7 +1314,8 @@ export function Session() {
                       <text fg={theme.text}>
                         {workflowShortcut()}
                         <span style={{ fg: theme.textMuted }}>
-                          {" "}open workflow details for {run().workflow} ({run().id.replace(/^job_/, "#")})
+                          {" "}
+                          open workflow details for {run().workflow} ({run().id.replace(/^job_/, "#")})
                         </span>
                       </text>
                     </box>
@@ -1791,6 +1806,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={props.part.tool === "task"}>
           <Task {...toolprops} />
         </Match>
+        <Match when={props.part.tool === "workflow"}>
+          <WorkflowCall {...toolprops} />
+        </Match>
         <Match when={props.part.tool === "apply_patch"}>
           <ApplyPatch {...toolprops} />
         </Match>
@@ -1819,6 +1837,16 @@ type ToolProps<T> = {
   output?: string
   part: ToolPart
 }
+
+function workflowMetadata(input?: Record<string, unknown>) {
+  return {
+    runId: typeof input?.runId === "string" ? input.runId : undefined,
+    sessionId: typeof input?.sessionId === "string" ? input.sessionId : undefined,
+    workflow: typeof input?.workflow === "string" ? input.workflow : undefined,
+    background: input?.background === true,
+  }
+}
+
 function GenericTool(props: ToolProps<any>) {
   const { theme } = useTheme()
   const ctx = use()
@@ -2069,6 +2097,79 @@ function BlockTool(props: {
         <text fg={theme.error}>{error()}</text>
       </Show>
     </box>
+  )
+}
+
+function WorkflowCall(props: ToolProps<typeof WorkflowTool>) {
+  const { theme } = useTheme()
+  const dialog = useDialog()
+  const sdk = useSDK()
+  const meta = createMemo(() => workflowMetadata(props.metadata as Record<string, unknown> | undefined))
+  const [run, { refetch }] = createResource(
+    () => meta().runId,
+    async (id) => {
+      if (!id) return
+      const result = await sdk.client.workflow.get({ id })
+      return result.data
+    },
+  )
+  const current = createMemo(() => run())
+  const isRunning = createMemo(() => props.part.state.status === "running" || current()?.status === "running")
+  const duration = createMemo(() => {
+    const value = current()
+    if (typeof value?.started_at !== "number" || typeof value.completed_at !== "number") return 0
+    return value.completed_at - value.started_at
+  })
+
+  createEffect(() => {
+    const runID = meta().runId
+    if (!runID) return
+    const interval = setInterval(() => {
+      if (props.part.state.status === "running" || current()?.status === "running") void refetch()
+    }, 1000)
+    onCleanup(() => clearInterval(interval))
+  })
+
+  const content = createMemo(() => {
+    if (props.input.action !== "start" && props.input.action !== "run_temporary") return undefined
+    const label =
+      current()?.definition?.meta.name ??
+      meta().workflow ??
+      props.input.name ??
+      (props.input.action === "run_temporary" ? "Temporary workflow" : "Workflow")
+    const lines = [meta().background ? `${label} (background)` : label]
+    if (isRunning()) {
+      const activeAgent = current()?.agents.findLast((agent) => agent.status === "running") ?? current()?.agents.at(-1)
+      if (current()?.current_phase) lines.push(`↳ phase ${current()!.current_phase}`)
+      else if (activeAgent) {
+        lines.push(
+          `↳ ${activeAgent.agent ? `@${activeAgent.agent}` : "agent"}${activeAgent.phase ? ` · ${activeAgent.phase}` : ""}`,
+        )
+      } else lines.push("↳ starting")
+    }
+    if (!isRunning() && current()) {
+      lines.push(`└ ${current()!.agents.length} agent runs · ${Locale.duration(duration())}`)
+    }
+    return lines.join("\n")
+  })
+
+  if (props.input.action !== "start" && props.input.action !== "run_temporary") return <GenericTool {...props} />
+
+  return (
+    <InlineTool
+      icon="│"
+      color={theme.textMuted}
+      spinner={isRunning()}
+      complete={meta().workflow ?? props.input.name ?? props.input.action}
+      pending="Starting workflow..."
+      part={props.part}
+      onClick={() => {
+        if (!meta().runId) return
+        dialog.replace(() => <DialogWorkflow openRunID={meta().runId!} />)
+      }}
+    >
+      {content()}
+    </InlineTool>
   )
 }
 
