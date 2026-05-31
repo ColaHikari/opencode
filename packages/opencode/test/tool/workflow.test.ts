@@ -10,7 +10,7 @@ import { WorkflowTool } from "@/tool/workflow"
 import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "@/session/schema"
-import { ModelID, ProviderID } from "@/provider/schema"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 
 const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, CrossSpawnSpawner.defaultLayer))
 
@@ -51,8 +51,8 @@ function workflowTool() {
   return Effect.gen(function* () {
     const registry = yield* ToolRegistry.Service
     const tool = (yield* registry.tools({
-      providerID: ProviderID.opencode,
-      modelID: ModelID.make("gpt-5"),
+      providerID: ProviderV2.ID.opencode,
+      modelID: ProviderV2.ModelID.make("gpt-5"),
       agent: { name: "build", mode: "primary", permission: [], options: {} },
     })).find((tool) => tool.id === WorkflowTool.id)
     if (!tool) return yield* Effect.fail(new Error(`Tool not found: ${WorkflowTool.id}`))

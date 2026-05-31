@@ -7,11 +7,11 @@ import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
-import { Database, desc } from "@/storage/db"
+import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import type { DeepMutable } from "@opencode-ai/core/schema"
 import { Glob } from "@opencode-ai/core/util/glob"
-import { eq } from "drizzle-orm"
+import { desc, eq } from "drizzle-orm"
 import { APICallError } from "ai"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -214,14 +214,29 @@ function fromRow(row: Row): Run {
   }
 }
 
-function persistRun(active: Active) {
-  Database.use((db) =>
-    db
-      .insert(WorkflowRunTable)
-      .values({
-        id: active.run.id,
-        session_id: active.run.session_id ?? null,
+function persistRun(db: Database.Interface["db"], active: Active) {
+  return db
+    .insert(WorkflowRunTable)
+    .values({
+      id: active.run.id,
+      session_id: active.run.session_id ?? null,
+      workflow: active.run.workflow,
+      status: active.run.status,
+      started_at: active.run.started_at,
+      completed_at: active.run.completed_at ?? null,
+      current_phase: active.run.current_phase ?? null,
+      args: active.run.args ?? null,
+      definition: active.run.definition ?? null,
+      logs: active.run.logs,
+      agents: active.run.agents,
+      result: active.run.result ?? null,
+      error: active.run.error ?? null,
+    })
+    .onConflictDoUpdate({
+      target: WorkflowRunTable.id,
+      set: {
         workflow: active.run.workflow,
+        session_id: active.run.session_id ?? null,
         status: active.run.status,
         started_at: active.run.started_at,
         completed_at: active.run.completed_at ?? null,
@@ -232,27 +247,11 @@ function persistRun(active: Active) {
         agents: active.run.agents,
         result: active.run.result ?? null,
         error: active.run.error ?? null,
-      })
-      .onConflictDoUpdate({
-        target: WorkflowRunTable.id,
-        set: {
-          workflow: active.run.workflow,
-          session_id: active.run.session_id ?? null,
-          status: active.run.status,
-          started_at: active.run.started_at,
-          completed_at: active.run.completed_at ?? null,
-          current_phase: active.run.current_phase ?? null,
-          args: active.run.args ?? null,
-          definition: active.run.definition ?? null,
-          logs: active.run.logs,
-          agents: active.run.agents,
-          result: active.run.result ?? null,
-          error: active.run.error ?? null,
-          time_updated: Date.now(),
-        },
-      })
-      .run(),
-  )
+        time_updated: Date.now(),
+      },
+    })
+    .run()
+    .pipe(Effect.orDie)
 }
 
 function errorText(error: unknown) {
@@ -411,6 +410,7 @@ export const layer = Layer.effect(
     const config = yield* Config.Service
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* () {
         return {
@@ -422,9 +422,7 @@ export const layer = Layer.effect(
 
     const readRuns = Effect.fn("Workflow.readRuns")(function* () {
       const active = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
-      const rows = Database.use((db) =>
-        db.select().from(WorkflowRunTable).orderBy(desc(WorkflowRunTable.started_at)).all(),
-      )
+      const rows = yield* db.select().from(WorkflowRunTable).orderBy(desc(WorkflowRunTable.started_at)).all().pipe(Effect.orDie)
       return rows
         .map(fromRow)
         .map((run) => {
@@ -458,7 +456,7 @@ export const layer = Layer.effect(
     const get: Interface["get"] = Effect.fn("Workflow.get")(function* (id) {
       const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
       if (active) return snapshot(active)
-      const row = Database.use((db) => db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get())
+      const row = yield* db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get().pipe(Effect.orDie)
       if (!row) return
       return fromRow(row)
     })
@@ -477,7 +475,7 @@ export const layer = Layer.effect(
       active.run.result = data?.result
       active.run.error = data?.error
       active.fiber = undefined
-      persistRun(active)
+      yield* persistRun(db, active)
       yield* Deferred.succeed(active.done, snapshot(active)).pipe(Effect.ignore)
       return snapshot(active)
     })
@@ -517,7 +515,7 @@ export const layer = Layer.effect(
         done,
       }
       yield* SynchronizedRef.update(s.runs, (runs) => new Map(runs).set(id, active))
-      persistRun(active)
+      yield* persistRun(db, active)
       if (input.prompt) {
         yield* input.prompt
           .prompt({
@@ -550,7 +548,7 @@ export const layer = Layer.effect(
           prompt: agentInput.prompt,
         }
         active.run.agents.push(node)
-        persistRun(active)
+        bridge.fork(persistRun(db, active))
         const prompt = input.prompt
         if (!prompt) return Promise.reject(new Error("Workflow agent execution requires prompt operations"))
         return bridge
@@ -567,7 +565,7 @@ export const layer = Layer.effect(
               node.agent = selected.name
               if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
               node.session_id = session.id
-              persistRun(active)
+              yield* persistRun(db, active)
               const message = yield* prompt.prompt({
                 sessionID: session.id,
                 agent: selected.name,
@@ -599,21 +597,21 @@ export const layer = Layer.effect(
               node.status = "completed"
               node.completed_at = Date.now()
               node.output = result.text
-              persistRun(active)
+              bridge.fork(persistRun(db, active))
               return result
             },
             (error) => {
               node.status = "failed"
               node.completed_at = Date.now()
               node.error = errorText(error)
-              persistRun(active)
+              bridge.fork(persistRun(db, active))
               return Promise.reject(error)
             },
           )
       }
 
       active.fiber = yield* Effect.promise(() =>
-        module.run(input.args ?? {}, createContext({ active, agent, persist: () => persistRun(active) })),
+        module.run(input.args ?? {}, createContext({ active, agent, persist: () => void bridge.fork(persistRun(db, active)) })),
       ).pipe(
         Effect.matchCauseEffect({
           onSuccess: (result) => finish(id, "completed", { result }),
@@ -666,8 +664,8 @@ export const layer = Layer.effect(
         next.delete(id)
         return next
       })
-      const row = Database.use((db) => db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get())
-      Database.use((db) => db.delete(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).run())
+      const row = yield* db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get().pipe(Effect.orDie)
+      yield* db.delete(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).run().pipe(Effect.orDie)
       return !!row || !!active
     })
 
@@ -676,6 +674,7 @@ export const layer = Layer.effect(
 )
 
 export const defaultLayer = layer.pipe(
+  Layer.provide(Database.defaultLayer),
   Layer.provide(Session.defaultLayer),
   Layer.provide(Agent.defaultLayer),
   Layer.provide(Provider.defaultLayer),

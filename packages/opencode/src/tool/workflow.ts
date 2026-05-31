@@ -1,6 +1,6 @@
 import { BackgroundJob } from "@/background/job"
-import { Bus } from "@/bus"
 import { InstanceState } from "@/effect/instance-state"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { File } from "@/file"
 import { FileWatcher } from "@/file/watcher"
 import { Format } from "@/format"
@@ -377,7 +377,7 @@ export const WorkflowTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
     const fs = yield* AppFileSystem.Service
-    const bus = yield* Bus.Service
+    const events = yield* EventV2Bridge.Service
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
     const scope = yield* Scope.Scope
@@ -465,8 +465,8 @@ export const WorkflowTool = Tool.define(
             })
             yield* fs.writeWithDirs(filepath, params.source)
             yield* format.file(filepath).pipe(Effect.ignore)
-            yield* bus.publish(File.Event.Edited, { file: filepath })
-            yield* bus.publish(FileWatcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
+            yield* events.publish(File.Event.Edited, { file: filepath })
+            yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
             yield* lsp.touchFile(filepath, "document")
             const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
             const info = workflows.find((item) => item.name === params.name)
@@ -489,7 +489,7 @@ export const WorkflowTool = Tool.define(
             metadata: { temporary: true, args: params.args ?? {}, background: params.background === true },
           })
           yield* fs.writeWithDirs(filepath, params.source)
-          yield* bus.publish(FileWatcher.Event.Updated, { file: filepath, event: "add" })
+          yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: "add" })
           const result = yield* startWorkflow({
             workflow,
             background,
@@ -502,7 +502,7 @@ export const WorkflowTool = Tool.define(
             ctx,
           })
           yield* fs.remove(filepath, { force: true }).pipe(Effect.ignore)
-          yield* bus.publish(FileWatcher.Event.Updated, { file: filepath, event: "unlink" })
+          yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: "unlink" })
           return result
         }).pipe(
           Effect.ensuring(

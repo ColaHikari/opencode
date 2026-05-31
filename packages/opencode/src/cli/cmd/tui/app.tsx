@@ -224,7 +224,11 @@ async function mountTui(input: TuiInput & { keymap: ReturnType<typeof createDefa
   const renderer = input.renderer
   // Prewarm palette before ThemeProvider mounts so `system` theme avoids a first-paint fallback flash.
   void renderer.getPalette({ size: 16 }).catch(() => undefined)
-  const mode = (await renderer.waitForThemeMode(1000)) ?? "dark"
+  const mode =
+    (await Promise.race([
+      renderer.waitForThemeMode(1000),
+      new Promise<"dark" | "light" | null>((resolve) => setTimeout(() => resolve(null), 1000).unref()),
+    ])) ?? "dark"
   if (renderer.isDestroyed) return
 
   await render(() => {

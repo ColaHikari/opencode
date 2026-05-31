@@ -351,12 +351,14 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
     onMount(init)
 
     function resolveSystemTheme(mode: "dark" | "light" = store.mode) {
-      return renderer
-        .getPalette({
+      return Promise.race([
+        renderer.getPalette({
           size: 16,
-        })
-        .then((colors: TerminalColors) => {
-          if (!colors.palette[0]) {
+        }),
+        new Promise<TerminalColors | undefined>((resolve) => setTimeout(() => resolve(undefined), 1000).unref()),
+      ])
+        .then((colors) => {
+          if (!colors?.palette[0]) {
             systemTheme = undefined
             syncThemes()
             if (store.active === "system") {
