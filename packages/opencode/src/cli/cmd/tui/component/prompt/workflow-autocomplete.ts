@@ -149,6 +149,7 @@ export async function listWorkflowInfos(workflow: WorkflowClient, enabled: boole
 
 export function parseWorkflowArgs(input: string) {
   return Object.fromEntries(
+    // Matches: [--]key[="quoted value" | 'quoted value' | unquoted_value]
     Array.from(input.matchAll(/(?:^|\s)(?:--)?([^=\s]+)(?:=("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S*))?/g)).map(
       (match) => {
         const raw = match[2] ?? "true"

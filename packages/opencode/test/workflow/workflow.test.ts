@@ -1,23 +1,14 @@
 import { describe, expect } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
 import { TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { Effect, Layer } from "effect"
-import fs from "fs/promises"
 import path from "path"
 
 const it = testEffect(Layer.mergeAll(Workflow.defaultLayer))
 
-async function writeWorkflow(dir: string, name: string, body: string) {
-  const workflows = path.join(dir, ".opencode", "workflows")
-  await fs.mkdir(workflows, { recursive: true })
-  await fs.writeFile(path.join(workflows, `${name}.js`), body)
-}
-
-async function writeTsWorkflow(dir: string, name: string, body: string) {
-  const workflows = path.join(dir, ".opencode", "workflows")
-  await fs.mkdir(workflows, { recursive: true })
-  await fs.writeFile(path.join(workflows, `${name}.ts`), body)
+async function writeWorkflow(dir: string, name: string, body: string, ext = "js") {
+  await Bun.write(path.join(dir, ".opencode", "workflows", `${name}.${ext}`), body)
 }
 
 describe("Workflow", () => {
@@ -87,7 +78,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() =>
-        writeTsWorkflow(
+        writeWorkflow(
           test.directory,
           "typed",
           `export default {
@@ -95,6 +86,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   async run(args, ctx) { ctx.setPhase("run"); ctx.log("typed"); return { value: args.value } }
 }
 `,
+          "ts",
         ),
       )
       const workflow = yield* Workflow.Service
@@ -102,16 +94,13 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(list.map((item) => item.name)).toContain("typed")
       const run = yield* workflow.start({ name: "typed", args: { value: 7 } })
 
-      function wait(): Effect.Effect<Workflow.Run> {
-        return Effect.gen(function* () {
+      const done = yield* pollWithTimeout(
+        Effect.gen(function* () {
           const current = yield* workflow.get(run.id)
-          if (current?.status === "completed") return current
-          yield* Effect.sleep("10 millis")
-          return yield* wait()
-        })
-      }
-
-      const done = yield* wait()
+          return current?.status === "completed" ? current : undefined
+        }),
+        "workflow never completed",
+      )
       expect(done.result).toEqual({ value: 7 })
     }),
   )

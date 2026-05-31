@@ -346,11 +346,7 @@ function createContext(input: {
     },
     async pipeline<T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]) {
       return Promise.all(
-        items.map(async (item) => {
-          let current = item
-          for (const step of steps) current = await step(current)
-          return current
-        }),
+        items.map((item) => steps.reduce<Promise<T>>((acc, step) => acc.then(step), Promise.resolve(item))),
       )
     },
     agent: input.agent,
@@ -471,7 +467,7 @@ export const layer = Layer.effect(
           isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
         ),
       )
-      const s = yield* InstanceState.get(state)
+      const inst = yield* InstanceState.get(state)
       const id = Identifier.ascending("job")
       const started_at = yield* Clock.currentTimeMillis
       const session = yield* sessions.create({ title: `Workflow: ${module.meta.name}` })
@@ -496,7 +492,7 @@ export const layer = Layer.effect(
         },
         done,
       }
-      yield* SynchronizedRef.update(s.runs, (runs) => new Map(runs).set(id, active))
+      yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, active)
       if (input.prompt) {
         yield* input.prompt
@@ -603,7 +599,7 @@ export const layer = Layer.effect(
             }),
         }),
         Effect.asVoid,
-        Effect.forkIn(s.scope, { startImmediately: true }),
+        Effect.forkIn(inst.scope, { startImmediately: true }),
       )
       return snapshot(active)
     })
@@ -635,13 +631,13 @@ export const layer = Layer.effect(
     })
 
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
-      const s = yield* InstanceState.get(state)
-      const active = (yield* SynchronizedRef.get(s.runs)).get(id)
+      const inst = yield* InstanceState.get(state)
+      const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
       if (active?.fiber) {
         yield* Fiber.interrupt(active.fiber).pipe(Effect.ignore)
         yield* Fiber.await(active.fiber).pipe(Effect.ignore)
       }
-      yield* SynchronizedRef.update(s.runs, (runs) => {
+      yield* SynchronizedRef.update(inst.runs, (runs) => {
         const next = new Map(runs)
         next.delete(id)
         return next

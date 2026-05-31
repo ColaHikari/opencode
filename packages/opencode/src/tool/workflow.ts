@@ -477,6 +477,7 @@ export const WorkflowTool = Tool.define(
             }
           }
 
+          // action === "run_temporary"
           if (!params.source) return yield* Effect.fail(new Error("source is required for action=run_temporary"))
           const instance = yield* InstanceState.context
           const name = temporaryName()
@@ -502,22 +503,13 @@ export const WorkflowTool = Tool.define(
           })
           yield* fs.remove(filepath, { force: true }).pipe(Effect.ignore)
           yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: "unlink" })
+          const workflowsDir = path.join(projectRoot(instance), ".opencode", "workflows")
+          const leftover = yield* fs.glob("temporary_job_*.ts", { cwd: workflowsDir, absolute: true })
+          yield* Effect.forEach(leftover, (file) => fs.remove(file, { force: true }).pipe(Effect.ignore), {
+            concurrency: "unbounded",
+          })
           return result
-        }).pipe(
-          Effect.ensuring(
-            Effect.gen(function* () {
-              const instance = yield* InstanceState.context
-              const matches = yield* fs.glob("temporary_job_*.ts", {
-                cwd: path.join(projectRoot(instance), ".opencode", "workflows"),
-                absolute: true,
-              })
-              yield* Effect.forEach(matches, (file) => fs.remove(file, { force: true }).pipe(Effect.ignore), {
-                concurrency: "unbounded",
-              })
-            }).pipe(Effect.ignore),
-          ),
-          Effect.orDie,
-        ),
+        }).pipe(Effect.orDie),
     }
   }),
 )
