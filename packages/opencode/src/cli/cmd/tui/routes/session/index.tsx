@@ -2131,12 +2131,8 @@ function WorkflowCall(props: ToolProps<typeof WorkflowTool>) {
   })
 
   const content = createMemo(() => {
-    if (props.input.action !== "start" && props.input.action !== "run_temporary") return undefined
-    const label =
-      current()?.definition?.meta.name ??
-      meta().workflow ??
-      props.input.name ??
-      (props.input.action === "run_temporary" ? "Temporary workflow" : "Workflow")
+    if (props.input.action !== "start") return undefined
+    const label = current()?.definition?.meta.name ?? meta().workflow ?? props.input.name ?? "Workflow"
     const lines = [meta().background ? `${label} (background)` : label]
     if (isRunning()) {
       const activeAgent = current()?.agents.findLast((agent) => agent.status === "running") ?? current()?.agents.at(-1)
@@ -2153,7 +2149,7 @@ function WorkflowCall(props: ToolProps<typeof WorkflowTool>) {
     return lines.join("\n")
   })
 
-  if (props.input.action !== "start" && props.input.action !== "run_temporary") return <GenericTool {...props} />
+  if (props.input.action !== "start") return <GenericTool {...props} />
 
   return (
     <InlineTool

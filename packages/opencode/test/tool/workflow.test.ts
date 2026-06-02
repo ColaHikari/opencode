@@ -11,6 +11,9 @@ import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "@/session/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import type { SessionPrompt } from "@/session/prompt"
+import type { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import { PartID } from "@/session/schema"
 
 const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, CrossSpawnSpawner.defaultLayer))
 
@@ -37,14 +40,49 @@ async function writeWorkflow(dir: string, name: string, source: string) {
 
 function requestRecorder() {
   const requests: Array<Omit<Permission.Request, "id" | "sessionID" | "tool">> = []
+  const prompts: SessionPrompt.PromptInput[] = []
   const ctx: Tool.Context = {
     ...baseCtx,
     ask: (req) =>
       Effect.sync(() => {
         requests.push(req)
       }),
+    extra: {
+      promptOps: {
+        prompt: (input: SessionPrompt.PromptInput) =>
+          Effect.sync(() => {
+            prompts.push(input)
+            return {
+              info: {
+                id: MessageID.ascending(),
+                role: "assistant",
+                parentID: input.messageID ?? MessageID.ascending(),
+                sessionID: input.sessionID,
+                mode: input.agent ?? "general",
+                agent: input.agent ?? "general",
+                cost: 0,
+                path: { cwd: "/tmp", root: "/tmp" },
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                modelID: input.model?.modelID ?? ProviderV2.ModelID.make("gpt-5"),
+                providerID: input.model?.providerID ?? ProviderV2.ID.opencode,
+                time: { created: Date.now() },
+                finish: "stop",
+              },
+              parts: [
+                {
+                  id: PartID.ascending(),
+                  messageID: MessageID.ascending(),
+                  sessionID: input.sessionID,
+                  type: "text",
+                  text: "ok",
+                },
+              ],
+            } as SessionLegacy.WithParts
+          }),
+      },
+    },
   }
-  return { ctx, requests }
+  return { ctx, requests, prompts }
 }
 
 function workflowTool() {
@@ -120,25 +158,30 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
     ),
   )
 
-  it.live("runs temporary workflow, removes file, and preserves source in history", () =>
+  it.live("routes workflow agent permission asks to the caller session", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
-        const source = `export const meta = { name: "Temporary", description: "One shot." }
-export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
-`
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "ask",
+            `export const meta = { name: "Ask" }
+export async function run(args, ctx) {
+  return await ctx.agent({ prompt: "Need permission" })
+}
+`,
+          ),
+        )
+
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
-        const result = yield* tool.execute({ action: "run_temporary", source, args: { value: 7 } }, recorder.ctx)
-        const runID = typeof result.metadata.runId === "string" ? result.metadata.runId : ""
-        const details = yield* tool.execute({ action: "inspect", run_id: runID, view: "all" }, recorder.ctx)
-        const files = yield* Effect.promise(() => fs.readdir(path.join(dir, ".opencode", "workflows")))
+        const result = yield* tool.execute(
+          { action: "start", name: "ask" },
+          recorder.ctx,
+        )
 
-        expect(recorder.requests[0].permission).toBe("workflow")
-        expect(recorder.requests[0].patterns).toEqual(["temporary"])
-        expect(details.output).toContain("<temporary>true</temporary>")
-        expect(details.output).toContain(source)
-        expect(files).toEqual([])
-        expect(result.output).toContain('"value": 7')
+        expect(result.output).toContain(`<workflow_run id="${result.metadata.runId}" state="completed">`)
+        expect(recorder.prompts.some((prompt) => prompt.permissionSessionID === recorder.ctx.sessionID)).toBe(true)
       }),
     ),
   )

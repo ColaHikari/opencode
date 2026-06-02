@@ -4,7 +4,6 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { File } from "@/file"
 import { FileWatcher } from "@/file/watcher"
 import { Format } from "@/format"
-import { Identifier } from "@/id/id"
 import { LSP } from "@/lsp/lsp"
 import { Session } from "@/session/session"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
@@ -17,13 +16,14 @@ import { trimDiff } from "./edit"
 import { Workflow } from "@/workflow/workflow"
 
 const WORKFLOW_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
+const DEFAULT_TIMEOUT = 60 * 60 * 1000
 
-const Action = Schema.Literals(["read", "start", "wait", "inspect", "create", "run_temporary"])
+const Action = Schema.Literals(["read", "start", "wait", "inspect", "create"])
 const InspectView = Schema.Literals(["summary", "logs", "agents", "agent", "result", "all"])
 
 const Parameters = Schema.Struct({
   action: Action.annotate({
-    description: "Workflow operation to perform: read, start, wait, inspect, create, or run_temporary",
+    description: "Workflow operation to perform: read, start, wait, inspect, or create",
   }),
   name: Schema.optional(Schema.String).annotate({
     description: "Workflow name for read/start/create. For create, this is the file name without extension.",
@@ -47,7 +47,7 @@ const Parameters = Schema.Struct({
     description: "Agent run id to inspect when view is agent",
   }),
   source: Schema.optional(Schema.String).annotate({
-    description: "Complete TypeScript workflow source for create/run_temporary",
+    description: "Complete TypeScript workflow source for create",
   }),
   overwrite: Schema.optional(Schema.Boolean).annotate({ description: "Overwrite an existing workflow file" }),
 })
@@ -64,7 +64,6 @@ const DESCRIPTION = [
   "- wait: wait for a running workflow by run_id.",
   "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details.",
   "- create: write a persistent .opencode/workflows/<name>.ts workflow file.",
-  "- run_temporary: create and run a one-shot workflow, remove its file after launch, and preserve source in history.",
 ].join("\n")
 
 function promptOps(ctx: Tool.Context) {
@@ -229,10 +228,6 @@ function sanitizeWorkflowName(name: string) {
   return name
 }
 
-function temporaryName() {
-  return `temporary_${Identifier.ascending("job").replace(/[^A-Za-z0-9_]/g, "_")}`
-}
-
 function workflowPath(directory: string, name: string) {
   return path.join(directory, ".opencode", "workflows", `${sanitizeWorkflowName(name)}.ts`)
 }
@@ -283,6 +278,7 @@ function startWorkflow(input: {
         name: input.name,
         args: input.params.args,
         prompt: ops,
+        permissionSessionID: input.ctx.sessionID,
         source: input.source,
         temporary: input.temporary,
       })
@@ -356,7 +352,7 @@ function startWorkflow(input: {
       }
     }
 
-    const waited = yield* waitForWorkflow(input.workflow, run, input.params.timeout)
+    const waited = yield* waitForWorkflow(input.workflow, run, input.params.timeout ?? DEFAULT_TIMEOUT)
     return {
       title: waited.timedOut ? `Workflow still running: ${run.workflow}` : `Workflow finished: ${run.workflow}`,
       metadata: { ...workflowMetadata(run, false), jobId: "", timedOut: waited.timedOut },
@@ -415,7 +411,7 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "wait") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=wait"))
-            const waited = yield* workflow.wait({ id: params.run_id, timeout: params.timeout })
+            const waited = yield* workflow.wait({ id: params.run_id, timeout: params.timeout ?? DEFAULT_TIMEOUT })
             if (!waited.run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             return {
               title: waited.timedOut
@@ -476,39 +472,7 @@ export const WorkflowTool = Tool.define(
               output: ["Workflow file created and validated.", "", formatWorkflow(info)].join("\n"),
             }
           }
-
-          // action === "run_temporary"
-          if (!params.source) return yield* Effect.fail(new Error("source is required for action=run_temporary"))
-          const instance = yield* InstanceState.context
-          const name = temporaryName()
-          const filepath = workflowPath(projectRoot(instance), name)
-          yield* ctx.ask({
-            permission: "workflow",
-            patterns: ["temporary"],
-            always: ["temporary"],
-            metadata: { temporary: true, args: params.args ?? {}, background: params.background === true },
-          })
-          yield* fs.writeWithDirs(filepath, params.source)
-          yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: "add" })
-          const result = yield* startWorkflow({
-            workflow,
-            background,
-            sessions,
-            scope,
-            params,
-            name,
-            source: params.source,
-            temporary: true,
-            ctx,
-          })
-          yield* fs.remove(filepath, { force: true }).pipe(Effect.ignore)
-          yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: "unlink" })
-          const workflowsDir = path.join(projectRoot(instance), ".opencode", "workflows")
-          const leftover = yield* fs.glob("temporary_job_*.ts", { cwd: workflowsDir, absolute: true })
-          yield* Effect.forEach(leftover, (file) => fs.remove(file, { force: true }).pipe(Effect.ignore), {
-            concurrency: "unbounded",
-          })
-          return result
+          return yield* Effect.fail(new Error(`Unsupported workflow action: ${params.action}`))
         }).pipe(Effect.orDie),
     }
   }),

@@ -23,6 +23,7 @@ export type WorkflowAgentInput = {
   agent?: string
   model?: string
   schema?: unknown
+  permissionSessionID?: string
 }
 
 export type WorkflowAgentResult = {

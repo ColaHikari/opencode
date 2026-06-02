@@ -119,6 +119,7 @@ export type StartOptions = StartInput & {
   prompt?: PromptOps
   source?: string
   temporary?: boolean
+  permissionSessionID?: SessionID
 }
 
 export type WaitInput = {
@@ -145,6 +146,7 @@ export type AgentInput = {
   prompt: string
   model?: string
   schema?: Record<string, unknown>
+  permissionSessionID?: SessionID
 }
 
 export type ContextApi = {
@@ -318,6 +320,7 @@ function projectConfigDir(ctx: { directory: string; worktree: string }) {
 function createContext(input: {
   active: Active
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  permissionSessionID?: SessionID
   persist: () => void
 }): ContextApi {
   return {
@@ -331,7 +334,7 @@ function createContext(input: {
       input.persist()
     },
     async parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
-      const concurrency = Math.max(1, options?.concurrencyLimit ?? 4)
+      const concurrency = Math.max(1, options?.concurrencyLimit ?? 20)
       const results: T[] = []
       let index = 0
       await Promise.all(
@@ -546,6 +549,7 @@ export const layer = Layer.effect(
               yield* persistRun(db, active)
               const message = yield* prompt.prompt({
                 sessionID: session.id,
+                permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
                 agent: selected.name,
                 model: modelInfo,
                 format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,

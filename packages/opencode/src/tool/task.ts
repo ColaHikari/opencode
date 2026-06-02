@@ -191,6 +191,7 @@ export const TaskTool = Tool.define(
         const result = yield* ops.prompt({
           messageID: MessageID.ascending(),
           sessionID: nextSession.id,
+          permissionSessionID: ctx.sessionID,
           model: {
             modelID: model.modelID,
             providerID: model.providerID,

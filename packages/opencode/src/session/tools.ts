@@ -16,7 +16,7 @@ import { Effect } from "effect"
 import { MessageV2 } from "./message-v2"
 import * as Session from "./session"
 import { SessionProcessor } from "./processor"
-import { PartID } from "./schema"
+import { PartID, SessionID } from "./schema"
 import * as Log from "@opencode-ai/core/util/log"
 import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -27,6 +27,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
+  permissionSessionID?: SessionID
   processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
   messages: SessionLegacy.WithParts[]
@@ -67,7 +68,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       permission
         .ask({
           ...req,
-          sessionID: input.session.id,
+          sessionID: input.permissionSessionID ?? input.session.id,
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
         })

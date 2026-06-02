@@ -83,14 +83,3 @@ Recommended flow:
 4. Use `view: "agent"` with `agent_id` to read a specific subagent prompt,
    final response, usage, and errors.
 5. Use `view: "all"` only when the user needs a complete audit trail.
-
-## Temporary Workflows
-
-Use the `workflow` tool with `action: "run_temporary"` for one-shot automation
-that should not leave a workflow file behind. The temporary source file is
-removed after launch, but the source is preserved in workflow history for audit
-and debugging.
-
-Do not use temporary workflows as a substitute for normal tool calls. They are
-appropriate when the user wants a short-lived orchestration that uses workflow
-features such as phases, logs, parallel agents, or structured final review.
