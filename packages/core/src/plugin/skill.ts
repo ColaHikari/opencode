@@ -31,6 +31,18 @@ export const Plugin = PluginV2.define({
           }),
         }),
       )
+      editor.source(
+        new SkillV2.EmbeddedSource({
+          type: "embedded",
+          skill: new SkillV2.Info({
+            name: "workflows-instructions",
+            description:
+              "Use when the user asks to create, modify, run, debug, or review opencode workflows. Explains workflow authoring, the native workflow tool, foreground/background execution, permissions, and how to inspect logs, agents, and results. Do not use for ordinary tasks unless the user explicitly wants workflow automation.",
+            location: AbsolutePath.make("/builtin/workflows-instructions.md"),
+            content: WorkflowsInstructionsContent,
+          }),
+        }),
+      )
     })
   }),
 })

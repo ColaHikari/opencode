@@ -503,16 +503,26 @@ function mutableMeta(meta: Meta): Definition["meta"] {
   }
 }
 
-// Each call imports the file fresh, keyed by its current mtime, so a workflow
-// edited between calls is always reloaded. We deliberately do NOT keep a
-// cross-call module cache: Bun's module cache is not reliably invalidated by a
-// `?mtime=` query alone, so caching the imported module by mtime can serve a
-// stale `run`/`meta` after an edit (the realtime-update bug). Correctness over
-// micro-optimization — the double-load that motivated Befund #4 is already gone
-// because start() now loads only the target module instead of calling list().
+// Each call imports the file fresh through a unique temp-file copy, so a
+// workflow edited between calls is always reloaded. We deliberately do NOT keep
+// a cross-call module cache, and we do not rely on a `?mtime=` query either:
+// Bun's module cache is not reliably invalidated by a query string alone, so a
+// cached or query-busted import can serve a stale `run`/`meta` after an edit
+// (the realtime-update bug). Correctness over micro-optimization — the
+// double-load that motivated the original finding is already gone because
+// start() now loads only the target module instead of calling list().
 async function loadModule(file: string): Promise<Module> {
-  const mtimeMs = (await Bun.file(file).stat()).mtimeMs
-  const imported = (await import(`${pathToFileURL(file).href}?mtime=${mtimeMs}`)) as Record<string, unknown>
+  const source = await Bun.file(file).text()
+  const ext = path.extname(file)
+  const cachePath = path.join(
+    path.dirname(file),
+    `.${path.basename(file, ext)}.${Date.now()}.${Math.random().toString(16).slice(2)}${ext === ".js" ? ".mjs" : ".mts"}`,
+  )
+  await Bun.write(cachePath, source)
+  const imported = (await import(pathToFileURL(cachePath).href).finally(() => Bun.file(cachePath).delete())) as Record<
+    string,
+    unknown
+  >
   const module = (
     typeof imported.default === "object" && imported.default !== null ? imported.default : imported
   ) as Record<string, unknown>
