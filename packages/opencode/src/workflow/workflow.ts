@@ -149,10 +149,14 @@ export class InvalidError extends Schema.TaggedErrorClass<InvalidError>()("Workf
 }) {}
 
 /**
- * Thrown inside a workflow module when the run has been cancelled. It unwinds
- * `module.run` (and any in-flight `ctx.parallel`/`ctx.pipeline` step) so the
- * follow-up step never starts. Surfaced as an interrupt-only cause so the run
- * is finished as `cancelled` rather than `failed`.
+ * Thrown by `checkpoint()` before the next `ctx.agent`/`ctx.parallel`/
+ * `ctx.pipeline` task/step once the run's abort signal has fired, so the
+ * follow-up step never starts. Detected in the run's failure branch and mapped
+ * to `cancelled` rather than `failed`.
+ *
+ * Deliberately a plain `Error` (not `Schema.TaggedErrorClass`): it is thrown
+ * synchronously from `checkpoint()`, a non-Effect JS callback invoked by the
+ * workflow module's own code, so it cannot yield an Effect error.
  */
 export class CancelledError extends Error {
   readonly _tag = "WorkflowCancelledError"
@@ -291,12 +295,6 @@ function isCancelled(value: unknown): boolean {
   )
 }
 
-function isCancelledCause(cause: Cause.Cause<unknown>): boolean {
-  // A workflow module throwing CancelledError surfaces as a failure or a defect
-  // depending on the path; squash returns the representative error either way.
-  return isCancelled(Cause.squash(cause))
-}
-
 function mutableMeta(meta: Meta): Definition["meta"] {
   return {
     name: meta.name,
@@ -364,7 +362,7 @@ function createContext(input: {
   persist: () => void
   /** AbortSignal of the run fiber; fires when the run is interrupted/cancelled. */
   signal: () => AbortSignal | undefined
-  /** Runs an Effect on the run fiber's runtime (used for Effect concurrency). */
+  /** Bridge used to run the task/step graph via Effect.forEach concurrency. */
   bridge: EffectBridge.Shape
 }): ContextApi {
   const checkpoint = () => {
@@ -383,8 +381,12 @@ function createContext(input: {
     parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
       checkpoint()
       const concurrency = Math.max(1, options?.concurrencyLimit ?? 20)
-      // Run on Effect concurrency inside the run fiber's runtime so interruption
-      // propagates; each task is gated by the run's abort signal before it runs.
+      // Each task is gated by the run's abort signal via checkpoint() before it
+      // starts: once cancel has fired, not-yet-started tasks throw CancelledError
+      // and never run. Note: a task already in flight is NOT force-interrupted —
+      // it runs to completion (or, if it is an agent step, is aborted for real
+      // via PromptOps.cancel on its child session). This is deliberate: the
+      // bridge runs each task as its own root fiber, not a child of active.fiber.
       return input.bridge.promise(
         Effect.forEach(
           tasks,
@@ -399,6 +401,11 @@ function createContext(input: {
     },
     pipeline<T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]) {
       checkpoint()
+      // Same gating as parallel(): checkpoint() throws CancelledError before each
+      // step, so the next step never starts after cancel. A step already in
+      // flight runs to completion (agent steps are additionally aborted for real
+      // via PromptOps.cancel) — the bridge runs the work as a root fiber, not a
+      // child of active.fiber, so interruption does not propagate down the tree.
       return input.bridge.promise(
         Effect.forEach(
           items,
@@ -690,9 +697,14 @@ export const layer = Layer.effect(
         Effect.matchCauseEffect({
           onSuccess: (result) => finish(id, "completed", { result }),
           onFailure: (cause) =>
+            // A workflow module throwing CancelledError surfaces as a failure or
+            // a defect depending on the path; squash returns the representative
+            // error either way, so `isCancelled(squash)` catches both.
             finish(
               id,
-              active.cancelling || Cause.hasInterruptsOnly(cause) || isCancelledCause(cause) ? "cancelled" : "failed",
+              active.cancelling || Cause.hasInterruptsOnly(cause) || isCancelled(Cause.squash(cause))
+                ? "cancelled"
+                : "failed",
               { error: errorText(Cause.squash(cause)) },
             ),
         }),
@@ -721,11 +733,14 @@ export const layer = Layer.effect(
       return { run: snapshot(active), timedOut: true }
     })
 
-    // Two-stage interruption: (1) interrupt the run fiber so its AbortSignal
-    // fires (gates ctx steps), then (2) abort every tracked child agent session
-    // via the prompt-ops cancel — that unblocks the detached agent promise so
-    // module.run can unwind and the fiber actually completes. Only after both
-    // do we await the fiber.
+    // Two-stage cancel. (1) Interrupt the run fiber: this fires its AbortSignal,
+    // which makes checkpoint() throw CancelledError before the NEXT ctx step, so
+    // no follow-up step starts. It does NOT reach the in-flight agent — that runs
+    // as a detached root fiber via bridge.promise, not a child of active.fiber.
+    // (2) Abort every tracked child agent session via PromptOps.cancel; that is
+    // what actually stops the in-flight agent (same path as TUI Esc / HTTP abort)
+    // and unblocks its promise so module.run can unwind and the fiber completes.
+    // Only after both do we await the fiber.
     const abortRun = Effect.fn("Workflow.abortRun")(function* (active: Active) {
       if (!active.fiber) return
       active.cancelling = true
