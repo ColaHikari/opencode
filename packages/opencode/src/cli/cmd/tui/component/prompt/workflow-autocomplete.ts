@@ -13,9 +13,9 @@ export type WorkflowArgContext = {
 }
 
 export const WORKFLOW_COMMAND_PREFIX = "/workflow "
-const WORKFLOW_COMMAND_PATTERN = /^\/(?:workflow|worfklow)\s+(\S*)$/
-const WORKFLOW_ARG_PATTERN = /^\/(?:workflow|worfklow)\s+(\S+)(?:\s+(.*))?$/
-const WORKFLOW_COMMAND_ALIASES = ["/workflow ", "/worfklow "]
+const WORKFLOW_COMMAND_PATTERN = /^\/workflow\s+(\S*)$/
+const WORKFLOW_ARG_PATTERN = /^\/workflow\s+(\S+)(?:\s+(.*))?$/
+const WORKFLOW_COMMAND_ALIASES = ["/workflow "]
 
 export function workflowNameQuery(input: string, cursorOffset: number) {
   return input.slice(0, cursorOffset).match(WORKFLOW_COMMAND_PATTERN)?.[1]
@@ -82,7 +82,6 @@ export function workflowCommandOption(input: TextareaRenderable): AutocompleteOp
   return {
     display: "/workflow",
     description: "Start a workflow by name",
-    aliases: ["/worfklow"],
     onSelect: () => {
       const cursor = input.logicalCursor
       input.deleteRange(0, 0, cursor.row, cursor.col)
