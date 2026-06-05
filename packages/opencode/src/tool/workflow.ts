@@ -1,12 +1,12 @@
 import { BackgroundJob } from "@/background/job"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { File } from "@/file"
-import { FileWatcher } from "@/file/watcher"
 import { Format } from "@/format"
 import { LSP } from "@/lsp/lsp"
 import { Session } from "@/session/session"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FileSystem } from "@opencode-ai/core/filesystem"
+import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { createTwoFilesPatch } from "diff"
 import path from "path"
 import { Cause, Effect, Schema, Scope } from "effect"
@@ -372,7 +372,7 @@ export const WorkflowTool = Tool.define(
     const workflow = yield* Workflow.Service
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
-    const fs = yield* AppFileSystem.Service
+    const fs = yield* FSUtil.Service
     const events = yield* EventV2Bridge.Service
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
@@ -460,8 +460,8 @@ export const WorkflowTool = Tool.define(
             })
             yield* fs.writeWithDirs(filepath, params.source)
             yield* format.file(filepath).pipe(Effect.ignore)
-            yield* events.publish(File.Event.Edited, { file: filepath })
-            yield* events.publish(FileWatcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
+            yield* events.publish(FileSystem.Event.Edited, { file: filepath })
+            yield* events.publish(Watcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
             yield* lsp.touchFile(filepath, "document")
             const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
             const info = workflows.find((item) => item.name === params.name)

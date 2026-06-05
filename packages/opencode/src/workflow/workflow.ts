@@ -8,7 +8,7 @@ import { Session } from "@/session/session"
 import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { DeepMutable } from "@opencode-ai/core/schema"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { desc, eq } from "drizzle-orm"
@@ -112,7 +112,7 @@ export const StartInput = Schema.Struct({
 export type StartInput = Schema.Schema.Type<typeof StartInput>
 
 export type PromptOps = {
-  prompt: (input: SessionPrompt.PromptInput) => Effect.Effect<SessionLegacy.WithParts, unknown>
+  prompt: (input: SessionPrompt.PromptInput) => Effect.Effect<SessionV1.WithParts, unknown>
 }
 
 export type StartOptions = StartInput & {
@@ -284,9 +284,9 @@ async function loadModule(file: string): Promise<Module> {
   }
 }
 
-function assistantText(message: SessionLegacy.WithParts) {
+function assistantText(message: SessionV1.WithParts) {
   return message.parts
-    .filter((part): part is SessionLegacy.TextPart => part.type === "text" && part.text.trim().length > 0)
+    .filter((part): part is SessionV1.TextPart => part.type === "text" && part.text.trim().length > 0)
     .map((part) => part.text)
     .join("\n")
 }
@@ -556,10 +556,11 @@ export const layer = Layer.effect(
                 parts: [{ type: "text", text: agentInput.prompt }],
               })
               node.message_id = message.info.id
-              node.output =
+              const text =
                 message.info.role === "assistant" && message.info.structured !== undefined
                   ? JSON.stringify(message.info.structured, null, 2)
                   : assistantText(message)
+              node.output = text
               if (message.info.role === "assistant") {
                 node.model = `${message.info.providerID}/${message.info.modelID}`
                 node.cost = message.info.cost
@@ -569,8 +570,8 @@ export const layer = Layer.effect(
                 data:
                   message.info.role === "assistant" && message.info.structured !== undefined
                     ? message.info.structured
-                    : node.output,
-                text: node.output,
+                    : text,
+                text,
               }
             }),
           )

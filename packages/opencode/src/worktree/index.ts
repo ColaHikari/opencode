@@ -15,7 +15,7 @@ import { Git } from "@/git"
 import { Effect, Layer, Path, Schema, Scope, Context } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { NodePath } from "@effect/platform-node"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
 
@@ -149,7 +149,7 @@ type GitResult = { code: number; text: string; stderr: string }
 export const layer: Layer.Layer<
   Service,
   never,
-  | AppFileSystem.Service
+  | FSUtil.Service
   | Path.Path
   | AppProcess.Service
   | Git.Service
@@ -160,7 +160,7 @@ export const layer: Layer.Layer<
   Service,
   Effect.gen(function* () {
     const scope = yield* Scope.Scope
-    const fs = yield* AppFileSystem.Service
+    const fs = yield* FSUtil.Service
     const pathSvc = yield* Path.Path
     const appProcess = yield* AppProcess.Service
     const { db } = yield* Database.Service
@@ -384,10 +384,19 @@ export const layer: Layer.Layer<
 
     function cleanDirectory(target: string) {
       return Effect.tryPromise({
-        try: () =>
-          import("fs/promises").then((fsp) =>
-            fsp.rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
-          ),
+        try: async () => {
+          const fsp = await import("fs/promises")
+          const attempts = process.platform === "win32" ? 50 : 5
+          for (const attempt of Array.from({ length: attempts }, (_, i) => i)) {
+            try {
+              await fsp.rm(target, { recursive: true, force: true })
+              return
+            } catch (error) {
+              if (attempt === attempts - 1) throw error
+              await new Promise((resolve) => setTimeout(resolve, 100))
+            }
+          }
+        },
         catch: (error) =>
           new RemoveFailedError({ message: errorMessage(error) || "Failed to remove git worktree directory" }),
       })
@@ -627,7 +636,7 @@ export const appLayer = layer.pipe(
   Layer.provide(AppProcess.defaultLayer),
   Layer.provide(Project.defaultLayer),
   Layer.provide(Database.defaultLayer),
-  Layer.provide(AppFileSystem.defaultLayer),
+  Layer.provide(FSUtil.defaultLayer),
   Layer.provide(NodePath.layer),
 )
 
