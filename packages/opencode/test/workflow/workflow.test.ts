@@ -206,7 +206,11 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
       // Ein kaputtes Ziel scheitert präzise (InvalidError, der die Datei/den Namen nennt).
       const failed = yield* workflow.start({ name: "broken", args: {} }).pipe(Effect.flip)
       expect(failed._tag).toBe("WorkflowInvalidError")
-      expect(failed.path).toContain("broken")
+      // Narrow the start() error union (InvalidError | NotFoundError) to the
+      // precise InvalidError so its `path` is accessible and typed.
+      const invalid =
+        failed instanceof Workflow.InvalidError ? failed : (yield* Effect.fail(new Error("expected InvalidError")))
+      expect(invalid.path).toContain("broken")
 
       // Die gültige Datei ist trotz broken.ts startbar (kein voller list()-Abbruch).
       const ok = yield* workflow.start({ name: HELLO_FIXTURE, args: {} })

@@ -60,6 +60,7 @@ const it = testEffect(
                     version: { type: "string", description: "Version to summarize." },
                   },
                 },
+                valid: true,
               },
             ]),
           runs: () => Effect.succeed([]),

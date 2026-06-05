@@ -37,6 +37,12 @@ export const Info = Schema.Struct({
   name: Schema.String,
   path: Schema.String,
   meta: Meta,
+  // `valid: false` marks a file that failed to load (bad meta / missing run /
+  // syntax error). It is still returned so a single broken file never makes the
+  // whole list fail; `error` carries the load failure as a human-readable
+  // string. Valid entries are explicitly `valid: true` (never omitted).
+  valid: Schema.Boolean,
+  error: Schema.optional(Schema.String),
 }).annotate({ identifier: "WorkflowInfo" })
 export type Info = Schema.Schema.Type<typeof Info>
 
@@ -209,7 +215,9 @@ type State = {
 }
 
 export interface Interface {
-  readonly list: () => Effect.Effect<Info[], InvalidError>
+  // Never fails: a file that cannot be loaded is reported as an invalid Info
+  // entry rather than aborting the whole list.
+  readonly list: () => Effect.Effect<Info[]>
   readonly runs: () => Effect.Effect<Run[]>
   readonly get: (id: string) => Effect.Effect<Run | undefined>
   readonly start: (input: StartOptions) => Effect.Effect<Run, InvalidError | NotFoundError>
@@ -336,10 +344,16 @@ function mutableMeta(meta: Meta): Definition["meta"] {
   }
 }
 
+// Each call imports the file fresh, keyed by its current mtime, so a workflow
+// edited between calls is always reloaded. We deliberately do NOT keep a
+// cross-call module cache: Bun's module cache is not reliably invalidated by a
+// `?mtime=` query alone, so caching the imported module by mtime can serve a
+// stale `run`/`meta` after an edit (the realtime-update bug). Correctness over
+// micro-optimization — the double-load that motivated Befund #4 is already gone
+// because start() now loads only the target module instead of calling list().
 async function loadModule(file: string): Promise<Module> {
-  const imported = (await import(
-    `${pathToFileURL(file).href}?mtime=${(await Bun.file(file).stat()).mtimeMs}`
-  )) as Record<string, unknown>
+  const mtimeMs = (await Bun.file(file).stat()).mtimeMs
+  const imported = (await import(`${pathToFileURL(file).href}?mtime=${mtimeMs}`)) as Record<string, unknown>
   const module = (
     typeof imported.default === "object" && imported.default !== null ? imported.default : imported
   ) as Record<string, unknown>
@@ -522,13 +536,33 @@ export const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       const directories = [...new Set([...(yield* config.directories()), projectConfigDir(ctx)])]
       const workflows = yield* Effect.promise(() => discover(directories))
+      // Per-file error isolation: each file is loaded inside Effect.result so a
+      // failure becomes an `{ valid: false, error }` entry instead of aborting
+      // the whole list. One broken file (bad meta / missing run / syntax error)
+      // therefore never makes the entire list — and, transitively, every
+      // workflow — unloadable. loadModule rejects with InvalidError on bad meta /
+      // missing run and with the raw load error on a syntax error.
       return yield* Effect.forEach(
         workflows,
         (workflow) =>
-          Effect.promise(() => loadModule(workflow.path)).pipe(
-            Effect.map((module) => ({ ...workflow, meta: module.meta })),
-            Effect.mapError((error) =>
+          Effect.tryPromise({
+            try: () => loadModule(workflow.path),
+            catch: (error) =>
               isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
+          }).pipe(
+            Effect.result,
+            Effect.map((result): Info =>
+              result._tag === "Success"
+                ? { ...workflow, meta: result.success.meta, valid: true }
+                : {
+                    ...workflow,
+                    // Synthesize a minimal meta so the schema stays satisfied and
+                    // consumers can still show the file's name; `valid: false`
+                    // signals the entry is not runnable.
+                    meta: { name: workflow.name },
+                    valid: false,
+                    error: result.failure.message,
+                  },
             ),
           ),
         { concurrency: "unbounded" },
@@ -578,14 +612,23 @@ export const layer = Layer.effect(
     })
 
     const start: Interface["start"] = Effect.fn("Workflow.start")(function* (input) {
-      const workflows = yield* list()
-      const workflow = workflows.find((item) => item.name === input.name)
+      // Resolve the single target by name without loading every workflow: a
+      // broken sibling file must not block starting a valid one. Only the target
+      // module is imported, and a broken target fails precisely (InvalidError
+      // naming the file) rather than as part of a whole-list failure.
+      const ctx = yield* InstanceState.context
+      const directories = [...new Set([...(yield* config.directories()), projectConfigDir(ctx)])]
+      const discovered = yield* Effect.promise(() => discover(directories))
+      const workflow = discovered.find((item) => item.name === input.name)
       if (!workflow) return yield* new NotFoundError({ name: input.name })
-      const module = yield* Effect.promise(() => loadModule(workflow.path)).pipe(
-        Effect.mapError((error) =>
+      // tryPromise so a load failure (bad meta / missing run / syntax error)
+      // surfaces as a typed InvalidError naming the file, not as an unhandled
+      // defect (Effect.promise would treat a rejection as a die).
+      const module = yield* Effect.tryPromise({
+        try: () => loadModule(workflow.path),
+        catch: (error) =>
           isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
-        ),
-      )
+      })
       const inst = yield* InstanceState.get(state)
       const id = Identifier.ascending("job")
       const started_at = yield* Clock.currentTimeMillis
