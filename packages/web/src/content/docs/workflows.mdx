@@ -249,6 +249,11 @@ Here each topic is drafted then reviewed independently; `results` is an array of
 `{ topic, review }` in input order. Pass an optional final
 `{ concurrencyLimit }` argument to cap how many items run at once.
 
+For a single-stage pipeline you must annotate the stage parameter
+(`async (item: string) => …`), otherwise TypeScript infers nothing and reports
+`TS7006: Parameter 'item' implicitly has an 'any' type`. Multi-stage pipelines
+infer the parameter types automatically, so no annotation is needed.
+
 ---
 
 ## Patterns
