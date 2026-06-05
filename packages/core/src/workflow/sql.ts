@@ -1,7 +1,22 @@
 import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { Timestamps } from "../database/schema.sql"
 
-type Definition = {
+// The workflow_run table lives in core (not in the opencode engine that owns the
+// runtime logic) because migrations are applied by core: every Drizzle table must
+// be declared here so the schema/migration pipeline sees it (cf. AGENTS.md,
+// "migrations live in packages/core and are applied by core"). The engine in
+// `packages/opencode/src/workflow/workflow.ts` re-exports the table via a one-line
+// bridge and owns the Effect schemas that validate these shapes at runtime.
+//
+// These row types are the SINGLE SOURCE OF TRUTH for the JSON column payloads:
+// they are the persistence contract that defines the columns. The engine's Effect
+// schemas (the runtime validators) are asserted assignable to/from these row types
+// at compile time, so the two can never silently drift again — a field added,
+// removed, or retyped on either side fails the engine build. The dependency law
+// (core must not import the engine) means the canonical declaration has to live
+// here in core; the assertion lives in the engine, which legally imports core.
+
+export type WorkflowDefinitionRow = {
   name: string
   path: string
   meta: {
@@ -14,14 +29,20 @@ type Definition = {
   temporary?: boolean
 }
 
-type LogEntry = {
+export type WorkflowLogRow = {
   time: number
   phase?: string
   message: string
 }
 
-type AgentRun = {
+export type WorkflowAgentRow = {
   id: string
+  // Agent NODES only ever carry these three. The run-level `status` column below
+  // is widened to also include "cancelled"/"interrupted", but those are RUN
+  // lifecycle states only: on cancel/interrupt the engine rewrites a still-running
+  // agent node to "failed" (with an explanatory error), and the orphan sweep
+  // touches only the run row, never the agents JSON. Keep this union in lockstep
+  // with the engine's `AgentRun` schema (asserted at compile time over there).
   status: "running" | "completed" | "failed"
   started_at: number
   completed_at?: number
@@ -52,14 +73,14 @@ export const WorkflowRunTable = sqliteTable(
     id: text().primaryKey(),
     session_id: text(),
     workflow: text().notNull(),
-    status: text().$type<"running" | "completed" | "failed" | "cancelled">().notNull(),
+    status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted">().notNull(),
     started_at: integer().notNull(),
     completed_at: integer(),
     current_phase: text(),
     args: text({ mode: "json" }).$type<Record<string, unknown>>(),
-    definition: text({ mode: "json" }).$type<Definition>(),
-    logs: text({ mode: "json" }).notNull().$type<LogEntry[]>(),
-    agents: text({ mode: "json" }).notNull().$type<AgentRun[]>(),
+    definition: text({ mode: "json" }).$type<WorkflowDefinitionRow>(),
+    logs: text({ mode: "json" }).notNull().$type<WorkflowLogRow[]>(),
+    agents: text({ mode: "json" }).notNull().$type<WorkflowAgentRow[]>(),
     result: text({ mode: "json" }).$type<unknown>(),
     error: text(),
     ...Timestamps,

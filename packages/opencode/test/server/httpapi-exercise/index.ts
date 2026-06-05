@@ -1473,6 +1473,53 @@ const scenarios: Scenario[] = [
     .probe({ path: "/global/upgrade", body: { target: 1 } })
     .at(() => ({ path: "/global/upgrade", body: { target: 1 } }))
     .status(400),
+  http.protected
+    .get("/workflow", "workflow.list")
+    .at((ctx) => ({ path: "/workflow", headers: ctx.headers() }))
+    .json(200, (body) => {
+      array(body)
+    }),
+  http.protected
+    .get("/workflow/run", "workflow.runs")
+    .at((ctx) => ({ path: "/workflow/run", headers: ctx.headers() }))
+    .json(200, (body) => {
+      array(body)
+    }),
+  http.protected
+    .get("/workflow/run/{id}", "workflow.get.missing")
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "job_httpapi_missing" }), headers: ctx.headers() }))
+    .json(200, (body) => {
+      check(body === null, "missing workflow run should be null")
+    }),
+  http.protected
+    .get("/workflow/run/{id}", "workflow.get.invalid")
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "not-a-run-id" }), headers: ctx.headers() }))
+    .status(400),
+  http.protected
+    .post("/workflow/{name}/start", "workflow.start.missing")
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: "httpapi-missing" }),
+      headers: ctx.headers(),
+      body: {},
+    }))
+    .status(400),
+  http.protected
+    .post("/workflow/run/{id}/cancel", "workflow.cancel.missing")
+    .at((ctx) => ({
+      path: route("/workflow/run/{id}/cancel", { id: "job_httpapi_missing" }),
+      headers: ctx.headers(),
+      body: {},
+    }))
+    .json(200, (body) => {
+      check(body === null, "cancelling a missing run should be null")
+    }),
+  http.protected
+    .delete("/workflow/run/{id}", "workflow.remove.missing")
+    .mutating()
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "job_httpapi_missing" }), headers: ctx.headers() }))
+    .json(200, (body) => {
+      check(body === false, "removing a missing run should report false")
+    }),
 ]
 
 const llmScenarios = new Set([

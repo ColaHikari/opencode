@@ -354,14 +354,12 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
     let systemThemeMode: "dark" | "light" | undefined
     let hasResolvedSystemTheme = false
     function resolveSystemTheme(mode: "dark" | "light" = store.mode) {
-      return Promise.race([
-        renderer.getPalette({
+      return renderer
+        .getPalette({
           size: 16,
-        }),
-        new Promise<TerminalColors | undefined>((resolve) => setTimeout(() => resolve(undefined), 1000).unref()),
-      ])
-        .then((colors) => {
-          if (!colors?.palette[0]) {
+        })
+        .then((colors: TerminalColors) => {
+          if (!colors.palette[0]) {
             // Keep the last known good generated theme during runtime reloads.
             // A terminal config swap can briefly make OSC palette probes fail.
             if (hasResolvedSystemTheme) return

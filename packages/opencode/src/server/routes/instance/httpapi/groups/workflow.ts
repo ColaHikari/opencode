@@ -1,3 +1,4 @@
+import { SessionID } from "@/session/schema"
 import { Workflow } from "@/workflow/workflow"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
@@ -10,6 +11,15 @@ const root = "/workflow"
 
 export const StartPayload = Schema.Struct({
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  // Optional cost cap (USD) for the run; mirrors the engine StartInput.budget.
+  // Non-negative finite: a negative/NaN/Infinity cap is rejected at validation.
+  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  // Session that should receive permission prompts raised by the run's
+  // subagents (mirrors the workflow tool path). Headless default: when omitted,
+  // permission requests follow the engine's default policy on an unobserved
+  // session — pass the caller's session id to surface them interactively.
+  // Validated/branded at the schema boundary like the session endpoints do.
+  permissionSessionID: Schema.optional(SessionID),
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
@@ -57,7 +67,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           }),
         ),
         HttpApiEndpoint.get("get", WorkflowPaths.get, {
-          params: { id: Schema.String },
+          // Branded at the schema boundary (like the session endpoints): an id
+          // that does not match the run-id format is a 400 at decode time, never
+          // a defect inside the handler.
+          params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.NullOr(Workflow.Run), "Workflow run"),
         }).annotateMerge(
@@ -81,7 +94,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           }),
         ),
         HttpApiEndpoint.post("cancel", WorkflowPaths.cancel, {
-          params: { id: Schema.String },
+          // Branded at the schema boundary (like the session endpoints): an id
+          // that does not match the run-id format is a 400 at decode time, never
+          // a defect inside the handler.
+          params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.NullOr(Workflow.Run), "Workflow run cancelled"),
         }).annotateMerge(
@@ -92,7 +108,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           }),
         ),
         HttpApiEndpoint.delete("remove", WorkflowPaths.remove, {
-          params: { id: Schema.String },
+          // Branded at the schema boundary (like the session endpoints): an id
+          // that does not match the run-id format is a 400 at decode time, never
+          // a defect inside the handler.
+          params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.Boolean, "Workflow run deleted"),
         }).annotateMerge(

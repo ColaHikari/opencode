@@ -13,9 +13,9 @@ export type WorkflowArgContext = {
 }
 
 export const WORKFLOW_COMMAND_PREFIX = "/workflow "
-const WORKFLOW_COMMAND_PATTERN = /^\/(?:workflow|worfklow)\s+(\S*)$/
-const WORKFLOW_ARG_PATTERN = /^\/(?:workflow|worfklow)\s+(\S+)(?:\s+(.*))?$/
-const WORKFLOW_COMMAND_ALIASES = ["/workflow ", "/worfklow "]
+const WORKFLOW_COMMAND_PATTERN = /^\/workflow\s+(\S*)$/
+const WORKFLOW_ARG_PATTERN = /^\/workflow\s+(\S+)(?:\s+(.*))?$/
+const WORKFLOW_COMMAND_ALIASES = ["/workflow "]
 
 export function workflowNameQuery(input: string, cursorOffset: number) {
   return input.slice(0, cursorOffset).match(WORKFLOW_COMMAND_PATTERN)?.[1]
@@ -82,7 +82,6 @@ export function workflowCommandOption(input: TextareaRenderable): AutocompleteOp
   return {
     display: "/workflow",
     description: "Start a workflow by name",
-    aliases: ["/worfklow"],
     onSelect: () => {
       const cursor = input.logicalCursor
       input.deleteRange(0, 0, cursor.row, cursor.col)
@@ -144,21 +143,44 @@ export async function listWorkflowInfos(workflow: WorkflowClient, enabled: boole
   if (!enabled) return []
   const result = await workflow.list()
   if (result.error || !result.data) return []
-  return result.data
+  // Skip invalid entries (broken files): they are still returned by list() but
+  // cannot be started, so the picker should not offer them. The picker never
+  // crashes on a broken file because list() never throws on one.
+  return result.data.filter((workflow) => workflow.valid !== false)
 }
 
-export function parseWorkflowArgs(input: string) {
+// The argument declaration as it appears on a workflow's meta (WorkflowInfo /
+// WorkflowMeta["arguments"]): a map of arg name -> { type?, default?, description? }.
+// Only the declared `type` drives coercion here.
+export type WorkflowArgDeclaration = Record<string, { type?: string }>
+
+// Parses `name=value` tokens into a payload, coercing values by DECLARED type
+// rather than by appearance. Coercion rules:
+//   - An arg declared `type: "number"` whose value parses as a finite number is
+//     coerced to that number. A declared-number arg whose value does NOT parse
+//     (e.g. `count=abc`) is passed through as the raw string — the engine stores
+//     args untyped (Record<string, unknown>) and runs no coercion/validation of
+//     its own, so silently turning a non-number into NaN would corrupt data; the
+//     workflow's own run() can validate. Surfacing the raw string is least surprising.
+//   - Every other arg — declared string, declared anything-else, or UNDECLARED —
+//     keeps its exact text (so `version=1.0` and `zip=01234` survive intact).
+//   - Bare flags (`--verbose`) keep the existing behavior of becoming the string
+//     "true"; the parser has never produced real booleans, and this change does
+//     not introduce them.
+export function parseWorkflowArgs(input: string, declaration: WorkflowArgDeclaration = {}) {
   return Object.fromEntries(
     // Matches: [--]key[="quoted value" | 'quoted value' | unquoted_value]
     Array.from(input.matchAll(/(?:^|\s)(?:--)?([^=\s]+)(?:=("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S*))?/g)).map(
       (match) => {
+        const name = match[1]
         const raw = match[2] ?? "true"
         const value =
           (raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))
             ? raw.slice(1, -1).replace(/\\(["'\\])/g, "$1")
             : raw
+        if (declaration[name]?.type !== "number") return [name, value]
         const numeric = Number(value)
-        return [match[1], Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]
+        return [name, Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]
       },
     ),
   )

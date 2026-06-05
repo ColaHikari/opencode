@@ -542,7 +542,7 @@ export function Autocomplete(props: {
         ? referenceMatchValue
           ? referenceAliasesValue.filter((item) => item.display === `@${referenceMatchValue.name}`)
           : [...referenceAliasesValue, ...agentsValue, ...(filesValue || []), ...mcpResources()]
-        : (workflow ?? commandsValue)
+        : (workflow ?? [...commandsValue])
 
     const searchValue = search()
 

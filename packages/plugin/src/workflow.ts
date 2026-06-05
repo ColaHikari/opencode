@@ -31,11 +31,56 @@ export type WorkflowAgentResult = {
   text: string
 }
 
+export type WorkflowParallelOptions = { concurrencyLimit?: number }
+export type WorkflowPipelineOptions = { concurrencyLimit?: number }
+
+/** A pipeline stage: receives the previous stage's output for this item plus the
+ * original item, and returns the next value. The first stage's `prev` is the
+ * item itself. Stages may change the type (`I → S1 → S2 …`). */
+export type WorkflowPipelineStage<Prev, Item, Next> = (prev: Prev, item: Item) => Promise<Next>
+
+/** Per-item pipeline. Each item flows through every stage SEQUENTIALLY (stage N+1
+ * receives stage N's result for that item), while items run concurrently against
+ * each other (no barrier between stages). Result is the last stage's output in
+ * item order. Overloaded for 1..4 stages so heterogeneous types flow through. */
+export interface WorkflowPipelineFn {
+  <I, A>(items: readonly I[], s1: WorkflowPipelineStage<I, I, A>, options?: WorkflowPipelineOptions): Promise<A[]>
+  <I, A, B>(
+    items: readonly I[],
+    s1: WorkflowPipelineStage<I, I, A>,
+    s2: WorkflowPipelineStage<A, I, B>,
+    options?: WorkflowPipelineOptions,
+  ): Promise<B[]>
+  <I, A, B, C>(
+    items: readonly I[],
+    s1: WorkflowPipelineStage<I, I, A>,
+    s2: WorkflowPipelineStage<A, I, B>,
+    s3: WorkflowPipelineStage<B, I, C>,
+    options?: WorkflowPipelineOptions,
+  ): Promise<C[]>
+  <I, A, B, C, D>(
+    items: readonly I[],
+    s1: WorkflowPipelineStage<I, I, A>,
+    s2: WorkflowPipelineStage<A, I, B>,
+    s3: WorkflowPipelineStage<B, I, C>,
+    s4: WorkflowPipelineStage<C, I, D>,
+    options?: WorkflowPipelineOptions,
+  ): Promise<D[]>
+}
+
 export type WorkflowContext = {
+  /**
+   * Remaining run budget in USD. Reflects the live cost cap the run was started
+   * with, decremented by each agent step's actual cost. `Infinity` when the run
+   * was started without a budget (unlimited — the default). Read it to make a
+   * workflow budget-aware; the engine additionally fails the next `agent()` call
+   * with a budget error once this reaches zero.
+   */
+  readonly budgetRemaining: number
   setPhase(phase: string): void
   log(message: string): void
-  parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }): Promise<T[]>
-  pipeline<T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]): Promise<T[]>
+  parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<T[]>
+  pipeline: WorkflowPipelineFn
   agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult>
 }
 

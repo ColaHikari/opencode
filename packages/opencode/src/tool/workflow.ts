@@ -31,6 +31,13 @@ const Parameters = Schema.Struct({
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({
     description: "Workflow input arguments as a JSON object",
   }),
+  // Non-negative finite, mirroring the engine/HTTP budget schema: a plain
+  // Schema.Number would accept NaN/±Infinity, and a NaN cap makes the gate
+  // (budgetRemaining <= 0) silently never trip — i.e. unlimited spend.
+  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))).annotate({
+    description:
+      "Optional cost cap in USD for the whole run. Agent steps stop with a budget error once the cumulative cost reaches this cap. Omit for unlimited.",
+  }),
   background: Schema.optional(Schema.Boolean).annotate({
     description: "Start the workflow asynchronously and notify this session when it finishes",
   }),
@@ -277,6 +284,7 @@ function startWorkflow(input: {
       .start({
         name: input.name,
         args: input.params.args,
+        budget: input.params.budget,
         prompt: ops,
         permissionSessionID: input.ctx.sessionID,
         source: input.source,
@@ -384,9 +392,14 @@ export const WorkflowTool = Tool.define(
         Effect.gen(function* () {
           if (params.action === "read") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=read"))
-            const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
+            const workflows = yield* workflow.list()
             const info = workflows.find((item) => item.name === params.name)
             if (!info) return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
+            // A discovered-but-broken file must surface its load error, not a
+            // misleadingly empty <workflow> block.
+            if (info.valid === false) {
+              return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
+            }
             return {
               title: `Workflow: ${info.name}`,
               metadata: { name: info.name, path: info.path },
@@ -396,7 +409,7 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "start") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
-            const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
+            const workflows = yield* workflow.list()
             if (!workflows.some((item) => item.name === params.name)) {
               return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
             }
@@ -411,7 +424,10 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "wait") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=wait"))
-            const waited = yield* workflow.wait({ id: params.run_id, timeout: params.timeout ?? DEFAULT_TIMEOUT })
+            const waited = yield* workflow.wait({
+              id: Workflow.RunID.make(params.run_id),
+              timeout: params.timeout ?? DEFAULT_TIMEOUT,
+            })
             if (!waited.run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             return {
               title: waited.timedOut
@@ -429,7 +445,7 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "inspect") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=inspect"))
-            const run = yield* workflow.get(params.run_id)
+            const run = yield* workflow.get(Workflow.RunID.make(params.run_id))
             if (!run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             const view = params.view ?? "summary"
             return {
@@ -451,7 +467,7 @@ export const WorkflowTool = Tool.define(
                 new Error(`Workflow already exists: ${params.name}. Set overwrite=true to replace it.`),
               )
             }
-            const previous = exists ? yield* fs.readFileString(filepath) : ""
+            const previous = exists ? ((yield* fs.readFileStringSafe(filepath)) ?? "") : ""
             yield* ctx.ask({
               permission: "edit",
               patterns: [path.relative(instance.worktree, filepath)],
@@ -463,9 +479,15 @@ export const WorkflowTool = Tool.define(
             yield* events.publish(FileSystem.Event.Edited, { file: filepath })
             yield* events.publish(Watcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
             yield* lsp.touchFile(filepath, "document")
-            const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
+            const workflows = yield* workflow.list()
             const info = workflows.find((item) => item.name === params.name)
             if (!info) return yield* Effect.fail(new Error(`Workflow was written but not discovered: ${params.name}`))
+            // The LLM-generated source may not load (bad meta / missing run /
+            // syntax error). Report that as a failure instead of claiming the file
+            // was "created and validated".
+            if (info.valid === false) {
+              return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
+            }
             return {
               title: `Workflow created: ${params.name}`,
               metadata: { name: params.name, path: filepath, exists },
