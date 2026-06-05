@@ -1,3 +1,4 @@
+import { SessionID } from "@/session/schema"
 import { Workflow } from "@/workflow/workflow"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
@@ -17,7 +18,8 @@ export const StartPayload = Schema.Struct({
   // subagents (mirrors the workflow tool path). Headless default: when omitted,
   // permission requests follow the engine's default policy on an unobserved
   // session — pass the caller's session id to surface them interactively.
-  permissionSessionID: Schema.optional(Schema.String),
+  // Validated/branded at the schema boundary like the session endpoints do.
+  permissionSessionID: Schema.optional(SessionID),
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
