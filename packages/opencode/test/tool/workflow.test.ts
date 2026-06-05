@@ -3,7 +3,6 @@ import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import fs from "fs/promises"
 import path from "path"
-import type { Permission } from "@/permission"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { WorkflowTool } from "@/tool/workflow"
@@ -11,8 +10,10 @@ import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "@/session/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import type { SessionPrompt } from "@/session/prompt"
-import type { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { PartID } from "@/session/schema"
 
 const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, CrossSpawnSpawner.defaultLayer))
@@ -39,7 +40,7 @@ async function writeWorkflow(dir: string, name: string, source: string) {
 }
 
 function requestRecorder() {
-  const requests: Array<Omit<Permission.Request, "id" | "sessionID" | "tool">> = []
+  const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
   const prompts: SessionPrompt.PromptInput[] = []
   const ctx: Tool.Context = {
     ...baseCtx,
@@ -63,7 +64,7 @@ function requestRecorder() {
                 cost: 0,
                 path: { cwd: "/tmp", root: "/tmp" },
                 tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-                modelID: input.model?.modelID ?? ProviderV2.ModelID.make("gpt-5"),
+                modelID: input.model?.modelID ?? ModelV2.ID.make("gpt-5"),
                 providerID: input.model?.providerID ?? ProviderV2.ID.opencode,
                 time: { created: Date.now() },
                 finish: "stop",
@@ -77,7 +78,7 @@ function requestRecorder() {
                   text: "ok",
                 },
               ],
-            } as SessionLegacy.WithParts
+            } as SessionV1.WithParts
           }),
       },
     },
@@ -90,7 +91,7 @@ function workflowTool() {
     const registry = yield* ToolRegistry.Service
     const tool = (yield* registry.tools({
       providerID: ProviderV2.ID.opencode,
-      modelID: ProviderV2.ModelID.make("gpt-5"),
+      modelID: ModelV2.ID.make("gpt-5"),
       agent: { name: "build", mode: "primary", permission: [], options: {} },
     })).find((tool) => tool.id === WorkflowTool.id)
     if (!tool) return yield* Effect.fail(new Error(`Tool not found: ${WorkflowTool.id}`))

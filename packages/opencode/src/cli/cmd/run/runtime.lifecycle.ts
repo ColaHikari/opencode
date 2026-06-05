@@ -8,7 +8,7 @@
 //
 // Also wires SIGINT so Ctrl-c clears a live prompt draft first, then falls
 // back to the usual two-press exit sequence through RunFooter.requestExit().
-import { createCliRenderer, type CliRenderer, type ScrollbackWriter } from "@opentui/core"
+import { CliRenderEvents, createCliRenderer, type CliRenderer, type ScrollbackWriter } from "@opentui/core"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Session as SessionApi } from "@/session/session"
 import { registerOpencodeKeymap } from "@/cli/cmd/tui/keymap"
@@ -63,6 +63,7 @@ export type LifecycleInput = {
   model: RunInput["model"]
   variant: string | undefined
   tuiConfig: RunTuiConfig
+  backgroundSubagents: boolean
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onQuestionReply: (input: QuestionReply) => void | Promise<void>
   onQuestionReject: (input: QuestionReject) => void | Promise<void>
@@ -70,11 +71,15 @@ export type LifecycleInput = {
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
   onInterrupt?: () => void
+  onBackground?: () => void
   onSubagentSelect?: (sessionID: string | undefined) => void
 }
 
 export type Lifecycle = {
   footer: FooterApi
+  onResize(fn: () => void): () => void
+  refreshTheme(): void
+  resetForReplay(input: { sessionTitle?: string; sessionID?: string; history: RunPrompt[] }): Promise<void>
   close(input: { showExit: boolean; sessionTitle?: string; sessionID?: string; history?: RunPrompt[] }): Promise<void>
 }
 
@@ -235,6 +240,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
           wrote,
           keymap,
           tuiConfig: input.tuiConfig,
+          backgroundSubagents: input.backgroundSubagents,
           diffStyle: input.tuiConfig.diff_style ?? "auto",
           onPermissionReply: input.onPermissionReply,
           onQuestionReply: input.onQuestionReply,
@@ -243,6 +249,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
           onModelSelect: input.onModelSelect,
           onVariantSelect: input.onVariantSelect,
           onInterrupt: input.onInterrupt,
+          onBackground: input.onBackground,
           onSubagentSelect: input.onSubagentSelect,
         })
 
@@ -288,7 +295,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
                         title: splash.title,
                         session_id: sessionID,
                       }),
-                      theme: theme.splash,
+                      theme: footer.currentTheme().splash,
                     }),
                   )
                   await renderer.idle().catch(() => {})
@@ -307,6 +314,49 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
 
         return {
           footer,
+          refreshTheme() {
+            footer.refreshTheme()
+          },
+          onResize(fn) {
+            let width = renderer.terminalWidth
+            let height = renderer.terminalHeight
+            const resize = () => {
+              if (width === renderer.terminalWidth && height === renderer.terminalHeight) {
+                return
+              }
+
+              width = renderer.terminalWidth
+              height = renderer.terminalHeight
+              fn()
+            }
+            renderer.on(CliRenderEvents.RESIZE, resize)
+            return () => renderer.off(CliRenderEvents.RESIZE, resize)
+          },
+          async resetForReplay(next) {
+            if (closed || renderer.isDestroyed || footer.isClosed) {
+              throw new Error("runtime closed")
+            }
+
+            await footer.idle()
+            if (closed || renderer.isDestroyed || footer.isClosed) {
+              throw new Error("runtime closed")
+            }
+
+            footer.resetForReplay(true)
+            renderer.resetSplitFooterForReplay({ clearSavedLines: true })
+            const splash = splashInfo(next.sessionTitle ?? input.sessionTitle, next.history)
+            renderer.writeToScrollback(
+              entrySplash({
+                ...splashMeta({
+                  title: splash.title,
+                  session_id: next.sessionID ?? input.getSessionID?.() ?? input.sessionID,
+                }),
+                theme: footer.currentTheme().splash,
+                showSession: splash.showSession,
+              }),
+            )
+            renderer.requestRender()
+          },
           close,
         }
       } catch (error) {

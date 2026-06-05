@@ -21,8 +21,10 @@ export const AccountPlugin = PluginV2.define({
 
     return {
       "catalog.transform": Effect.fn(function* (evt) {
+        const active = yield* accounts.activeAll().pipe(Effect.orDie)
+        if (active.size === 0) return
         for (const item of evt.provider.list()) {
-          const account = yield* accounts.active(Auth.ServiceID.make(item.provider.id)).pipe(Effect.orDie)
+          const account = active.get(Auth.ServiceID.make(item.provider.id))
           if (!account) continue
           evt.provider.update(item.provider.id, (provider) => {
             provider.enabled = {
@@ -30,10 +32,10 @@ export const AccountPlugin = PluginV2.define({
               service: account.serviceID,
             }
             if (account.credential.type === "api") {
-              provider.options.aisdk.provider.apiKey = account.credential.key
-              Object.assign(provider.options.aisdk.provider, account.credential.metadata ?? {})
+              provider.request.body.apiKey = account.credential.key
+              Object.assign(provider.request.body, account.credential.metadata ?? {})
             }
-            if (account.credential.type === "oauth") provider.options.aisdk.provider.apiKey = account.credential.access
+            if (account.credential.type === "oauth") provider.request.body.apiKey = account.credential.access
           })
         }
       }),

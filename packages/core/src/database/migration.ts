@@ -1,12 +1,13 @@
 export * as DatabaseMigration from "./migration"
 
 import { sql } from "drizzle-orm"
-import { Effect } from "effect"
+import { Effect, Semaphore } from "effect"
 import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { migrations } from "./migration.gen"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
+const lock = Semaphore.makeUnsafe(1)
 
 export type Migration = {
   id: string
@@ -14,7 +15,7 @@ export type Migration = {
 }
 
 export function apply(db: Database) {
-  return applyOnly(db, migrations)
+  return lock.withPermit(applyOnly(db, migrations))
 }
 
 export function applyOnly(db: Database, input: Migration[]) {
@@ -47,7 +48,7 @@ export function applyOnly(db: Database, input: Migration[]) {
       if (completed.has(migration.id)) continue
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
-          yield* migration.up(tx)
+          if (!process.env.OPENCODE_SKIP_MIGRATIONS) yield* migration.up(tx)
           yield* tx.run(
             sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed) VALUES (${migration.id}, ${Date.now()})`,
           )

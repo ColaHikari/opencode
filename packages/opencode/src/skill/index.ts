@@ -6,16 +6,16 @@ import type { Agent } from "@/agent/agent"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { Global } from "@opencode-ai/core/global"
+import { SkillPlugin } from "@opencode-ai/core/plugin/skill"
 import { Permission } from "@/permission"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@/config/config"
+import { FrontmatterError } from "@opencode-ai/core/v1/config/error"
 import { ConfigMarkdown } from "@/config/markdown"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Glob } from "@opencode-ai/core/util/glob"
 import * as Log from "@opencode-ai/core/util/log"
 import { Discovery } from "./discovery"
-import CUSTOMIZE_OPENCODE_SKILL_BODY from "./prompt/customize-opencode.md" with { type: "text" }
-import WORKFLOWS_INSTRUCTIONS_SKILL_BODY from "./prompt/workflows-instructions.md" with { type: "text" }
 import { isRecord } from "@/util/record"
 
 const log = Log.create({ service: "skill" })
@@ -33,9 +33,11 @@ const SKILL_PATTERN = "**/SKILL.md"
 const CUSTOMIZE_OPENCODE_SKILL_NAME = "customize-opencode"
 const CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION =
   "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself."
+const CUSTOMIZE_OPENCODE_SKILL_BODY = SkillPlugin.CustomizeOpencodeContent
 const WORKFLOWS_INSTRUCTIONS_SKILL_NAME = "workflows-instructions"
 const WORKFLOWS_INSTRUCTIONS_SKILL_DESCRIPTION =
   "Use when the user asks to create, modify, run, debug, or review opencode workflows. Explains workflow authoring, the native workflow tool, foreground/background execution, permissions, and how to inspect logs, agents, and results. Do not use for ordinary tasks unless the user explicitly wants workflow automation."
+const WORKFLOWS_INSTRUCTIONS_SKILL_BODY = SkillPlugin.WorkflowsInstructionsContent
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -112,9 +114,7 @@ const add = Effect.fnUntraced(function* (state: State, match: string, events: Ev
   }).pipe(
     Effect.catch(
       Effect.fnUntraced(function* (err) {
-        const message = ConfigMarkdown.FrontmatterError.isInstance(err)
-          ? err.data.message
-          : `Failed to parse skill ${match}`
+        const message = FrontmatterError.isInstance(err) ? err.data.message : `Failed to parse skill ${match}`
         const { Session } = yield* Effect.promise(() => import("@/session/session"))
         yield* events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() })
         log.error("failed to load skill", { skill: match, err })
@@ -177,7 +177,7 @@ const scan = Effect.fnUntraced(function* (
 const discoverSkills = Effect.fnUntraced(function* (
   config: Config.Interface,
   discovery: Discovery.Interface,
-  fsys: AppFileSystem.Interface,
+  fsys: FSUtil.Interface,
   global: Global.Interface,
   disableExternalSkills: boolean,
   disableClaudeCodeSkills: boolean,
@@ -257,7 +257,7 @@ export const layer = Layer.effect(
     const discovery = yield* Discovery.Service
     const config = yield* Config.Service
     const events = yield* EventV2Bridge.Service
-    const fsys = yield* AppFileSystem.Service
+    const fsys = yield* FSUtil.Service
     const global = yield* Global.Service
     const flags = yield* RuntimeFlags.Service
     const discovered = yield* InstanceState.make(
@@ -332,7 +332,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Discovery.defaultLayer),
   Layer.provide(Config.defaultLayer),
   Layer.provide(EventV2Bridge.defaultLayer),
-  Layer.provide(AppFileSystem.defaultLayer),
+  Layer.provide(FSUtil.defaultLayer),
   Layer.provide(Global.layer),
   Layer.provide(RuntimeFlags.defaultLayer),
 )

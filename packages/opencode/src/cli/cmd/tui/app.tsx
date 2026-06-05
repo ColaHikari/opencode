@@ -648,6 +648,8 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         suggested: true,
         category: "Agent",
         slashName: "models",
+        // Bias /mo toward /models over /move without changing global fuzzy scoring.
+        slashAliases: ["mo"],
         run: () => {
           dialog.replace(() => <DialogModel />)
         },
@@ -730,6 +732,13 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         hidden: local.model.variant.list().length === 0,
         slashName: "variants",
         run: () => {
+          if (local.model.variant.list().length === 0) {
+            return toast.show({
+              title: "No variants available",
+              message: "The current model does not support any variants.",
+              variant: "info",
+            })
+          }
           dialog.replace(() => <DialogVariant />)
         },
       },
@@ -973,11 +982,13 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]),
   }))
 
-  event.on(TuiEvent.CommandExecute.type, (evt) => {
+  event.on(TuiEvent.CommandExecute.type, (evt, { workspace }) => {
+    if (workspace !== project.workspace.current()) return
     keymap.dispatchCommand(evt.properties.command)
   })
 
-  event.on(TuiEvent.ToastShow.type, (evt) => {
+  event.on(TuiEvent.ToastShow.type, (evt, { workspace }) => {
+    if (workspace !== project.workspace.current()) return
     toast.show({
       title: evt.properties.title,
       message: evt.properties.message,
@@ -986,7 +997,8 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     })
   })
 
-  event.on(TuiEvent.SessionSelect.type, (evt) => {
+  event.on(TuiEvent.SessionSelect.type, (evt, { workspace }) => {
+    if (workspace !== project.workspace.current()) return
     route.navigate({
       type: "session",
       sessionID: evt.properties.sessionID,
@@ -1003,7 +1015,8 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     }
   })
 
-  event.on("session.error", (evt) => {
+  event.on("session.error", (evt, { workspace }) => {
+    if (workspace !== project.workspace.current()) return
     const error = evt.properties.error
     if (error && typeof error === "object" && error.name === "MessageAbortedError") return
     const message = errorMessage(error)
@@ -1097,7 +1110,9 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
               <Home />
             </Match>
             <Match when={route.data.type === "session"}>
-              <Session />
+              <Show when={route.data.type === "session" ? route.data.sessionID : undefined} keyed>
+                {(_) => <Session />}
+              </Show>
             </Match>
           </Switch>
           {plugin()}
