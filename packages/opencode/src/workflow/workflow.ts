@@ -10,6 +10,11 @@ import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
+import type {
+  WorkflowAgentRow,
+  WorkflowDefinitionRow,
+  WorkflowLogRow,
+} from "@opencode-ai/core/workflow/sql"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { and, desc, eq, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
@@ -118,6 +123,30 @@ export const AgentRun = Schema.Struct({
   error: Schema.optional(Schema.String),
 }).annotate({ identifier: "WorkflowAgentRun" })
 export type AgentRun = DeepMutable<Schema.Schema.Type<typeof AgentRun>>
+
+// Compile-time SSoT bridge between the engine's runtime validators (the Effect
+// schemas above) and core's persistence contract (the row types that annotate the
+// workflow_run JSON columns). The engine keeps the Effect schemas as the runtime
+// validators; core keeps the row types as the canonical column shapes. These
+// bidirectional assignability checks fail the build the moment either side drifts
+// — a field added/removed/retyped, or the AgentRun status union widened — so the
+// silent drift that motivated this refactor cannot recur. Two directions are
+// needed because a one-way `extends` only catches a SUPERSET on one side; both
+// directions together pin the shapes to be mutually assignable (structurally
+// identical for these closed object types). `void` keeps the consts from being
+// reported as unused.
+const _defToRow: WorkflowDefinitionRow = {} as Definition
+const _defFromRow: Definition = {} as WorkflowDefinitionRow
+const _logToRow: WorkflowLogRow = {} as LogEntry
+const _logFromRow: LogEntry = {} as WorkflowLogRow
+const _agentToRow: WorkflowAgentRow = {} as AgentRun
+const _agentFromRow: AgentRun = {} as WorkflowAgentRow
+void _defToRow
+void _defFromRow
+void _logToRow
+void _logFromRow
+void _agentToRow
+void _agentFromRow
 
 export const Run = Schema.Struct({
   id: RunID,
