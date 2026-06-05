@@ -9,7 +9,7 @@ import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import type { DeepMutable } from "@opencode-ai/core/schema"
+import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { and, desc, eq, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
@@ -17,6 +17,21 @@ import path from "path"
 import { pathToFileURL } from "url"
 import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Scope, Schema, SynchronizedRef } from "effect"
 import { WorkflowRunTable } from "./workflow.sql"
+
+// Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
+// / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a
+// nominal brand so a run id can never be confused with any other string at the
+// type level. The brand is type-only — the `isStartsWith("job")` check is the
+// same shape SessionID uses, which the OpenAPI generator emits as a plain
+// `string`, so the SDK shape is unchanged. `make` mints a fresh ascending id
+// (the prefix the engine already used via `Identifier.ascending("job")`).
+export const RunID = Schema.String.check(Schema.isStartsWith("job")).pipe(
+  Schema.brand("WorkflowRunID"),
+  withStatics((schema) => ({
+    ascending: (id?: string) => schema.make(Identifier.ascending("job", id)),
+  })),
+)
+export type RunID = Schema.Schema.Type<typeof RunID>
 
 export const Argument = Schema.Struct({
   type: Schema.optional(Schema.String),
@@ -98,7 +113,7 @@ export const AgentRun = Schema.Struct({
 export type AgentRun = DeepMutable<Schema.Schema.Type<typeof AgentRun>>
 
 export const Run = Schema.Struct({
-  id: Schema.String,
+  id: RunID,
   session_id: Schema.optional(Schema.String),
   workflow: Schema.String,
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
@@ -148,7 +163,7 @@ export type StartOptions = StartInput & {
 }
 
 export type WaitInput = {
-  id: string
+  id: RunID
   timeout?: number
 }
 
@@ -320,11 +335,11 @@ export interface Interface {
   // entry rather than aborting the whole list.
   readonly list: () => Effect.Effect<Info[]>
   readonly runs: () => Effect.Effect<Run[]>
-  readonly get: (id: string) => Effect.Effect<Run | undefined>
+  readonly get: (id: RunID) => Effect.Effect<Run | undefined>
   readonly start: (input: StartOptions) => Effect.Effect<Run, InvalidError | NotFoundError>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
-  readonly cancel: (id: string) => Effect.Effect<Run | undefined>
-  readonly remove: (id: string) => Effect.Effect<boolean>
+  readonly cancel: (id: RunID) => Effect.Effect<Run | undefined>
+  readonly remove: (id: RunID) => Effect.Effect<boolean>
   /**
    * Marks every `running` DB row that has no live registry entry as
    * `interrupted`. Runs automatically when the per-instance registry is first
@@ -350,7 +365,9 @@ type Row = typeof WorkflowRunTable.$inferSelect
 
 function fromRow(row: Row): Run {
   return {
-    id: row.id,
+    // DB->engine brand boundary: the row id is an opaque `text` column in core
+    // (which cannot import the engine's brand), so it is re-branded here.
+    id: RunID.make(row.id),
     session_id: row.session_id ?? undefined,
     workflow: row.workflow,
     args: row.args ?? undefined,
@@ -712,7 +729,7 @@ export const layer = Layer.effect(
     })
 
     const finish = Effect.fn("Workflow.finish")(function* (
-      id: string,
+      id: RunID,
       status: Exclude<Status, "running">,
       data?: { result?: unknown; error?: string },
     ) {
@@ -758,7 +775,7 @@ export const layer = Layer.effect(
           isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
       })
       const inst = yield* InstanceState.get(state)
-      const id = Identifier.ascending("job")
+      const id = RunID.ascending()
       const started_at = yield* Clock.currentTimeMillis
       const session = yield* sessions.create({ title: `Workflow: ${module.meta.name}` })
       const done = yield* Deferred.make<Run>()
