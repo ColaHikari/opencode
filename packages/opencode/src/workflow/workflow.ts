@@ -403,30 +403,35 @@ function fromRow(row: Row): Run {
 }
 
 function persistRun(db: Database.Interface["db"], active: Active) {
-  const data = {
-    id: active.run.id,
-    session_id: active.run.session_id ?? null,
-    workflow: active.run.workflow,
-    status: active.run.status,
-    started_at: active.run.started_at,
-    completed_at: active.run.completed_at ?? null,
-    current_phase: active.run.current_phase ?? null,
-    args: active.run.args ?? null,
-    definition: active.run.definition ?? null,
-    logs: active.run.logs,
-    agents: active.run.agents,
-    result: active.run.result ?? null,
-    error: active.run.error ?? null,
-  }
-  return db
-    .insert(WorkflowRunTable)
-    .values(data)
-    .onConflictDoUpdate({
+  // The snapshot MUST be built at execution time (inside Effect.suspend), not
+  // at effect-construction time: progress writes are forked into the instance
+  // scope and may execute AFTER the awaited terminal write in `finish`. A
+  // snapshot captured at construction would then revert the row to a stale
+  // state (live-found regression: a completed run's row flipped back to
+  // `running`). Reading `active.run` at execution time makes every write a
+  // full snapshot of the CURRENT state, so any write ordering converges on
+  // the final row.
+  return Effect.suspend(() => {
+    const data = {
+      id: active.run.id,
+      session_id: active.run.session_id ?? null,
+      workflow: active.run.workflow,
+      status: active.run.status,
+      started_at: active.run.started_at,
+      completed_at: active.run.completed_at ?? null,
+      current_phase: active.run.current_phase ?? null,
+      args: active.run.args ?? null,
+      definition: active.run.definition ?? null,
+      logs: active.run.logs,
+      agents: active.run.agents,
+      result: active.run.result ?? null,
+      error: active.run.error ?? null,
+    }
+    return db.insert(WorkflowRunTable).values(data).onConflictDoUpdate({
       target: WorkflowRunTable.id,
       set: { ...data, time_updated: Date.now() },
-    })
-    .run()
-    .pipe(Effect.orDie)
+    }).run()
+  }).pipe(Effect.orDie)
 }
 
 /**
