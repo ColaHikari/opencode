@@ -2804,6 +2804,7 @@ export type WorkflowStartPayload = {
   args?: {
     [key: string]: unknown
   }
+  budget?: number
 }
 
 export type UnauthorizedError = {

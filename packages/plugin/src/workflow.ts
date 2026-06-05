@@ -69,6 +69,14 @@ export interface WorkflowPipelineFn {
 }
 
 export type WorkflowContext = {
+  /**
+   * Remaining run budget in USD. Reflects the live cost cap the run was started
+   * with, decremented by each agent step's actual cost. `Infinity` when the run
+   * was started without a budget (unlimited — the default). Read it to make a
+   * workflow budget-aware; the engine additionally fails the next `agent()` call
+   * with a budget error once this reaches zero.
+   */
+  readonly budgetRemaining: number
   setPhase(phase: string): void
   log(message: string): void
   parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<T[]>
