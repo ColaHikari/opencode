@@ -67,7 +67,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           }),
         ),
         HttpApiEndpoint.get("get", WorkflowPaths.get, {
-          params: { id: Schema.String },
+          // Branded at the schema boundary (like the session endpoints): an id
+          // that does not match the run-id format is a 400 at decode time, never
+          // a defect inside the handler.
+          params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.NullOr(Workflow.Run), "Workflow run"),
         }).annotateMerge(
@@ -91,7 +94,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           }),
         ),
         HttpApiEndpoint.post("cancel", WorkflowPaths.cancel, {
-          params: { id: Schema.String },
+          // Branded at the schema boundary (like the session endpoints): an id
+          // that does not match the run-id format is a 400 at decode time, never
+          // a defect inside the handler.
+          params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.NullOr(Workflow.Run), "Workflow run cancelled"),
         }).annotateMerge(
@@ -102,7 +108,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           }),
         ),
         HttpApiEndpoint.delete("remove", WorkflowPaths.remove, {
-          params: { id: Schema.String },
+          // Branded at the schema boundary (like the session endpoints): an id
+          // that does not match the run-id format is a 400 at decode time, never
+          // a defect inside the handler.
+          params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.Boolean, "Workflow run deleted"),
         }).annotateMerge(

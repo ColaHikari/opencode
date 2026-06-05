@@ -26,10 +26,10 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       return yield* workflow.runs()
     })
 
-    const get = Effect.fn("WorkflowHttpApi.get")(function* (ctx: { params: { id: string } }) {
-      // HTTP brand boundary: the route param is a raw `string`, branded to the
-      // engine's RunID here (the only public entry point that supplies one).
-      return (yield* workflow.get(Workflow.RunID.make(ctx.params.id))) ?? null
+    const get = Effect.fn("WorkflowHttpApi.get")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      // The route param is validated/branded by the params schema (RunID), so a
+      // malformed id is a 400 at decode time and never reaches this handler.
+      return (yield* workflow.get(ctx.params.id)) ?? null
     })
 
     const start = Effect.fn("WorkflowHttpApi.start")(function* (ctx: {
@@ -48,12 +48,12 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
         .pipe(Effect.mapError(apiError))
     })
 
-    const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: string } }) {
-      return (yield* workflow.cancel(Workflow.RunID.make(ctx.params.id))) ?? null
+    const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      return (yield* workflow.cancel(ctx.params.id)) ?? null
     })
 
-    const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: string } }) {
-      return yield* workflow.remove(Workflow.RunID.make(ctx.params.id))
+    const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      return yield* workflow.remove(ctx.params.id)
     })
 
     return handlers
