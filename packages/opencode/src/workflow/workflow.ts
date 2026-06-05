@@ -123,7 +123,9 @@ export const StartInput = Schema.Struct({
   // shows). After each agent step the remaining budget is decremented by that
   // step's cost; before each `ctx.agent` call the engine fails the step with a
   // BudgetExceededError once nothing is left. Omitted ⇒ unlimited (Infinity).
-  budget: Schema.optional(Schema.Finite),
+  // Must be a non-negative finite number: a negative/NaN/Infinity cap is a
+  // validation error here, never a confusing runtime budget failure.
+  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
 }).annotate({ identifier: "WorkflowStartInput" })
 export type StartInput = Schema.Schema.Type<typeof StartInput>
 
@@ -189,6 +191,13 @@ export class StructuredOutputError extends Schema.TaggedErrorClass<StructuredOut
  * as any other agent error (node `failed`, run `failed` unless the workflow
  * module catches it). The message names both the configured budget and the
  * amount already spent so the failure is self-explanatory.
+ *
+ * The cap is enforced PER STEP, best-effort: it is checked before each
+ * `ctx.agent` call and the spend is settled after each step. Steps launched
+ * concurrently via `ctx.parallel`/`ctx.pipeline` all pass the gate while the
+ * budget is still positive, so a run can overspend by up to the combined cost
+ * of the steps already in flight when the budget runs out. This is a soft cap,
+ * not a hard mid-step limit.
  */
 export class BudgetExceededError extends Schema.TaggedErrorClass<BudgetExceededError>()(
   "WorkflowBudgetExceededError",
@@ -896,18 +905,27 @@ export const layer = Layer.effect(
                 data: structured !== undefined ? structured : node.output,
                 text: node.output,
               }
-            }).pipe(Effect.ensuring(Effect.sync(() => node.session_id && active.sessions.delete(node.session_id)))),
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  if (node.session_id) active.sessions.delete(node.session_id)
+                  // Decrement the live budget by whatever this step ACTUALLY cost
+                  // — the SAME `cost` (USD) the dashboard shows, set on the node
+                  // from the assistant message above. Done in `ensuring` (not the
+                  // success branch) so failed-but-paid steps (e.g. a structured-
+                  // output failure that still incurred model cost) and interrupted
+                  // steps are charged too. A step with no cost (cost undefined)
+                  // leaves the budget untouched; an unset budget stays Infinity.
+                  active.budgetRemaining -= node.cost ?? 0
+                }),
+              ),
+            ),
           )
           .then(
             (result) => {
               node.status = "completed"
               node.completed_at = Date.now()
               node.output = result.text
-              // Decrement the live budget by this step's actual telemetry — the
-              // SAME `cost` (USD) the dashboard shows, set on the node from the
-              // assistant message above. A step with no cost (cost undefined)
-              // leaves the budget untouched; an unset budget stays Infinity.
-              active.budgetRemaining -= node.cost ?? 0
               bridge.fork(persistRun(db, active))
               return result
             },

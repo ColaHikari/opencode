@@ -11,7 +11,8 @@ const root = "/workflow"
 export const StartPayload = Schema.Struct({
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   // Optional cost cap (USD) for the run; mirrors the engine StartInput.budget.
-  budget: Schema.optional(Schema.Finite),
+  // Non-negative finite: a negative/NaN/Infinity cap is rejected at validation.
+  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
