@@ -269,9 +269,17 @@ function mutableMeta(meta: Meta): Definition["meta"] {
 }
 
 async function loadModule(file: string): Promise<Module> {
-  const imported = (await import(
-    `${pathToFileURL(file).href}?mtime=${(await Bun.file(file).stat()).mtimeMs}`
-  )) as Record<string, unknown>
+  const source = await Bun.file(file).text()
+  const ext = path.extname(file)
+  const cachePath = path.join(
+    path.dirname(file),
+    `.${path.basename(file, ext)}.${Date.now()}.${Math.random().toString(16).slice(2)}${ext === ".js" ? ".mjs" : ".mts"}`,
+  )
+  await Bun.write(cachePath, source)
+  const imported = (await import(pathToFileURL(cachePath).href).finally(() => Bun.file(cachePath).delete())) as Record<
+    string,
+    unknown
+  >
   const module = (
     typeof imported.default === "object" && imported.default !== null ? imported.default : imported
   ) as Record<string, unknown>
