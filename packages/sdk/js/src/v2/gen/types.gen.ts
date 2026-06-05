@@ -2732,6 +2732,8 @@ export type WorkflowInfo = {
   name: string
   path: string
   meta: WorkflowMeta
+  valid: boolean
+  error?: string
 }
 
 export type WorkflowApiError = {

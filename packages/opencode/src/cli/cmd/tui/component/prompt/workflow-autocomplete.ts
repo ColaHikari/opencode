@@ -144,7 +144,10 @@ export async function listWorkflowInfos(workflow: WorkflowClient, enabled: boole
   if (!enabled) return []
   const result = await workflow.list()
   if (result.error || !result.data) return []
-  return result.data
+  // Skip invalid entries (broken files): they are still returned by list() but
+  // cannot be started, so the picker should not offer them. The picker never
+  // crashes on a broken file because list() never throws on one.
+  return result.data.filter((workflow) => workflow.valid !== false)
 }
 
 export function parseWorkflowArgs(input: string) {
