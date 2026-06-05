@@ -2788,7 +2788,7 @@ export type WorkflowRun = {
     [key: string]: unknown
   }
   definition?: WorkflowDefinition
-  status: "running" | "completed" | "failed" | "cancelled"
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted"
   started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   current_phase?: string

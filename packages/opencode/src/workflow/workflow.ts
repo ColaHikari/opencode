@@ -49,7 +49,10 @@ export const Definition = Schema.Struct({
 }).annotate({ identifier: "WorkflowDefinition" })
 export type Definition = DeepMutable<Schema.Schema.Type<typeof Definition>>
 
-export const Status = Schema.Literals(["running", "completed", "failed", "cancelled"])
+// "interrupted" is a terminal status assigned to runs whose in-memory fiber was
+// lost (crash/process restart) while the DB row still said "running". The orphan
+// sweep on service start rewrites such zombie rows so the lifecycle stays honest.
+export const Status = Schema.Literals(["running", "completed", "failed", "cancelled", "interrupted"])
 export type Status = Schema.Schema.Type<typeof Status>
 
 export const LogEntry = Schema.Struct({
@@ -213,6 +216,18 @@ export interface Interface {
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
   readonly cancel: (id: string) => Effect.Effect<Run | undefined>
   readonly remove: (id: string) => Effect.Effect<boolean>
+  /**
+   * Marks every `running` DB row that has no live registry entry as
+   * `interrupted`. Runs automatically when the per-instance registry is first
+   * created (process start → registry empty → all `running` rows are zombies),
+   * and is exposed so callers/tests can trigger it explicitly.
+   */
+  readonly sweep: () => Effect.Effect<void>
+  /**
+   * Drops a finished run from the in-memory registry without deleting its DB
+   * row. Subsequent reads go through `fromRow`. No-op for a still-running run.
+   */
+  readonly evict: (id: string) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Workflow") {}
@@ -272,6 +287,34 @@ function persistRun(db: Database.Interface["db"], active: Active) {
     })
     .run()
     .pipe(Effect.orDie)
+}
+
+/**
+ * Rewrites every `running` row whose id is not in `liveIds` to `interrupted`
+ * with a completion timestamp. Used by the startup sweep (liveIds empty) and the
+ * exposed `sweep()` method (liveIds = currently active runs).
+ */
+function sweepOrphans(db: Database.Interface["db"], liveIds: ReadonlySet<string>, now: number) {
+  return Effect.gen(function* () {
+    const rows = yield* db
+      .select()
+      .from(WorkflowRunTable)
+      .where(eq(WorkflowRunTable.status, "running"))
+      .all()
+      .pipe(Effect.orDie)
+    const orphans = rows.filter((row) => !liveIds.has(row.id))
+    yield* Effect.forEach(
+      orphans,
+      (row) =>
+        db
+          .update(WorkflowRunTable)
+          .set({ status: "interrupted", completed_at: now, time_updated: now })
+          .where(eq(WorkflowRunTable.id, row.id))
+          .run()
+          .pipe(Effect.orDie),
+      { discard: true },
+    )
+  })
 }
 
 function errorText(error: unknown) {
@@ -464,8 +507,13 @@ export const layer = Layer.effect(
     const { db } = yield* Database.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* () {
+        const runs = yield* SynchronizedRef.make(new Map<string, Active>())
+        // The registry is freshly empty here: any row still marked `running`
+        // belongs to a fiber that did not survive into this process, so sweep
+        // every one of them to `interrupted` (honest orphan recovery on start).
+        yield* sweepOrphans(db, new Set(), yield* Clock.currentTimeMillis)
         return {
-          runs: yield* SynchronizedRef.make(new Map()),
+          runs,
           scope: yield* Scope.Scope,
         }
       }),
@@ -721,10 +769,19 @@ export const layer = Layer.effect(
     const wait: Interface["wait"] = Effect.fn("Workflow.wait")(function* (input) {
       const run = yield* get(input.id)
       if (!run) return { timedOut: false }
+      // Terminal runs (completed/failed/cancelled/interrupted) resolve at once —
+      // there is no fiber left to wait on, so never report a timeout for them.
       if (run.status !== "running") return { run, timedOut: false }
 
-      const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(input.id)
-      if (!active) return { run, timedOut: true }
+      const live = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
+      const active = live.get(input.id)
+      // DB still says `running` but no live fiber owns it: an orphan. Sweep it to
+      // `interrupted` and report that honestly instead of a misleading timeout.
+      // Pass the live registry keys so genuinely-running siblings are untouched.
+      if (!active) {
+        yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis)
+        return { run: yield* get(input.id), timedOut: false }
+      }
       if (input.timeout === undefined) return { run: yield* Deferred.await(active.done), timedOut: false }
       if (input.timeout <= 0) return { run: snapshot(active), timedOut: true }
 
@@ -784,7 +841,26 @@ export const layer = Layer.effect(
       return !!row || !!active
     })
 
-    return Service.of({ list, runs, get, start, wait, cancel, remove })
+    const sweep: Interface["sweep"] = Effect.fn("Workflow.sweep")(function* () {
+      const live = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
+      yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis)
+    })
+
+    const evict: Interface["evict"] = Effect.fn("Workflow.evict")(function* (id) {
+      const inst = yield* InstanceState.get(state)
+      const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
+      // Only finished runs may be evicted; a running run must keep its fiber and
+      // Deferred reachable so cancel()/wait() still work.
+      if (!active || active.run.status === "running") return false
+      yield* SynchronizedRef.update(inst.runs, (runs) => {
+        const next = new Map(runs)
+        next.delete(id)
+        return next
+      })
+      return true
+    })
+
+    return Service.of({ list, runs, get, start, wait, cancel, remove, sweep, evict })
   }),
 )
 
