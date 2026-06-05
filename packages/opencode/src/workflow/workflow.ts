@@ -430,6 +430,23 @@ function persistRun(db: Database.Interface["db"], active: Active) {
 }
 
 /**
+ * Forks a progress-snapshot write as a child of the instance scope, so the
+ * fiber is tracked and torn down with the instance instead of leaking as a
+ * detached root fiber. Interrupt-on-dispose is safe for these writes: every
+ * `persistRun` is an idempotent full-state upsert, the terminal write in
+ * `finish` is awaited inline, and the startup orphan sweep heals any run whose
+ * last progress snapshot was cut short.
+ */
+function persistInScope(
+  scope: Scope.Scope,
+  bridge: EffectBridge.Shape,
+  db: Database.Interface["db"],
+  active: Active,
+) {
+  bridge.fork(persistRun(db, active).pipe(Effect.forkIn(scope)))
+}
+
+/**
  * Rewrites every `running` row whose id is not in `liveIds` to `interrupted`
  * with a completion timestamp in a single bulk UPDATE. Used by the startup sweep
  * (liveIds empty) and the exposed `sweep()` method (liveIds = currently active
@@ -876,7 +893,7 @@ export const layer = Layer.effect(
           prompt: agentInput.prompt,
         }
         active.run.agents.push(node)
-        bridge.fork(persistRun(db, active))
+        persistInScope(inst.scope, bridge, db, active)
         const prompt = input.prompt
         if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
         return bridge
@@ -962,14 +979,14 @@ export const layer = Layer.effect(
               node.status = "completed"
               node.completed_at = Date.now()
               node.output = result.text
-              bridge.fork(persistRun(db, active))
+              persistInScope(inst.scope, bridge, db, active)
               return result
             },
             (error) => {
               node.status = "failed"
               node.completed_at = Date.now()
               node.error = errorText(error)
-              bridge.fork(persistRun(db, active))
+              persistInScope(inst.scope, bridge, db, active)
               return Promise.reject(error)
             },
           )
@@ -982,7 +999,7 @@ export const layer = Layer.effect(
           createContext({
             active,
             agent,
-            persist: () => void bridge.fork(persistRun(db, active)),
+            persist: () => void persistInScope(inst.scope, bridge, db, active),
             signal: () => runSignal,
             bridge,
           }),
