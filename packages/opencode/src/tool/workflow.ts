@@ -31,7 +31,10 @@ const Parameters = Schema.Struct({
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({
     description: "Workflow input arguments as a JSON object",
   }),
-  budget: Schema.optional(Schema.Number).annotate({
+  // Non-negative finite, mirroring the engine/HTTP budget schema: a plain
+  // Schema.Number would accept NaN/±Infinity, and a NaN cap makes the gate
+  // (budgetRemaining <= 0) silently never trip — i.e. unlimited spend.
+  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))).annotate({
     description:
       "Optional cost cap in USD for the whole run. Agent steps stop with a budget error once the cumulative cost reaches this cap. Omit for unlimited.",
   }),

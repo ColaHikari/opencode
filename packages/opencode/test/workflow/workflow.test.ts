@@ -172,7 +172,11 @@ export async function run(args, ctx) {
 // - "error": die Session hat einen StructuredOutputError auf message.info.error
 //   gesetzt (genau wie packages/opencode/src/session/prompt.ts es tut), gibt aber
 //   weiterhin erfolgreich eine WithParts zurück.
-function structuredPromptOps(mode: "structured" | "undefined" | "error") {
+// `cost` mirrors the real telemetry (`message.info.cost`, USD) so a step that
+// FAILS structured-output can still report what it actually cost — exactly the
+// failed-but-paid case the budget must charge for. Defaults to 0 to leave the
+// existing structured-output callers unchanged.
+function structuredPromptOps(mode: "structured" | "undefined" | "error", cost = 0) {
   const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
     prompt: (input) =>
       Effect.gen(function* () {
@@ -181,7 +185,7 @@ function structuredPromptOps(mode: "structured" | "undefined" | "error") {
           role: "assistant",
           providerID: "test",
           modelID: "test-model",
-          cost: 0,
+          cost,
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         }
         if (mode === "structured") info.structured = SCHEMA_OBJECT
@@ -259,6 +263,24 @@ export async function run(args, ctx) {
   const remaining = ctx.budgetRemaining
   await ctx.agent({ prompt: "spend" })
   return { unlimited: remaining === Infinity }
+}
+`
+
+// Failed-but-paid-Fixture: ein Agent MIT Schema, der scheitert (kein
+// strukturiertes Ergebnis), aber laut Telemetrie echte Kosten verursacht hat.
+// Der Workflow fängt den Fehler ab und gibt das Restbudget zurück, damit der
+// Test beweisen kann, dass das Budget TROTZ des Fehlers belastet wurde.
+const BUDGET_FAILED_PAID_FIXTURE = "budget-failed-paid"
+const BUDGET_FAILED_PAID_WORKFLOW = `export const meta = { name: "${BUDGET_FAILED_PAID_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  let failed = false
+  try {
+    await ctx.agent({ prompt: "produce structured", schema: { type: "object" } })
+  } catch (e) {
+    failed = true
+  }
+  return { failed, remaining: ctx.budgetRemaining }
 }
 `
 
@@ -740,6 +762,33 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const done = yield* workflow.wait({ id: run.id })
       expect(done.run?.status).toBe("completed")
       expect((done.run?.result as { unlimited: boolean }).unlimited).toBe(true)
+    }),
+  )
+
+  it.instance("a failed-but-paid step still charges the budget by its actual cost", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, BUDGET_FAILED_PAID_FIXTURE, BUDGET_FAILED_PAID_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      // Schema-Agent scheitert (kein strukturiertes Ergebnis), hat aber 0.3 USD
+      // gekostet. Der Workflow fängt den Fehler ab und läuft weiter.
+      const run = yield* workflow.start({
+        name: BUDGET_FAILED_PAID_FIXTURE,
+        args: {},
+        prompt: structuredPromptOps("error", 0.3),
+        budget: 1,
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { failed: boolean; remaining: number }
+      // Der Step ist wirklich gescheitert ...
+      expect(result.failed).toBe(true)
+      // ... wurde aber trotzdem mit seinen echten Kosten (0.3) belastet.
+      expect(result.remaining).toBe(0.7)
+      // Und der Agent-Node ist als failed verbucht.
+      expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
     }),
   )
 })
