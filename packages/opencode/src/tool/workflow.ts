@@ -424,7 +424,10 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "wait") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=wait"))
-            const waited = yield* workflow.wait({ id: params.run_id, timeout: params.timeout ?? DEFAULT_TIMEOUT })
+            const waited = yield* workflow.wait({
+              id: Workflow.RunID.make(params.run_id),
+              timeout: params.timeout ?? DEFAULT_TIMEOUT,
+            })
             if (!waited.run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             return {
               title: waited.timedOut
@@ -442,7 +445,7 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "inspect") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=inspect"))
-            const run = yield* workflow.get(params.run_id)
+            const run = yield* workflow.get(Workflow.RunID.make(params.run_id))
             if (!run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             const view = params.view ?? "summary"
             return {

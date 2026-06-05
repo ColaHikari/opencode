@@ -613,7 +613,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   it.instance("persisted run round-trips through fromRow", () =>
     Effect.gen(function* () {
       const workflow = yield* Workflow.Service
-      const persistedId = "job_roundtrip"
+      const persistedId = Workflow.RunID.make("job_roundtrip")
       // Persist a finished run directly via the SQL layer (no live registry
       // entry), so get() must read it back through DB->fromRow.
       yield* seedCompletedRow(persistedId)
@@ -631,7 +631,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   it.instance("wait on interrupted run resolves immediately as interrupted (not timedOut)", () =>
     Effect.gen(function* () {
       const workflow = yield* Workflow.Service
-      const orphanId = "job_orphan_wait"
+      const orphanId = Workflow.RunID.make("job_orphan_wait")
       yield* seedRunningRow(orphanId)
       yield* workflow.sweep()
 

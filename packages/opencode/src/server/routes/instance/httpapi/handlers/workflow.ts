@@ -27,7 +27,9 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
     })
 
     const get = Effect.fn("WorkflowHttpApi.get")(function* (ctx: { params: { id: string } }) {
-      return (yield* workflow.get(ctx.params.id)) ?? null
+      // HTTP brand boundary: the route param is a raw `string`, branded to the
+      // engine's RunID here (the only public entry point that supplies one).
+      return (yield* workflow.get(Workflow.RunID.make(ctx.params.id))) ?? null
     })
 
     const start = Effect.fn("WorkflowHttpApi.start")(function* (ctx: {
@@ -40,11 +42,11 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
     })
 
     const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: string } }) {
-      return (yield* workflow.cancel(ctx.params.id)) ?? null
+      return (yield* workflow.cancel(Workflow.RunID.make(ctx.params.id))) ?? null
     })
 
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: string } }) {
-      return yield* workflow.remove(ctx.params.id)
+      return yield* workflow.remove(Workflow.RunID.make(ctx.params.id))
     })
 
     return handlers
