@@ -511,7 +511,9 @@ function createContext(input: {
       const stages = (hasOptions ? rest.slice(0, -1) : rest) as ReadonlyArray<
         (prev: unknown, item: unknown) => Promise<unknown>
       >
-      const concurrency = options?.concurrencyLimit ? Math.max(1, options.concurrencyLimit) : "unbounded"
+      // Same clamp as parallel(): an explicit limit ≤0 is floored to 1, matching
+      // parallel's `Math.max(1, …)`. Only an UNSET limit means "unbounded".
+      const concurrency = options?.concurrencyLimit === undefined ? "unbounded" : Math.max(1, options.concurrencyLimit)
       // No barrier between stages: each ITEM runs the full stage SEQUENCE as its
       // own Effect, and items run under Effect.forEach concurrency — so item B may
       // be in stage 2 while item A is still in stage 1. checkpoint() gates before

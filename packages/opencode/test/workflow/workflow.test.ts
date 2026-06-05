@@ -287,6 +287,9 @@ describe("Workflow", () => {
       const result = done.result as { peak: number; result: number[] }
       expect(result.result).toHaveLength(6)
       expect(result.peak).toBeLessThanOrEqual(2)
+      // Untergrenze: 6 Tasks à ~40ms bei Limit 2 erreichen zuverlässig peak 2 —
+      // schützt gegen versehentliches Über-Clamping des Limits auf 1.
+      expect(result.peak).toBeGreaterThanOrEqual(2)
     }),
   )
 
