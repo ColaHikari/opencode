@@ -163,6 +163,57 @@ export async function run(args, ctx) { ctx.setPhase("start"); ctx.log("hello"); 
     }),
   )
 
+  it.instance("a broken workflow file does not break list(); it is reported invalid", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          HELLO_FIXTURE,
+          `export const meta = { name: "Hello", description: "Test workflow", phases: ["start"] }
+export async function run(args, ctx) { ctx.setPhase("start"); ctx.log("hello"); return { ok: true } }
+`,
+        ),
+      )
+      // Syntaxfehler: unvollständiges Objektliteral -> Modul-Load schlägt fehl.
+      yield* Effect.promise(() => writeWorkflow(test.directory, "broken", "export const meta = {"))
+      const workflow = yield* Workflow.Service
+
+      const all = yield* workflow.list()
+      const broken = all.find((item) => item.name === "broken")
+      expect(broken?.valid).toBe(false)
+      expect(broken?.error).toBeTruthy()
+      // Die gute Datei bleibt trotz der kaputten weiterhin gelistet und gültig.
+      expect(all.some((item) => item.name === HELLO_FIXTURE && item.valid !== false)).toBe(true)
+    }),
+  )
+
+  it.instance("start loads only the target module and fails precisely for broken target", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          HELLO_FIXTURE,
+          `export const meta = { name: "Hello" }
+export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); return { ok: true } }
+`,
+        ),
+      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, "broken", "export const meta = {"))
+      const workflow = yield* Workflow.Service
+
+      // Ein kaputtes Ziel scheitert präzise (InvalidError, der die Datei/den Namen nennt).
+      const failed = yield* workflow.start({ name: "broken", args: {} }).pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+      expect(failed.path).toContain("broken")
+
+      // Die gültige Datei ist trotz broken.ts startbar (kein voller list()-Abbruch).
+      const ok = yield* workflow.start({ name: HELLO_FIXTURE, args: {} })
+      expect(ok.id).toBeTruthy()
+    }),
+  )
+
   it.instance("starts and records a workflow run", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
