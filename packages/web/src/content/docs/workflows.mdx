@@ -305,3 +305,11 @@ From a workflow run detail view:
 - **Up** and **Down** select phases.
 
 The dashboard persists workflow run history, so completed and failed runs remain visible after they finish.
+
+---
+
+## Security & trust
+
+Workflow files are code. Anything in `.opencode/workflows/` is executed via dynamic import with the same trust level as a [plugin](/docs/plugins) — there is no sandbox. Only place files there that you trust, and review workflow files that arrive with a cloned repository before running them.
+
+Note that the `workflow` tool's `create` action writes model-generated TypeScript into this directory. The `workflow` permission is the control point: it gates both creating and starting workflows, so keep it on `ask` if you want to review each run.
