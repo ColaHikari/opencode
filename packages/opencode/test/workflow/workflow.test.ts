@@ -199,7 +199,97 @@ function structuredPromptOps(mode: "structured" | "undefined" | "error") {
   return ops
 }
 
+// Pipeline-Fixture: zwei Items ("A","B"), zwei Stages. Stage 2 ändert den Typ
+// (string -> { a, b }). Item A wird in Stage 1 künstlich verlangsamt, damit Item
+// B Stage 2 erreichen kann, BEVOR Item A Stage 1 verlässt — der Nachweis, dass
+// es KEINE Barriere zwischen den Stages gibt (Items laufen unabhängig durch die
+// Stage-Sequenz). Reihenfolge-Marker und Ergebnis werden über ctx.log bzw. das
+// Workflow-Resultat beobachtbar gemacht; das Resultat enthält die Marker-Folge
+// und das Stage-2-Resultat in Item-Reihenfolge.
+const PIPELINE_FIXTURE = "pipeline"
+const PIPELINE_WORKFLOW = `export const meta = { name: "${PIPELINE_FIXTURE}", phases: ["pipeline"] }
+export async function run(args, ctx) {
+  ctx.setPhase("pipeline")
+  const order = []
+  const slow = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const result = await ctx.pipeline(
+    ["A", "B"],
+    async (item) => {
+      order.push(item + ":stage1:start")
+      // Item A trödelt in Stage 1, damit B in Stage 2 vorrückt.
+      if (item === "A") await slow(80)
+      order.push(item + ":stage1:done")
+      return { item, n: item === "A" ? 1 : 2 }
+    },
+    async (prev, item) => {
+      order.push(item + ":stage2")
+      return { a: prev.n, b: prev.item === "A" ? "x" : "y" }
+    },
+  )
+  for (const marker of order) ctx.log(marker)
+  return { order, result }
+}
+`
+
+// Parallel-Fixture: sechs Tasks à ~40ms, concurrencyLimit aus den args. Jede
+// Task meldet Start/Ende über zwei globale Zähler (auf globalThis, weil das
+// Workflow-Modul in seinem eigenen ESM-Realm läuft); der Workflow gibt die
+// beobachtete Spitzen-Parallelität und die Task-Resultate zurück.
+const PARALLEL_FIXTURE = "parallel-limit"
+const PARALLEL_WORKFLOW = `export const meta = { name: "${PARALLEL_FIXTURE}", phases: ["parallel"] }
+export async function run(args, ctx) {
+  ctx.setPhase("parallel")
+  let active = 0
+  let peak = 0
+  const slow = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const tasks = Array.from({ length: 6 }, (_, i) => async () => {
+    active++
+    peak = Math.max(peak, active)
+    await slow(40)
+    active--
+    return i
+  })
+  const result = await ctx.parallel(tasks, { concurrencyLimit: args.concurrencyLimit })
+  return { peak, result }
+}
+`
+
 describe("Workflow", () => {
+  it.instance("pipeline runs stages per item without a barrier and supports heterogeneous types", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_FIXTURE, PIPELINE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: PIPELINE_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("pipeline did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { order: string[]; result: Array<{ a: number; b: string }> }
+      // Kein Barrier: Item B erreicht Stage 2, bevor Item A Stage 1 verlässt.
+      expect(result.order.indexOf("B:stage2")).toBeLessThan(result.order.indexOf("A:stage1:done"))
+      // Stage 2 ändert den Typ; Ergebnis in Item-Reihenfolge.
+      expect(result.result).toEqual([
+        { a: 1, b: "x" },
+        { a: 2, b: "y" },
+      ])
+    }),
+  )
+
+  it.instance("parallel respects concurrencyLimit", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_FIXTURE, PARALLEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: PARALLEL_FIXTURE, args: { concurrencyLimit: 2 } })
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("parallel did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { peak: number; result: number[] }
+      expect(result.result).toHaveLength(6)
+      expect(result.peak).toBeLessThanOrEqual(2)
+    }),
+  )
+
   it.instance("discovers workflow files", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
