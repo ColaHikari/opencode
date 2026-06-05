@@ -143,6 +143,62 @@ function hangingPromptOps() {
   return { ops, aborted, started }
 }
 
+// Schema-Fixtures: Workflows, deren run(ctx) den Agenten MIT Schema aufruft
+// (strukturierte Ausgabe angefordert). Der Promtp-Ops-Fake (unten) steuert, ob
+// die Session strukturierte Daten, undefined oder einen StructuredOutputError
+// liefert. Jeder gibt das geparste Objekt im Ergebnis zurück, damit der
+// Positivpfad das Objekt durchreichen kann.
+const SCHEMA_SUCCESS_FIXTURE = "schema-success"
+const SCHEMA_UNDEFINED_FIXTURE = "schema-undefined"
+const SCHEMA_FAILING_FIXTURE = "schema-failing"
+const SCHEMA_OBJECT = { value: 123 }
+
+function schemaWorkflow(name: string) {
+  return `export const meta = { name: "${name}", phases: ["agent"] }
+export async function run(args, ctx) {
+  ctx.setPhase("agent")
+  const result = await ctx.agent({ prompt: "produce structured", schema: { type: "object" } })
+  return { data: result.data }
+}
+`
+}
+
+// Prompt-Ops-Fake, der die SESSION-Schicht nachbildet (nicht die Engine): die
+// initiale noReply-Nachricht wird sofort beantwortet; der Agent-Prompt liefert
+// eine Assistant-Nachricht, deren `structured`/`error`-Feld der Modus bestimmt:
+// - "structured": message.info.structured ist gesetzt (Erfolgspfad);
+// - "undefined": structured fehlt trotz angefordertem Schema (stiller Fallback,
+//   der jetzt scheitern muss);
+// - "error": die Session hat einen StructuredOutputError auf message.info.error
+//   gesetzt (genau wie packages/opencode/src/session/prompt.ts es tut), gibt aber
+//   weiterhin erfolgreich eine WithParts zurück.
+function structuredPromptOps(mode: "structured" | "undefined" | "error") {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        const info: Record<string, unknown> = {
+          role: "assistant",
+          providerID: "test",
+          modelID: "test-model",
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        }
+        if (mode === "structured") info.structured = SCHEMA_OBJECT
+        if (mode === "error")
+          info.error = {
+            name: "StructuredOutputError",
+            data: { message: "Model did not produce structured output", retries: 0 },
+          }
+        const parts =
+          mode === "undefined" || mode === "error" ? [{ type: "text", text: "here is some plaintext" }] : []
+        return { info: { ...info, id: "msg_test" }, parts } as unknown as SessionV1.WithParts
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
 describe("Workflow", () => {
   it.instance("discovers workflow files", () =>
     Effect.gen(function* () {
@@ -404,6 +460,65 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const res = yield* workflow.wait({ id: orphanId, timeout: 50 })
       expect(res.run?.status).toBe("interrupted")
       expect(res.timedOut).not.toBe(true)
+    }),
+  )
+
+  it.instance("schema agent failure is recorded as failed, never silently completed", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, SCHEMA_FAILING_FIXTURE, schemaWorkflow(SCHEMA_FAILING_FIXTURE)),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({
+        name: SCHEMA_FAILING_FIXTURE,
+        args: {},
+        prompt: structuredPromptOps("error"),
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("failed")
+      expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
+      // Kein stiller Plaintext-Fallback: der Agent darf NICHT completed sein.
+      expect(done.run?.agents.some((a) => a.status === "completed")).toBe(false)
+    }),
+  )
+
+  it.instance("schema agent with undefined structured result fails instead of plaintext fallback", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, SCHEMA_UNDEFINED_FIXTURE, schemaWorkflow(SCHEMA_UNDEFINED_FIXTURE)),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({
+        name: SCHEMA_UNDEFINED_FIXTURE,
+        args: {},
+        prompt: structuredPromptOps("undefined"),
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("failed")
+      expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
+    }),
+  )
+
+  it.instance("schema agent success returns the parsed object and completes", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, SCHEMA_SUCCESS_FIXTURE, schemaWorkflow(SCHEMA_SUCCESS_FIXTURE)),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({
+        name: SCHEMA_SUCCESS_FIXTURE,
+        args: {},
+        prompt: structuredPromptOps("structured"),
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      // Positivpfad: das geparste Objekt wird durch ctx.agent (result.data) und
+      // damit das Workflow-Resultat hindurchgereicht.
+      expect(done.run?.result).toEqual({ data: SCHEMA_OBJECT })
+      expect(done.run?.agents.every((a) => a.status === "completed")).toBe(true)
     }),
   )
 })
