@@ -1,4 +1,5 @@
 import { Workflow } from "@/workflow/workflow"
+import { SessionID } from "@/session/schema"
 import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -37,7 +38,17 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       payload?: StartPayload
     }) {
       return yield* workflow
-        .start({ name: ctx.params.name, args: ctx.payload?.args, budget: ctx.payload?.budget, prompt })
+        .start({
+          name: ctx.params.name,
+          args: ctx.payload?.args,
+          budget: ctx.payload?.budget,
+          // HTTP brand boundary: the payload carries a raw string; brand it to
+          // the engine's SessionID here (mirrors the RunID boundary in `get`).
+          permissionSessionID: ctx.payload?.permissionSessionID
+            ? SessionID.make(ctx.payload.permissionSessionID)
+            : undefined,
+          prompt,
+        })
         .pipe(Effect.mapError(apiError))
     })
 
