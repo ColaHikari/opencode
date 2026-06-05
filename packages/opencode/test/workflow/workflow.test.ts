@@ -199,6 +199,69 @@ function structuredPromptOps(mode: "structured" | "undefined" | "error") {
   return ops
 }
 
+// Budget-Fixtures. Der Engine liest die Agent-Kosten aus `message.info.cost`
+// (USD) — exakt wie der echte Session-Pfad und das TUI-Dashboard. Dieser Fake
+// bildet GENAU diese Telemetrie-Form nach: jede beantwortete Agent-Nachricht
+// trägt `cost` (und `tokens`, wie die echte Session), sodass der Engine pro
+// Step das Restbudget korrekt dekrementieren kann.
+function costPromptOps(cost: number) {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        return {
+          info: {
+            id: "msg_test",
+            role: "assistant",
+            providerID: "test",
+            modelID: "test-model",
+            cost,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+          parts: [{ type: "text", text: "ok" }],
+        } as unknown as SessionV1.WithParts
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
+// Zwei sequentielle ctx.agent-Aufrufe; bei kleinem Budget muss der zweite
+// Aufruf am Budget-Gate scheitern (Restbudget <= 0 nach dem ersten Step).
+const BUDGET_FIXTURE = "budget-two-steps"
+const BUDGET_WORKFLOW = `export const meta = { name: "${BUDGET_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "step one" })
+  await ctx.agent({ prompt: "step two" })
+  return { ok: true }
+}
+`
+
+// Schreibt ctx.budgetRemaining vor und nach einem Agent-Step ins Resultat,
+// damit der Test die Live-Dekrementierung beobachten kann.
+const BUDGET_REMAINING_FIXTURE = "budget-remaining"
+const BUDGET_REMAINING_WORKFLOW = `export const meta = { name: "${BUDGET_REMAINING_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const before = ctx.budgetRemaining
+  await ctx.agent({ prompt: "spend" })
+  const after = ctx.budgetRemaining
+  return { before, after }
+}
+`
+
+// Liest ctx.budgetRemaining OHNE gesetztes Budget — muss Infinity sein.
+const BUDGET_UNLIMITED_FIXTURE = "budget-unlimited"
+const BUDGET_UNLIMITED_WORKFLOW = `export const meta = { name: "${BUDGET_UNLIMITED_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const remaining = ctx.budgetRemaining
+  await ctx.agent({ prompt: "spend" })
+  return { unlimited: remaining === Infinity }
+}
+`
+
 // Pipeline-Fixture: zwei Items ("A","B"), zwei Stages. Stage 2 ändert den Typ
 // (string -> { a, b }). Item A wird in Stage 1 künstlich verlangsamt, damit Item
 // B Stage 2 erreichen kann, BEVOR Item A Stage 1 verlässt — der Nachweis, dass
@@ -612,6 +675,69 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       // damit das Workflow-Resultat hindurchgereicht.
       expect(done.run?.result).toEqual({ data: SCHEMA_OBJECT })
       expect(done.run?.agents.every((a) => a.status === "completed")).toBe(true)
+    }),
+  )
+
+  it.instance("agent calls beyond exhausted budget fail the run with a budget error", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_FIXTURE, BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      // Budget 1.0 USD, jeder Step kostet 1.0 — nach Step 1 ist das Budget
+      // erschöpft (Rest 0), also scheitert der zweite ctx.agent am Gate.
+      const run = yield* workflow.start({
+        name: BUDGET_FIXTURE,
+        args: {},
+        prompt: costPromptOps(1),
+        budget: 1,
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("failed")
+      expect(done.run?.error ?? "").toMatch(/budget/i)
+      // Erster Step lief, zweiter Step scheiterte am Gate.
+      expect(done.run?.agents.filter((a) => a.status === "completed").length).toBe(1)
+      expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
+    }),
+  )
+
+  it.instance("budgetRemaining reflects real spend during the run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, BUDGET_REMAINING_FIXTURE, BUDGET_REMAINING_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({
+        name: BUDGET_REMAINING_FIXTURE,
+        args: {},
+        prompt: costPromptOps(0.25),
+        budget: 1,
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { before: number; after: number }
+      expect(result.before).toBe(1)
+      // Nach einem Step à 0.25 USD bleibt 0.75 übrig.
+      expect(result.after).toBe(0.75)
+      expect(result.after).toBeLessThan(result.before)
+    }),
+  )
+
+  it.instance("no budget set means unlimited (Infinity) — unchanged default", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, BUDGET_UNLIMITED_FIXTURE, BUDGET_UNLIMITED_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({
+        name: BUDGET_UNLIMITED_FIXTURE,
+        args: {},
+        prompt: costPromptOps(5),
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      expect((done.run?.result as { unlimited: boolean }).unlimited).toBe(true)
     }),
   )
 })
