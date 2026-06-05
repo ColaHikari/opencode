@@ -113,6 +113,13 @@ export type StartInput = Schema.Schema.Type<typeof StartInput>
 
 export type PromptOps = {
   prompt: (input: SessionPrompt.PromptInput) => Effect.Effect<SessionV1.WithParts, unknown>
+  /**
+   * Aborts a running agent session (the same path TUI Esc / `POST /:id/abort`
+   * use). The workflow engine calls this for every tracked child session when a
+   * run is cancelled so no tokens keep burning after cancel. Optional so callers
+   * that never start agents need not provide it.
+   */
+  cancel?: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 export type StartOptions = StartInput & {
@@ -141,6 +148,20 @@ export class InvalidError extends Schema.TaggedErrorClass<InvalidError>()("Workf
   message: Schema.String,
 }) {}
 
+/**
+ * Thrown inside a workflow module when the run has been cancelled. It unwinds
+ * `module.run` (and any in-flight `ctx.parallel`/`ctx.pipeline` step) so the
+ * follow-up step never starts. Surfaced as an interrupt-only cause so the run
+ * is finished as `cancelled` rather than `failed`.
+ */
+export class CancelledError extends Error {
+  readonly _tag = "WorkflowCancelledError"
+  constructor() {
+    super("Workflow cancelled")
+    this.name = "WorkflowCancelledError"
+  }
+}
+
 export type AgentInput = {
   agent?: string
   prompt: string
@@ -167,6 +188,12 @@ type Active = {
   run: Run
   done: Deferred.Deferred<Run>
   fiber?: Fiber.Fiber<void, unknown>
+  /** Child agent sessions currently in flight; aborted on cancel/remove. */
+  sessions: Set<string>
+  /** Session-abort vector for this run (the prompt-ops `cancel`); undefined when no prompt-ops were supplied. */
+  cancelSession?: (sessionID: SessionID) => Effect.Effect<void>
+  /** Set once a cancel/remove has been requested so the run finishes as `cancelled`, never `failed`. */
+  cancelling?: boolean
 }
 
 type State = {
@@ -257,6 +284,19 @@ function isInvalidError(error: unknown): error is InvalidError {
   return typeof error === "object" && error !== null && Reflect.get(error, "_tag") === "WorkflowInvalidError"
 }
 
+function isCancelled(value: unknown): boolean {
+  return (
+    value instanceof CancelledError ||
+    (typeof value === "object" && value !== null && Reflect.get(value, "_tag") === "WorkflowCancelledError")
+  )
+}
+
+function isCancelledCause(cause: Cause.Cause<unknown>): boolean {
+  // A workflow module throwing CancelledError surfaces as a failure or a defect
+  // depending on the path; squash returns the representative error either way.
+  return isCancelled(Cause.squash(cause))
+}
+
 function mutableMeta(meta: Meta): Definition["meta"] {
   return {
     name: meta.name,
@@ -322,7 +362,14 @@ function createContext(input: {
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
   permissionSessionID?: SessionID
   persist: () => void
+  /** AbortSignal of the run fiber; fires when the run is interrupted/cancelled. */
+  signal: () => AbortSignal | undefined
+  /** Runs an Effect on the run fiber's runtime (used for Effect concurrency). */
+  bridge: EffectBridge.Shape
 }): ContextApi {
+  const checkpoint = () => {
+    if (input.signal()?.aborted) throw new CancelledError()
+  }
   return {
     budgetRemaining: Number.POSITIVE_INFINITY,
     setPhase(phase: string) {
@@ -333,23 +380,39 @@ function createContext(input: {
       input.active.run.logs.push({ time: Date.now(), phase: input.active.run.current_phase, message })
       input.persist()
     },
-    async parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
+    parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
+      checkpoint()
       const concurrency = Math.max(1, options?.concurrencyLimit ?? 20)
-      const results: T[] = []
-      let index = 0
-      await Promise.all(
-        Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
-          while (index < tasks.length) {
-            const current = index++
-            results[current] = await tasks[current]()
-          }
-        }),
+      // Run on Effect concurrency inside the run fiber's runtime so interruption
+      // propagates; each task is gated by the run's abort signal before it runs.
+      return input.bridge.promise(
+        Effect.forEach(
+          tasks,
+          (task) =>
+            Effect.promise(() => {
+              checkpoint()
+              return task()
+            }),
+          { concurrency },
+        ),
       )
-      return results
     },
-    async pipeline<T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]) {
-      return Promise.all(
-        items.map((item) => steps.reduce<Promise<T>>((acc, step) => acc.then(step), Promise.resolve(item))),
+    pipeline<T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]) {
+      checkpoint()
+      return input.bridge.promise(
+        Effect.forEach(
+          items,
+          (item) =>
+            Effect.promise(async () => {
+              let current = item
+              for (const step of steps) {
+                checkpoint()
+                current = await step(current)
+              }
+              return current
+            }),
+          { concurrency: "unbounded" },
+        ),
       )
     },
     agent: input.agent,
@@ -456,6 +519,17 @@ export const layer = Layer.effect(
       active.run.result = data?.result
       active.run.error = data?.error
       active.fiber = undefined
+      // Close out any agent that is still marked running when the run ends as
+      // cancelled/failed — its session was aborted (cancel) or the run unwound,
+      // so it is no longer running.
+      if (status !== "completed") {
+        for (const node of active.run.agents) {
+          if (node.status !== "running") continue
+          node.status = "failed"
+          node.completed_at = completed_at
+          node.error ??= status === "cancelled" ? "Cancelled" : "Workflow failed"
+        }
+      }
       yield* persistRun(db, active)
       yield* Deferred.succeed(active.done, snapshot(active)).pipe(Effect.ignore)
       return snapshot(active)
@@ -494,6 +568,8 @@ export const layer = Layer.effect(
           agents: [],
         },
         done,
+        sessions: new Set<string>(),
+        cancelSession: input.prompt?.cancel,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, active)
@@ -517,8 +593,12 @@ export const layer = Layer.effect(
           .pipe(Effect.ignore)
       }
       const bridge = yield* EffectBridge.make()
+      // AbortSignal of the run fiber; set inside Effect.promise below and fired
+      // on Fiber.interrupt. Read by ctx.agent/parallel/pipeline for gating.
+      let runSignal: AbortSignal | undefined
 
-      const agent = (agentInput: AgentInput) => {
+      const agent = async (agentInput: AgentInput) => {
+        if (runSignal?.aborted) throw new CancelledError()
         const node: AgentRun = {
           id: `${active.run.agents.length + 1}`,
           status: "running",
@@ -531,7 +611,7 @@ export const layer = Layer.effect(
         active.run.agents.push(node)
         bridge.fork(persistRun(db, active))
         const prompt = input.prompt
-        if (!prompt) return Promise.reject(new Error("Workflow agent execution requires prompt operations"))
+        if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
         return bridge
           .promise(
             Effect.gen(function* () {
@@ -546,6 +626,8 @@ export const layer = Layer.effect(
               node.agent = selected.name
               if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
               node.session_id = session.id
+              // Track the child session so cancel()/remove() can abort it.
+              active.sessions.add(session.id)
               yield* persistRun(db, active)
               const message = yield* prompt.prompt({
                 sessionID: session.id,
@@ -572,7 +654,7 @@ export const layer = Layer.effect(
                     : node.output,
                 text: node.output,
               }
-            }),
+            }).pipe(Effect.ensuring(Effect.sync(() => node.session_id && active.sessions.delete(node.session_id)))),
           )
           .then(
             (result) => {
@@ -592,18 +674,34 @@ export const layer = Layer.effect(
           )
       }
 
-      active.fiber = yield* Effect.promise(() =>
-        module.run(input.args ?? {}, createContext({ active, agent, persist: () => void bridge.fork(persistRun(db, active)) })),
-      ).pipe(
+      active.fiber = yield* Effect.promise((signal) => {
+        runSignal = signal
+        return module.run(
+          input.args ?? {},
+          createContext({
+            active,
+            agent,
+            persist: () => void bridge.fork(persistRun(db, active)),
+            signal: () => runSignal,
+            bridge,
+          }),
+        )
+      }).pipe(
         Effect.matchCauseEffect({
           onSuccess: (result) => finish(id, "completed", { result }),
           onFailure: (cause) =>
-            finish(id, Cause.hasInterruptsOnly(cause) ? "cancelled" : "failed", {
-              error: errorText(Cause.squash(cause)),
-            }),
+            finish(
+              id,
+              active.cancelling || Cause.hasInterruptsOnly(cause) || isCancelledCause(cause) ? "cancelled" : "failed",
+              { error: errorText(Cause.squash(cause)) },
+            ),
         }),
         Effect.asVoid,
-        Effect.forkIn(inst.scope, { startImmediately: true }),
+        // Fork lazily (no `startImmediately`) so this returns the fiber handle
+        // immediately. With `startImmediately` the runtime drives the run body
+        // synchronously into the first agent step, blocking `start` and leaving
+        // `active.fiber` unassigned (which would make cancel a no-op).
+        Effect.forkIn(inst.scope),
       )
       return snapshot(active)
     })
@@ -623,23 +721,43 @@ export const layer = Layer.effect(
       return { run: snapshot(active), timedOut: true }
     })
 
+    // Two-stage interruption: (1) interrupt the run fiber so its AbortSignal
+    // fires (gates ctx steps), then (2) abort every tracked child agent session
+    // via the prompt-ops cancel — that unblocks the detached agent promise so
+    // module.run can unwind and the fiber actually completes. Only after both
+    // do we await the fiber.
+    const abortRun = Effect.fn("Workflow.abortRun")(function* (active: Active) {
+      if (!active.fiber) return
+      active.cancelling = true
+      const scope = (yield* InstanceState.get(state)).scope
+      const interrupted = yield* Fiber.interrupt(active.fiber).pipe(Effect.forkIn(scope))
+      const cancelSession = active.cancelSession
+      if (cancelSession) {
+        yield* Effect.forEach([...active.sessions], (sessionID) => cancelSession(SessionID.make(sessionID)), {
+          concurrency: "unbounded",
+          discard: true,
+        }).pipe(Effect.ignore)
+      }
+      yield* Fiber.await(interrupted).pipe(Effect.ignore)
+      yield* Fiber.await(active.fiber).pipe(Effect.ignore)
+    })
+
     const cancel: Interface["cancel"] = Effect.fn("Workflow.cancel")(function* (id) {
       const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
       if (!active) return
       if (active.run.status !== "running") return snapshot(active)
-      if (active.fiber) {
-        yield* Fiber.interrupt(active.fiber).pipe(Effect.ignore)
-        yield* Fiber.await(active.fiber).pipe(Effect.ignore)
-      }
+      yield* abortRun(active)
       return yield* finish(id, "cancelled")
     })
 
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
       const inst = yield* InstanceState.get(state)
       const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
+      // A running run is cancelled first (interrupt + abort agent sessions) so
+      // delete cannot block on the in-flight run and no agent keeps running.
       if (active?.fiber) {
-        yield* Fiber.interrupt(active.fiber).pipe(Effect.ignore)
-        yield* Fiber.await(active.fiber).pipe(Effect.ignore)
+        yield* abortRun(active)
+        yield* finish(id, "cancelled").pipe(Effect.ignore)
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => {
         const next = new Map(runs)
