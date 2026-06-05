@@ -52,6 +52,9 @@ function statusIcon(status: WorkflowRun["status"]) {
   if (status === "running") return "●"
   if (status === "completed") return "✔"
   if (status === "failed") return "✖"
+  // `interrupted` is a failure-like terminal state (orphaned/zombie run), shown
+  // with a distinct broken-circle marker so it reads apart from a clean cancel.
+  if (status === "interrupted") return "⊘"
   return "◌"
 }
 
@@ -99,6 +102,7 @@ function phaseIcon(status: ReturnType<typeof phaseStatus>) {
   if (status === "completed") return "✔"
   if (status === "running") return "●"
   if (status === "failed") return "✖"
+  if (status === "interrupted") return "⊘"
   return "◌"
 }
 
@@ -264,6 +268,7 @@ function shortRunID(run: WorkflowRun) {
 function statusLabel(status: WorkflowRun["status"]) {
   if (status === "completed") return "done"
   if (status === "cancelled") return "cancel"
+  if (status === "interrupted") return "interrupt"
   return status
 }
 
@@ -868,7 +873,7 @@ function DialogWorkflowRun(props: {
                 const color = createMemo(() => {
                   if (active()) return theme.primary
                   if (status() === "completed") return theme.text
-                  if (status() === "failed") return theme.error
+                  if (status() === "failed" || status() === "interrupted") return theme.error
                   return theme.textMuted
                 })
                 return (
@@ -887,7 +892,7 @@ function DialogWorkflowRun(props: {
                           ? theme.primary
                           : status() === "completed"
                             ? theme.success
-                            : status() === "failed"
+                            : status() === "failed" || status() === "interrupted"
                               ? theme.error
                               : theme.textMuted
                       }

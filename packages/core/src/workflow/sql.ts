@@ -52,7 +52,7 @@ export const WorkflowRunTable = sqliteTable(
     id: text().primaryKey(),
     session_id: text(),
     workflow: text().notNull(),
-    status: text().$type<"running" | "completed" | "failed" | "cancelled">().notNull(),
+    status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted">().notNull(),
     started_at: integer().notNull(),
     completed_at: integer(),
     current_phase: text(),
