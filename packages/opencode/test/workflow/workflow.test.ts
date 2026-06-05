@@ -2,7 +2,6 @@ import { describe, expect } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
 import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
-import { SessionID } from "@/session/schema"
 import { TestInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Layer } from "effect"
@@ -30,8 +29,16 @@ export async function run(args, ctx) {
 }
 `
 
-// Test-Prompt-Ops: hält jeden Agent-Prompt an einer Deferred fest (unterbrechbar)
-// und protokolliert, welche Child-Session per cancel() echt abgebrochen wurde.
+function assistantReply(): SessionV1.WithParts {
+  return { info: { role: "assistant" }, parts: [] } as unknown as SessionV1.WithParts
+}
+
+// Test-Prompt-Ops, die das echte Session-Abort-Verhalten nachbilden:
+// - die initiale "Workflow started"-Nachricht (noReply) wird sofort beantwortet,
+//   damit start() zurückkehrt;
+// - jeder Agent-Prompt blockiert (langer, unterbrechbarer Lauf), bis cancel()
+//   die Session abbricht; cancel() protokolliert die abgebrochene Child-Session
+//   und unterbricht den laufenden Prompt (wie SessionPrompt.cancel -> Abort).
 function hangingPromptOps() {
   const aborted = new Set<string>()
   const started = new Set<string>()
@@ -39,18 +46,23 @@ function hangingPromptOps() {
   const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
     prompt: (input) =>
       Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
         const gate = yield* Deferred.make<void>()
         gates.set(input.sessionID, gate)
         started.add(input.sessionID)
-        // Blockiert bis cancel() die Session abbricht (oder Fiber-Interrupt).
-        yield* Deferred.await(gate)
-        return { info: { role: "assistant" }, parts: [] } as unknown as SessionV1.WithParts
+        // Läuft, bis die Session per cancel() abgebrochen wird (Gate -> Interrupt)
+        // oder der lange Lauf endet. Der Timer hält die Suspension unterbrechbar.
+        yield* Effect.race(
+          Effect.sleep("30 seconds"),
+          Deferred.await(gate).pipe(Effect.flatMap(() => Effect.interrupt)),
+        )
+        return assistantReply()
       }),
     cancel: (sessionID) =>
       Effect.gen(function* () {
         aborted.add(sessionID)
         const gate = gates.get(sessionID)
-        if (gate) yield* Deferred.interrupt(gate)
+        if (gate) yield* Deferred.succeed(gate, undefined)
       }),
   }
   return { ops, aborted, started }
@@ -159,11 +171,11 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
 
       const run = yield* workflow.start({ name: SLOW_FIXTURE, args: {}, prompt: ops })
 
-      // Warten bis der erste Agent läuft.
+      // Warten bis der erste Agent läuft und seine Child-Session erzeugt hat.
       const live = yield* pollWithTimeout(
         Effect.gen(function* () {
           const current = yield* workflow.get(run.id)
-          return current && current.agents.length >= 1 ? current : undefined
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
         }),
         "agent never started",
       )
@@ -198,7 +210,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const live = yield* pollWithTimeout(
         Effect.gen(function* () {
           const current = yield* workflow.get(run.id)
-          return current && current.agents.length >= 1 ? current : undefined
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
         }),
         "agent never started",
       )
