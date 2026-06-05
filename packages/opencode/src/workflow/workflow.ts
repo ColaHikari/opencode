@@ -158,6 +158,23 @@ export class InvalidError extends Schema.TaggedErrorClass<InvalidError>()("Workf
 }) {}
 
 /**
+ * Raised by an agent step that requested structured output (a `schema` was
+ * passed to `ctx.agent`) when the session produced no parsed structured result —
+ * either because the underlying session set a `StructuredOutputError` on the
+ * assistant message, or because `structured` came back `undefined`. The engine
+ * MUST NOT silently fall back to plaintext when a schema was requested: a missing
+ * structured result is a genuine step failure, so this error propagates through
+ * the same agent-failure path as any other agent error (node `failed`, run
+ * `failed` unless the workflow module catches it).
+ */
+export class StructuredOutputError extends Schema.TaggedErrorClass<StructuredOutputError>()(
+  "WorkflowStructuredOutputError",
+  {
+    message: Schema.String,
+  },
+) {}
+
+/**
  * Thrown by `checkpoint()` before the next `ctx.agent`/`ctx.parallel`/
  * `ctx.pipeline` task/step once the run's abort signal has fired, so the
  * follow-up step never starts. Detected in the run's failure branch and mapped
@@ -729,20 +746,39 @@ export const layer = Layer.effect(
                 parts: [{ type: "text", text: agentInput.prompt }],
               })
               node.message_id = message.info.id
-              node.output =
-                message.info.role === "assistant" && message.info.structured !== undefined
-                  ? JSON.stringify(message.info.structured, null, 2)
-                  : assistantText(message)
               if (message.info.role === "assistant") {
                 node.model = `${message.info.providerID}/${message.info.modelID}`
                 node.cost = message.info.cost
                 node.tokens = message.info.tokens
               }
+              const structured =
+                message.info.role === "assistant" ? message.info.structured : undefined
+              // A schema was requested ⇒ a structured result is mandatory. When the
+              // session produced none (it set a StructuredOutputError on the message
+              // and/or `structured` came back undefined) we MUST fail the step rather
+              // than silently fall back to plaintext: a missing structured result is
+              // a genuine step failure that has to surface (node `failed`, run fails
+              // unless the module catches it). Non-schema agents are unaffected.
+              if (agentInput.schema && structured === undefined) {
+                const sessionMessage =
+                  message.info.role === "assistant" && message.info.error?.name === "StructuredOutputError"
+                    ? (message.info.error.data as { message?: string }).message
+                    : undefined
+                node.output = assistantText(message)
+                return yield* new StructuredOutputError({
+                  message: [
+                    "Agent was asked for structured output but produced none",
+                    sessionMessage ? `(${sessionMessage})` : undefined,
+                    `expected a result matching the requested schema (${JSON.stringify(agentInput.schema)})`,
+                  ]
+                    .filter(Boolean)
+                    .join(" "),
+                })
+              }
+              node.output =
+                structured !== undefined ? JSON.stringify(structured, null, 2) : assistantText(message)
               return {
-                data:
-                  message.info.role === "assistant" && message.info.structured !== undefined
-                    ? message.info.structured
-                    : node.output,
+                data: structured !== undefined ? structured : node.output,
                 text: node.output,
               }
             }).pipe(Effect.ensuring(Effect.sync(() => node.session_id && active.sessions.delete(node.session_id)))),
