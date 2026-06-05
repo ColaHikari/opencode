@@ -13,7 +13,6 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
-import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { PartID } from "@/session/schema"
 
 const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, CrossSpawnSpawner.defaultLayer))
@@ -40,7 +39,7 @@ async function writeWorkflow(dir: string, name: string, source: string) {
 }
 
 function requestRecorder() {
-  const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+  const requests: Parameters<Tool.Context["ask"]>[0][] = []
   const prompts: SessionPrompt.PromptInput[] = []
   const ctx: Tool.Context = {
     ...baseCtx,

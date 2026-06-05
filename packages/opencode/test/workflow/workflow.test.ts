@@ -791,4 +791,43 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
     }),
   )
+
+  it.instance("reloads workflow implementation after file changes", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "reload",
+          `export const meta = { name: "Reload One" }
+export async function run() { return { value: "one" } }
+`,
+          "ts",
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const first = yield* workflow.start({ name: "reload" })
+      const firstWaited = yield* workflow.wait({ id: first.id })
+      const firstDone = firstWaited.run ?? (yield* Effect.fail(new Error("first workflow did not finish")))
+      expect(firstDone.definition?.meta.name).toBe("Reload One")
+      expect(firstDone.result).toEqual({ value: "one" })
+
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "reload",
+          `export const meta = { name: "Reload Two" }
+export async function run() { return { value: "two" } }
+`,
+          "ts",
+        ),
+      )
+
+      const second = yield* workflow.start({ name: "reload" })
+      const secondWaited = yield* workflow.wait({ id: second.id })
+      const secondDone = secondWaited.run ?? (yield* Effect.fail(new Error("second workflow did not finish")))
+      expect(secondDone.definition?.meta.name).toBe("Reload Two")
+      expect(secondDone.result).toEqual({ value: "two" })
+    }),
+  )
 })
