@@ -150,18 +150,38 @@ export async function listWorkflowInfos(workflow: WorkflowClient, enabled: boole
   return result.data.filter((workflow) => workflow.valid !== false)
 }
 
-export function parseWorkflowArgs(input: string) {
+// The argument declaration as it appears on a workflow's meta (WorkflowInfo /
+// WorkflowMeta["arguments"]): a map of arg name -> { type?, default?, description? }.
+// Only the declared `type` drives coercion here.
+export type WorkflowArgDeclaration = Record<string, { type?: string }>
+
+// Parses `name=value` tokens into a payload, coercing values by DECLARED type
+// rather than by appearance. Coercion rules:
+//   - An arg declared `type: "number"` whose value parses as a finite number is
+//     coerced to that number. A declared-number arg whose value does NOT parse
+//     (e.g. `count=abc`) is passed through as the raw string — the engine stores
+//     args untyped (Record<string, unknown>) and runs no coercion/validation of
+//     its own, so silently turning a non-number into NaN would corrupt data; the
+//     workflow's own run() can validate. Surfacing the raw string is least surprising.
+//   - Every other arg — declared string, declared anything-else, or UNDECLARED —
+//     keeps its exact text (so `version=1.0` and `zip=01234` survive intact).
+//   - Bare flags (`--verbose`) keep the existing behavior of becoming the string
+//     "true"; the parser has never produced real booleans, and this change does
+//     not introduce them.
+export function parseWorkflowArgs(input: string, declaration: WorkflowArgDeclaration = {}) {
   return Object.fromEntries(
     // Matches: [--]key[="quoted value" | 'quoted value' | unquoted_value]
     Array.from(input.matchAll(/(?:^|\s)(?:--)?([^=\s]+)(?:=("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S*))?/g)).map(
       (match) => {
+        const name = match[1]
         const raw = match[2] ?? "true"
         const value =
           (raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))
             ? raw.slice(1, -1).replace(/\\(["'\\])/g, "$1")
             : raw
+        if (declaration[name]?.type !== "number") return [name, value]
         const numeric = Number(value)
-        return [match[1], Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]
+        return [name, Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]
       },
     ),
   )
