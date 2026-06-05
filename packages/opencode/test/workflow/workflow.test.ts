@@ -2,12 +2,55 @@ import { describe, expect } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
 import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
+import { Database } from "@opencode-ai/core/database/database"
+import { WorkflowRunTable } from "@opencode-ai/core/workflow/sql"
+import { eq } from "drizzle-orm"
 import { TestInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Layer } from "effect"
 import path from "path"
 
-const it = testEffect(Layer.mergeAll(Workflow.defaultLayer))
+// Database.defaultLayer is merged so the orphan-sweep tests can seed a row
+// directly through the same in-memory SQLite connection the engine uses.
+const it = testEffect(Layer.mergeAll(Workflow.defaultLayer, Database.defaultLayer))
+
+const HELLO_FIXTURE = "hello"
+const HELLO_WORKFLOW = `export const meta = { name: "${HELLO_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); return { ok: true } }
+`
+
+// Seeds a workflow_run row in status="running" with NO live registry entry,
+// the exact shape an orphaned (crashed/restarted) run leaves behind.
+function seedRunningRow(id: string) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    yield* db
+      .insert(WorkflowRunTable)
+      .values({
+        id,
+        workflow: HELLO_FIXTURE,
+        status: "running",
+        started_at: Date.now(),
+        logs: [],
+        agents: [],
+      })
+      .run()
+      .pipe(Effect.orDie)
+  })
+}
+
+function fetchRunRow(id: string) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const row = yield* db
+      .select()
+      .from(WorkflowRunTable)
+      .where(eq(WorkflowRunTable.id, id))
+      .get()
+      .pipe(Effect.orDie)
+    return row ?? (yield* Effect.fail(new Error(`row ${id} not found`)))
+  })
+}
 
 async function writeWorkflow(dir: string, name: string, body: string, ext = "js") {
   await Bun.write(path.join(dir, ".opencode", "workflows", `${name}.${ext}`), body)
@@ -224,6 +267,57 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(gone).toBeUndefined()
       // Und die Child-Session wurde vor dem Löschen abgebrochen.
       expect(aborted.has(childSession!)).toBe(true)
+    }),
+  )
+
+  // Orphan-Mechanismus: Die In-Memory-Test-DB (OPENCODE_DB=:memory:) überlebt
+  // keine frische Layer-Instanz, daher wird der Orphan simuliert, indem wir eine
+  // running-Zeile OHNE Registry-Eintrag direkt über die SQL-Schicht einfügen und
+  // anschließend NUR den Sweep auslösen (engine.sweep()), so wie er beim
+  // Service-Start läuft (leere Registry -> alle running-Zeilen werden gefegt).
+  it.instance("orphaned running rows are marked interrupted on service start", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const orphanId = "job_orphan_sweep"
+      yield* seedRunningRow(orphanId)
+
+      yield* workflow.sweep()
+
+      const row = yield* fetchRunRow(orphanId)
+      expect(row.status).toBe("interrupted")
+      expect(row.completed_at).toBeGreaterThan(0)
+    }),
+  )
+
+  it.instance("persisted run round-trips through fromRow", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, HELLO_FIXTURE, HELLO_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: HELLO_FIXTURE, args: {} })
+      yield* workflow.wait({ id: run.id })
+
+      // Entfernt den Run aus der In-Memory-Registry, damit get() zwingend über
+      // DB->fromRow lesen muss (nicht aus dem Snapshot).
+      yield* workflow.evict(run.id)
+
+      const viaDb = yield* workflow.get(run.id)
+      const persisted = viaDb ?? (yield* Effect.fail(new Error("run not persisted")))
+      expect(persisted).toMatchObject({ id: run.id, status: "completed" })
+      expect(persisted.logs.map((item) => item.message)).toContain("running")
+    }),
+  )
+
+  it.instance("wait on interrupted run resolves immediately as interrupted (not timedOut)", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const orphanId = "job_orphan_wait"
+      yield* seedRunningRow(orphanId)
+      yield* workflow.sweep()
+
+      const res = yield* workflow.wait({ id: orphanId, timeout: 50 })
+      expect(res.run?.status).toBe("interrupted")
+      expect(res.timedOut).not.toBe(true)
     }),
   )
 })
