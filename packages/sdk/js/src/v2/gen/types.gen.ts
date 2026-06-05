@@ -21,6 +21,7 @@ export type Event =
   | EventSessionNextPrompted
   | EventSessionNextPromptAdmitted
   | EventSessionNextPromptPromoted
+  | EventSessionNextInterruptRequested
   | EventSessionNextContextUpdated
   | EventSessionNextSynthetic
   | EventSessionNextShellStarted
@@ -870,6 +871,14 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.next.interrupt.requested"
+        properties: {
+          timestamp: number
+          sessionID: string
+        }
+      }
+    | {
+        id: string
         type: "session.next.context.updated"
         properties: {
           timestamp: number
@@ -1111,6 +1120,7 @@ export type GlobalEvent = {
             [key: string]: unknown
           }
           content: Array<ToolTextContent | ToolFileContent>
+          outputPaths?: Array<string>
           result?: unknown
           provider: {
             executed: boolean
@@ -1168,6 +1178,7 @@ export type GlobalEvent = {
         properties: {
           timestamp: number
           sessionID: string
+          messageID: string
           text: string
         }
       }
@@ -1177,8 +1188,10 @@ export type GlobalEvent = {
         properties: {
           timestamp: number
           sessionID: string
+          messageID: string
+          reason: "auto" | "manual"
           text: string
-          include?: string
+          recent: string
         }
       }
     | {
@@ -1626,6 +1639,7 @@ export type GlobalEvent = {
     | SyncEventSessionNextPrompted
     | SyncEventSessionNextPromptAdmitted
     | SyncEventSessionNextPromptPromoted
+    | SyncEventSessionNextInterruptRequested
     | SyncEventSessionNextContextUpdated
     | SyncEventSessionNextSynthetic
     | SyncEventSessionNextShellStarted
@@ -1645,7 +1659,6 @@ export type GlobalEvent = {
     | SyncEventSessionNextToolFailed
     | SyncEventSessionNextRetried
     | SyncEventSessionNextCompactionStarted
-    | SyncEventSessionNextCompactionDelta
     | SyncEventSessionNextCompactionEnded
 }
 
@@ -2732,6 +2745,8 @@ export type WorkflowInfo = {
   name: string
   path: string
   meta: WorkflowMeta
+  valid: boolean
+  error?: string
 }
 
 export type WorkflowApiError = {
@@ -2788,7 +2803,7 @@ export type WorkflowRun = {
     [key: string]: unknown
   }
   definition?: WorkflowDefinition
-  status: "running" | "completed" | "failed" | "cancelled"
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted"
   started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   current_phase?: string
@@ -2802,6 +2817,8 @@ export type WorkflowStartPayload = {
   args?: {
     [key: string]: unknown
   }
+  budget?: number
+  permissionSessionID?: string
 }
 
 export type UnauthorizedError = {
@@ -2958,6 +2975,19 @@ export type ModelV2Info = {
     body: {
       [key: string]: unknown
     }
+    generation?: {
+      maxTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      temperature?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      topP?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      topK?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      frequencyPenalty?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      presencePenalty?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      seed?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      stop?: Array<string>
+    }
+    options?: {
+      [key: string]: unknown
+    }
     variant?: string
   }
   variants: Array<{
@@ -2966,6 +2996,19 @@ export type ModelV2Info = {
       [key: string]: string
     }
     body: {
+      [key: string]: unknown
+    }
+    generation?: {
+      maxTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      temperature?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      topP?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      topK?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      frequencyPenalty?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      presencePenalty?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      seed?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      stop?: Array<string>
+    }
+    options?: {
       [key: string]: unknown
     }
   }>
@@ -3362,6 +3405,21 @@ export type SyncEventSessionNextPromptPromoted = {
   }
 }
 
+export type SyncEventSessionNextInterruptRequested = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.interrupt.requested.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+    }
+  }
+}
+
 export type SyncEventSessionNextContextUpdated = {
   type: "sync"
   id: string
@@ -3682,6 +3740,7 @@ export type SyncEventSessionNextToolSuccess = {
         [key: string]: unknown
       }
       content: Array<ToolTextContent | ToolFileContent>
+      outputPaths?: Array<string>
       result?: unknown
       provider: {
         executed: boolean
@@ -3756,35 +3815,21 @@ export type SyncEventSessionNextCompactionStarted = {
   }
 }
 
-export type SyncEventSessionNextCompactionDelta = {
-  type: "sync"
-  id: string
-  syncEvent: {
-    type: "session.next.compaction.delta.1"
-    id: string
-    seq: number
-    aggregateID: string
-    data: {
-      timestamp: number
-      sessionID: string
-      text: string
-    }
-  }
-}
-
 export type SyncEventSessionNextCompactionEnded = {
   type: "sync"
   id: string
   syncEvent: {
-    type: "session.next.compaction.ended.1"
+    type: "session.next.compaction.ended.2"
     id: string
     seq: number
     aggregateID: string
     data: {
       timestamp: number
       sessionID: string
+      messageID: string
+      reason: "auto" | "manual"
       text: string
-      include?: string
+      recent: string
     }
   }
 }
@@ -4009,6 +4054,7 @@ export type SessionMessageToolStateCompleted = {
   }
   attachments?: Array<PromptFileAttachment>
   content: Array<ToolTextContent | ToolFileContent>
+  outputPaths?: Array<string>
   structured: {
     [key: string]: unknown
   }
@@ -4097,7 +4143,7 @@ export type SessionMessageCompaction = {
   type: "compaction"
   reason: "auto" | "manual"
   summary: string
-  include?: string
+  recent: string
   id: string
   metadata?: {
     [key: string]: unknown
@@ -4291,6 +4337,19 @@ export type ModelV2Info1 = {
     body: {
       [key: string]: unknown
     }
+    generation?: {
+      maxTokens?: number | "NaN" | "Infinity" | "-Infinity"
+      temperature?: number | "NaN" | "Infinity" | "-Infinity"
+      topP?: number | "NaN" | "Infinity" | "-Infinity"
+      topK?: number | "NaN" | "Infinity" | "-Infinity"
+      frequencyPenalty?: number | "NaN" | "Infinity" | "-Infinity"
+      presencePenalty?: number | "NaN" | "Infinity" | "-Infinity"
+      seed?: number | "NaN" | "Infinity" | "-Infinity"
+      stop?: Array<string>
+    }
+    options?: {
+      [key: string]: unknown
+    }
     variant?: string
   }
   variants: Array<{
@@ -4299,6 +4358,19 @@ export type ModelV2Info1 = {
       [key: string]: string
     }
     body: {
+      [key: string]: unknown
+    }
+    generation?: {
+      maxTokens?: number | "NaN" | "Infinity" | "-Infinity"
+      temperature?: number | "NaN" | "Infinity" | "-Infinity"
+      topP?: number | "NaN" | "Infinity" | "-Infinity"
+      topK?: number | "NaN" | "Infinity" | "-Infinity"
+      frequencyPenalty?: number | "NaN" | "Infinity" | "-Infinity"
+      presencePenalty?: number | "NaN" | "Infinity" | "-Infinity"
+      seed?: number | "NaN" | "Infinity" | "-Infinity"
+      stop?: Array<string>
+    }
+    options?: {
       [key: string]: unknown
     }
   }>
@@ -4469,6 +4541,15 @@ export type EventSessionNextPromptPromoted = {
     messageID: string
     prompt: Prompt
     timeCreated: number
+  }
+}
+
+export type EventSessionNextInterruptRequested = {
+  id: string
+  type: "session.next.interrupt.requested"
+  properties: {
+    timestamp: number
+    sessionID: string
   }
 }
 
@@ -4733,6 +4814,7 @@ export type EventSessionNextToolSuccess = {
       [key: string]: unknown
     }
     content: Array<ToolTextContent | ToolFileContent>
+    outputPaths?: Array<string>
     result?: unknown
     provider: {
       executed: boolean
@@ -4794,6 +4876,7 @@ export type EventSessionNextCompactionDelta = {
   properties: {
     timestamp: number
     sessionID: string
+    messageID: string
     text: string
   }
 }
@@ -4804,8 +4887,10 @@ export type EventSessionNextCompactionEnded = {
   properties: {
     timestamp: number
     sessionID: string
+    messageID: string
+    reason: "auto" | "manual"
     text: string
-    include?: string
+    recent: string
   }
 }
 

@@ -51,9 +51,9 @@ import { Reference } from "@/reference/reference"
 import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { Workflow } from "@/workflow/workflow"
 import { WorkflowTool } from "./workflow"
-import { ModelV2 } from "@opencode-ai/core/model"
 
 const log = Log.create({ service: "tool.registry" })
 
