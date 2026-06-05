@@ -762,14 +762,15 @@ export const layer = Layer.effect(
               if (agentInput.schema && structured === undefined) {
                 const sessionMessage =
                   message.info.role === "assistant" && message.info.error?.name === "StructuredOutputError"
-                    ? (message.info.error.data as { message?: string }).message
+                    ? message.info.error.data.message
                     : undefined
                 node.output = assistantText(message)
+                const schemaText = JSON.stringify(agentInput.schema)
                 return yield* new StructuredOutputError({
                   message: [
                     "Agent was asked for structured output but produced none",
                     sessionMessage ? `(${sessionMessage})` : undefined,
-                    `expected a result matching the requested schema (${JSON.stringify(agentInput.schema)})`,
+                    `expected a result matching the requested schema (${schemaText.length > 200 ? schemaText.slice(0, 200) + "…" : schemaText})`,
                   ]
                     .filter(Boolean)
                     .join(" "),
