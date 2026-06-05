@@ -532,10 +532,18 @@ export const layer = Layer.effect(
         .toSorted((a, b) => b.started_at - a.started_at)
     })
 
-    const list: Interface["list"] = Effect.fn("Workflow.list")(function* () {
+    // Shared discovery for list() and start(): resolves the config + project
+    // directories and globs them into a sorted `{ name, path }[]`. No module is
+    // loaded here — loading is the caller's concern (list loads all per-file,
+    // start loads only the target).
+    const discoverWorkflows = Effect.fn("Workflow.discover")(function* () {
       const ctx = yield* InstanceState.context
       const directories = [...new Set([...(yield* config.directories()), projectConfigDir(ctx)])]
-      const workflows = yield* Effect.promise(() => discover(directories))
+      return yield* Effect.promise(() => discover(directories))
+    })
+
+    const list: Interface["list"] = Effect.fn("Workflow.list")(function* () {
+      const workflows = yield* discoverWorkflows()
       // Per-file error isolation: each file is loaded inside Effect.result so a
       // failure becomes an `{ valid: false, error }` entry instead of aborting
       // the whole list. One broken file (bad meta / missing run / syntax error)
@@ -616,9 +624,7 @@ export const layer = Layer.effect(
       // broken sibling file must not block starting a valid one. Only the target
       // module is imported, and a broken target fails precisely (InvalidError
       // naming the file) rather than as part of a whole-list failure.
-      const ctx = yield* InstanceState.context
-      const directories = [...new Set([...(yield* config.directories()), projectConfigDir(ctx)])]
-      const discovered = yield* Effect.promise(() => discover(directories))
+      const discovered = yield* discoverWorkflows()
       const workflow = discovered.find((item) => item.name === input.name)
       if (!workflow) return yield* new NotFoundError({ name: input.name })
       // tryPromise so a load failure (bad meta / missing run / syntax error)

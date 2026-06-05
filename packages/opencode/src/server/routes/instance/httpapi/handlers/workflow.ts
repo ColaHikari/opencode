@@ -17,7 +17,9 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
     const prompt = yield* SessionPrompt.Service
 
     const list = Effect.fn("WorkflowHttpApi.list")(function* () {
-      return yield* workflow.list().pipe(Effect.mapError(apiError))
+      // list() never fails (broken files are reported as invalid entries), so no
+      // error mapping is needed here; apiError still covers start()'s failures.
+      return yield* workflow.list()
     })
 
     const runs = Effect.fn("WorkflowHttpApi.runs")(function* () {
