@@ -35,7 +35,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       payload?: StartPayload
     }) {
       return yield* workflow
-        .start({ name: ctx.params.name, args: ctx.payload?.args, prompt })
+        .start({ name: ctx.params.name, args: ctx.payload?.args, budget: ctx.payload?.budget, prompt })
         .pipe(Effect.mapError(apiError))
     })
 

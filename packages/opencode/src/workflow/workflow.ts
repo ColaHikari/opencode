@@ -117,6 +117,13 @@ export type Run = DeepMutable<Schema.Schema.Type<typeof Run>>
 export const StartInput = Schema.Struct({
   name: Schema.String,
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  // Optional cost cap in USD for the whole run. The unit is USD because that is
+  // exactly the per-agent telemetry the engine already records (`AgentRun.cost`,
+  // read from the assistant message's `cost`, the same number the dashboard
+  // shows). After each agent step the remaining budget is decremented by that
+  // step's cost; before each `ctx.agent` call the engine fails the step with a
+  // BudgetExceededError once nothing is left. Omitted ⇒ unlimited (Infinity).
+  budget: Schema.optional(Schema.Finite),
 }).annotate({ identifier: "WorkflowStartInput" })
 export type StartInput = Schema.Schema.Type<typeof StartInput>
 
@@ -171,6 +178,24 @@ export class StructuredOutputError extends Schema.TaggedErrorClass<StructuredOut
   "WorkflowStructuredOutputError",
   {
     message: Schema.String,
+  },
+) {}
+
+/**
+ * Raised at the top of `ctx.agent` (right after the abort-signal checkpoint)
+ * when the run was started with a budget and that budget is exhausted
+ * (`budgetRemaining <= 0`). The next agent step never starts: the engine
+ * refuses to spend past the cap. Propagates through the SAME agent-failure path
+ * as any other agent error (node `failed`, run `failed` unless the workflow
+ * module catches it). The message names both the configured budget and the
+ * amount already spent so the failure is self-explanatory.
+ */
+export class BudgetExceededError extends Schema.TaggedErrorClass<BudgetExceededError>()(
+  "WorkflowBudgetExceededError",
+  {
+    message: Schema.String,
+    budget: Schema.Finite,
+    spent: Schema.Finite,
   },
 ) {}
 
@@ -262,6 +287,18 @@ type Active = {
   cancelSession?: (sessionID: SessionID) => Effect.Effect<void>
   /** Set once a cancel/remove has been requested so the run finishes as `cancelled`, never `failed`. */
   cancelling?: boolean
+  /**
+   * Original cost cap (USD) the run was started with, or `Infinity` when no
+   * budget was set. Kept alongside `budgetRemaining` purely so the
+   * BudgetExceededError can report how much was budgeted vs. spent.
+   */
+  budget: number
+  /**
+   * Live remaining budget (USD). Starts at `budget` and is decremented after
+   * each agent step by that step's `AgentRun.cost`. `Infinity` ⇒ unlimited.
+   * Read by `ctx.budgetRemaining`; gated against in `ctx.agent`.
+   */
+  budgetRemaining: number
 }
 
 type State = {
@@ -468,7 +505,12 @@ function createContext(input: {
     if (input.signal()?.aborted) throw new CancelledError()
   }
   return {
-    budgetRemaining: Number.POSITIVE_INFINITY,
+    // Live remaining budget (USD), read on every access so a workflow can
+    // observe the value shrink across agent steps. `Infinity` when the run was
+    // started without a budget (unchanged default).
+    get budgetRemaining() {
+      return input.active.budgetRemaining
+    },
     setPhase(phase: string) {
       input.active.run.current_phase = phase
       input.persist()
@@ -732,6 +774,10 @@ export const layer = Layer.effect(
         done,
         sessions: new Set<string>(),
         cancelSession: input.prompt?.cancel,
+        // Unset budget ⇒ Infinity ⇒ the gate never trips and the decrement is a
+        // no-op, preserving the previous unlimited behavior exactly.
+        budget: input.budget ?? Number.POSITIVE_INFINITY,
+        budgetRemaining: input.budget ?? Number.POSITIVE_INFINITY,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, active)
@@ -761,6 +807,20 @@ export const layer = Layer.effect(
 
       const agent = async (agentInput: AgentInput) => {
         if (runSignal?.aborted) throw new CancelledError()
+        // Budget gate — ordered right AFTER the abort-signal checkpoint so a
+        // cancelled run still unwinds as `cancelled` (not `failed`) before any
+        // budget verdict is reached. `Infinity` (no budget set) never trips.
+        // Once the prior steps have consumed the whole budget we refuse to spend
+        // again: fail the step with a BudgetExceededError, which propagates like
+        // any other agent failure (node `failed`, run `failed` unless caught).
+        if (active.budgetRemaining <= 0) {
+          const spent = active.budget - active.budgetRemaining
+          throw new BudgetExceededError({
+            message: `Workflow budget exhausted: spent ${spent} of ${active.budget} (USD) budget; refusing to start another agent step`,
+            budget: active.budget,
+            spent,
+          })
+        }
         const node: AgentRun = {
           id: `${active.run.agents.length + 1}`,
           status: "running",
@@ -843,6 +903,11 @@ export const layer = Layer.effect(
               node.status = "completed"
               node.completed_at = Date.now()
               node.output = result.text
+              // Decrement the live budget by this step's actual telemetry — the
+              // SAME `cost` (USD) the dashboard shows, set on the node from the
+              // assistant message above. A step with no cost (cost undefined)
+              // leaves the budget untouched; an unset budget stays Infinity.
+              active.budgetRemaining -= node.cost ?? 0
               bridge.fork(persistRun(db, active))
               return result
             },

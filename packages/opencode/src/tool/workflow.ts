@@ -31,6 +31,10 @@ const Parameters = Schema.Struct({
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({
     description: "Workflow input arguments as a JSON object",
   }),
+  budget: Schema.optional(Schema.Number).annotate({
+    description:
+      "Optional cost cap in USD for the whole run. Agent steps stop with a budget error once the cumulative cost reaches this cap. Omit for unlimited.",
+  }),
   background: Schema.optional(Schema.Boolean).annotate({
     description: "Start the workflow asynchronously and notify this session when it finishes",
   }),
@@ -277,6 +281,7 @@ function startWorkflow(input: {
       .start({
         name: input.name,
         args: input.params.args,
+        budget: input.params.budget,
         prompt: ops,
         permissionSessionID: input.ctx.sessionID,
         source: input.source,

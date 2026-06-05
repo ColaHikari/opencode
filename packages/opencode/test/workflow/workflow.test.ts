@@ -694,9 +694,11 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const done = yield* workflow.wait({ id: run.id })
       expect(done.run?.status).toBe("failed")
       expect(done.run?.error ?? "").toMatch(/budget/i)
-      // Erster Step lief, zweiter Step scheiterte am Gate.
+      // Das Gate verhindert, dass der zweite Step überhaupt STARTET: nur der
+      // erste Agent läuft (und wird completed); für den geblockten zweiten Step
+      // wird kein Node angelegt — die Engine weigert sich, weiter zu spenden.
       expect(done.run?.agents.filter((a) => a.status === "completed").length).toBe(1)
-      expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
+      expect(done.run?.agents.length).toBe(1)
     }),
   )
 
