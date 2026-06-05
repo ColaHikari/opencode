@@ -16,6 +16,13 @@ import { APICallError } from "ai"
 import path from "path"
 import { pathToFileURL } from "url"
 import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Scope, Schema, SynchronizedRef } from "effect"
+import type {
+  WorkflowContext,
+  WorkflowParallelOptions,
+  WorkflowPipelineFn,
+  WorkflowPipelineOptions,
+  WorkflowPipelineStage,
+} from "@opencode-ai/plugin/workflow"
 import { WorkflowRunTable } from "./workflow.sql"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
@@ -249,43 +256,15 @@ export type AgentInput = {
   permissionSessionID?: SessionID
 }
 
-export type ParallelOptions = { concurrencyLimit?: number }
-export type PipelineOptions = { concurrencyLimit?: number }
-
-/** A pipeline stage: receives the previous stage's output for this item plus the
- * original item, and returns the next value. The first stage's `prev` is the
- * item itself. Stages may change the type (`I → S1 → S2 …`). */
-export type PipelineStage<Prev, Item, Next> = (prev: Prev, item: Item) => Promise<Next>
-
-/** Per-item pipeline. Each item flows through every stage SEQUENTIALLY (stage N+1
- * receives stage N's result for that item), while items run concurrently against
- * each other (no barrier between stages). Result is the last stage's output in
- * item order. Overloaded for 1..4 stages so heterogeneous types flow through
- * without `any`; the public type is precise. */
-export interface PipelineFn {
-  <I, A>(items: readonly I[], s1: PipelineStage<I, I, A>, options?: PipelineOptions): Promise<A[]>
-  <I, A, B>(
-    items: readonly I[],
-    s1: PipelineStage<I, I, A>,
-    s2: PipelineStage<A, I, B>,
-    options?: PipelineOptions,
-  ): Promise<B[]>
-  <I, A, B, C>(
-    items: readonly I[],
-    s1: PipelineStage<I, I, A>,
-    s2: PipelineStage<A, I, B>,
-    s3: PipelineStage<B, I, C>,
-    options?: PipelineOptions,
-  ): Promise<C[]>
-  <I, A, B, C, D>(
-    items: readonly I[],
-    s1: PipelineStage<I, I, A>,
-    s2: PipelineStage<A, I, B>,
-    s3: PipelineStage<B, I, C>,
-    s4: PipelineStage<C, I, D>,
-    options?: PipelineOptions,
-  ): Promise<D[]>
-}
+// Pipeline/parallel option and stage shapes are the public workflow-authoring
+// contract, owned by `@opencode-ai/plugin` (opencode depends on the plugin, so
+// the plugin is the single source of truth). The engine re-exports them under
+// its short names so workflow modules and the engine see the SAME types; any
+// drift in the plugin definitions is a compile error here.
+export type ParallelOptions = WorkflowParallelOptions
+export type PipelineOptions = WorkflowPipelineOptions
+export type PipelineStage<Prev, Item, Next> = WorkflowPipelineStage<Prev, Item, Next>
+export type PipelineFn = WorkflowPipelineFn
 
 export type ContextApi = {
   readonly budgetRemaining: number
@@ -295,6 +274,17 @@ export type ContextApi = {
   readonly pipeline: PipelineFn
   readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
 }
+
+// `ContextApi` is the engine-side view of the run context handed to a workflow
+// module; `WorkflowContext` (plugin) is the public authoring view. They must
+// stay structurally assignable so a value the engine builds is a valid argument
+// to a module typed against the plugin. This is asserted at compile time rather
+// than via a full SSoT import because the two differ intentionally: ContextApi
+// is `readonly` and is the runtime producer, WorkflowContext is the consumer
+// contract. Drift in either direction fails the build below.
+type _ContextApiSatisfiesWorkflowContext = ContextApi extends WorkflowContext ? true : never
+const _contextApiCheck: _ContextApiSatisfiesWorkflowContext = true
+void _contextApiCheck
 
 type Module = {
   meta: Meta
