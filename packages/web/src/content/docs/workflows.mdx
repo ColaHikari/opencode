@@ -220,22 +220,34 @@ This is useful for fan-out phases where multiple agents can inspect the same inp
 
 ### Pipelines
 
-Use `ctx.pipeline` when each step depends on the previous step's output.
+Use `ctx.pipeline` when each item must flow through a sequence of stages, where
+each stage depends on the previous stage's output for that item. Stages are
+passed as separate arguments (not an array) and may change the type as the value
+flows through. Each item runs the full stage sequence on its own — items run
+concurrently against each other, with no barrier between stages — and the result
+is an array of the last stage's outputs in item order.
+
+A stage receives the previous stage's result plus the original item, so a later
+stage can still reach the value it started from:
 
 ```ts
-const result = await ctx.pipeline(["initial input"], [
-  async (input) => {
+const results = await ctx.pipeline(
+  ["topic one", "topic two"],
+  async (topic) => {
     ctx.setPhase("draft")
-    return await ctx.agent({ agent: "build", prompt: `Draft from:\n${input}` })
+    return await ctx.agent({ agent: "build", prompt: `Draft from:\n${topic}` })
   },
-  async (draft) => {
+  async (draft, topic) => {
     ctx.setPhase("review")
-    return await ctx.agent({ agent: "plan", prompt: `Review:\n${draft.text}` })
+    const review = await ctx.agent({ agent: "plan", prompt: `Review:\n${draft.text}` })
+    return { topic, review: review.text }
   },
-])
+)
 ```
 
-Use pipelines for fan-in work, where one stage prepares input for the next.
+Here each topic is drafted then reviewed independently; `results` is an array of
+`{ topic, review }` in input order. Pass an optional final
+`{ concurrencyLimit }` argument to cap how many items run at once.
 
 ---
 
