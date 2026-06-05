@@ -11,7 +11,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { DeepMutable } from "@opencode-ai/core/schema"
 import { Glob } from "@opencode-ai/core/util/glob"
-import { desc, eq } from "drizzle-orm"
+import { and, desc, eq, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -223,11 +223,6 @@ export interface Interface {
    * and is exposed so callers/tests can trigger it explicitly.
    */
   readonly sweep: () => Effect.Effect<void>
-  /**
-   * Drops a finished run from the in-memory registry without deleting its DB
-   * row. Subsequent reads go through `fromRow`. No-op for a still-running run.
-   */
-  readonly evict: (id: string) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Workflow") {}
@@ -291,30 +286,22 @@ function persistRun(db: Database.Interface["db"], active: Active) {
 
 /**
  * Rewrites every `running` row whose id is not in `liveIds` to `interrupted`
- * with a completion timestamp. Used by the startup sweep (liveIds empty) and the
- * exposed `sweep()` method (liveIds = currently active runs).
+ * with a completion timestamp in a single bulk UPDATE. Used by the startup sweep
+ * (liveIds empty) and the exposed `sweep()` method (liveIds = currently active
+ * runs); genuinely-running rows owned by a live fiber are left untouched.
  */
 function sweepOrphans(db: Database.Interface["db"], liveIds: ReadonlySet<string>, now: number) {
-  return Effect.gen(function* () {
-    const rows = yield* db
-      .select()
-      .from(WorkflowRunTable)
-      .where(eq(WorkflowRunTable.status, "running"))
-      .all()
-      .pipe(Effect.orDie)
-    const orphans = rows.filter((row) => !liveIds.has(row.id))
-    yield* Effect.forEach(
-      orphans,
-      (row) =>
-        db
-          .update(WorkflowRunTable)
-          .set({ status: "interrupted", completed_at: now, time_updated: now })
-          .where(eq(WorkflowRunTable.id, row.id))
-          .run()
-          .pipe(Effect.orDie),
-      { discard: true },
+  return db
+    .update(WorkflowRunTable)
+    .set({ status: "interrupted", completed_at: now, time_updated: now })
+    .where(
+      and(
+        eq(WorkflowRunTable.status, "running"),
+        liveIds.size ? notInArray(WorkflowRunTable.id, [...liveIds]) : undefined,
+      ),
     )
-  })
+    .run()
+    .pipe(Effect.orDie, Effect.asVoid)
 }
 
 function errorText(error: unknown) {
@@ -846,21 +833,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis)
     })
 
-    const evict: Interface["evict"] = Effect.fn("Workflow.evict")(function* (id) {
-      const inst = yield* InstanceState.get(state)
-      const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
-      // Only finished runs may be evicted; a running run must keep its fiber and
-      // Deferred reachable so cancel()/wait() still work.
-      if (!active || active.run.status === "running") return false
-      yield* SynchronizedRef.update(inst.runs, (runs) => {
-        const next = new Map(runs)
-        next.delete(id)
-        return next
-      })
-      return true
-    })
-
-    return Service.of({ list, runs, get, start, wait, cancel, remove, sweep, evict })
+    return Service.of({ list, runs, get, start, wait, cancel, remove, sweep })
   }),
 )
 

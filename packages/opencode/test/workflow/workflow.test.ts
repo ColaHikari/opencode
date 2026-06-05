@@ -15,9 +15,6 @@ import path from "path"
 const it = testEffect(Layer.mergeAll(Workflow.defaultLayer, Database.defaultLayer))
 
 const HELLO_FIXTURE = "hello"
-const HELLO_WORKFLOW = `export const meta = { name: "${HELLO_FIXTURE}", phases: ["run"] }
-export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); return { ok: true } }
-`
 
 // Seeds a workflow_run row in status="running" with NO live registry entry,
 // the exact shape an orphaned (crashed/restarted) run leaves behind.
@@ -49,6 +46,41 @@ function fetchRunRow(id: string) {
       .get()
       .pipe(Effect.orDie)
     return row ?? (yield* Effect.fail(new Error(`row ${id} not found`)))
+  })
+}
+
+// Seeds a fully finished run (with log + agent telemetry) straight into the DB.
+// Because it never went through start(), it has NO live registry entry, so
+// get() is forced through the DB->fromRow path — no test-only seam required.
+function seedCompletedRow(id: string) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* db
+      .insert(WorkflowRunTable)
+      .values({
+        id,
+        workflow: HELLO_FIXTURE,
+        status: "completed",
+        started_at: now,
+        completed_at: now,
+        current_phase: "run",
+        logs: [{ time: now, phase: "run", message: "running" }],
+        agents: [
+          {
+            id: "1",
+            status: "completed",
+            started_at: now,
+            completed_at: now,
+            phase: "run",
+            prompt: "do the thing",
+            output: "did the thing",
+          },
+        ],
+        result: { ok: true },
+      })
+      .run()
+      .pipe(Effect.orDie)
   })
 }
 
@@ -291,20 +323,19 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
 
   it.instance("persisted run round-trips through fromRow", () =>
     Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, HELLO_FIXTURE, HELLO_WORKFLOW))
       const workflow = yield* Workflow.Service
-      const run = yield* workflow.start({ name: HELLO_FIXTURE, args: {} })
-      yield* workflow.wait({ id: run.id })
+      const persistedId = "job_roundtrip"
+      // Persist a finished run directly via the SQL layer (no live registry
+      // entry), so get() must read it back through DB->fromRow.
+      yield* seedCompletedRow(persistedId)
 
-      // Entfernt den Run aus der In-Memory-Registry, damit get() zwingend über
-      // DB->fromRow lesen muss (nicht aus dem Snapshot).
-      yield* workflow.evict(run.id)
-
-      const viaDb = yield* workflow.get(run.id)
+      const viaDb = yield* workflow.get(persistedId)
       const persisted = viaDb ?? (yield* Effect.fail(new Error("run not persisted")))
-      expect(persisted).toMatchObject({ id: run.id, status: "completed" })
+      expect(persisted).toMatchObject({ id: persistedId, status: "completed" })
+      // Telemetrie überlebt den Roundtrip durch fromRow.
       expect(persisted.logs.map((item) => item.message)).toContain("running")
+      expect(persisted.agents.length).toBeGreaterThan(0)
+      expect(persisted.agents[0]?.output).toBe("did the thing")
     }),
   )
 
