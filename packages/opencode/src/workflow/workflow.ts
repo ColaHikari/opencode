@@ -200,12 +200,50 @@ export type AgentInput = {
   permissionSessionID?: SessionID
 }
 
+export type ParallelOptions = { concurrencyLimit?: number }
+export type PipelineOptions = { concurrencyLimit?: number }
+
+/** A pipeline stage: receives the previous stage's output for this item plus the
+ * original item, and returns the next value. The first stage's `prev` is the
+ * item itself. Stages may change the type (`I → S1 → S2 …`). */
+export type PipelineStage<Prev, Item, Next> = (prev: Prev, item: Item) => Promise<Next>
+
+/** Per-item pipeline. Each item flows through every stage SEQUENTIALLY (stage N+1
+ * receives stage N's result for that item), while items run concurrently against
+ * each other (no barrier between stages). Result is the last stage's output in
+ * item order. Overloaded for 1..4 stages so heterogeneous types flow through
+ * without `any`; the public type is precise. */
+export interface PipelineFn {
+  <I, A>(items: readonly I[], s1: PipelineStage<I, I, A>, options?: PipelineOptions): Promise<A[]>
+  <I, A, B>(
+    items: readonly I[],
+    s1: PipelineStage<I, I, A>,
+    s2: PipelineStage<A, I, B>,
+    options?: PipelineOptions,
+  ): Promise<B[]>
+  <I, A, B, C>(
+    items: readonly I[],
+    s1: PipelineStage<I, I, A>,
+    s2: PipelineStage<A, I, B>,
+    s3: PipelineStage<B, I, C>,
+    options?: PipelineOptions,
+  ): Promise<C[]>
+  <I, A, B, C, D>(
+    items: readonly I[],
+    s1: PipelineStage<I, I, A>,
+    s2: PipelineStage<A, I, B>,
+    s3: PipelineStage<B, I, C>,
+    s4: PipelineStage<C, I, D>,
+    options?: PipelineOptions,
+  ): Promise<D[]>
+}
+
 export type ContextApi = {
   readonly budgetRemaining: number
   readonly setPhase: (phase: string) => void
   readonly log: (message: string) => void
-  readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) => Promise<T[]>
-  readonly pipeline: <T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]) => Promise<T[]>
+  readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<T[]>
+  readonly pipeline: PipelineFn
   readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
 }
 
@@ -460,11 +498,25 @@ function createContext(input: {
         ),
       )
     },
-    pipeline<T>(items: readonly T[], steps: readonly ((item: T) => Promise<T>)[]) {
+    // Real per-item pipeline (heterogeneous stages). The public type is the
+    // precise overloaded `PipelineFn`; internally we plumb `unknown` because the
+    // variadic stage chain cannot be expressed in a single impl signature. The
+    // last argument is an optional `{ concurrencyLimit }` object (a plain object,
+    // never a function) — everything before it is a stage.
+    pipeline: ((items: readonly unknown[], ...rest: unknown[]) => {
       checkpoint()
-      // Same gating as parallel(): checkpoint() throws CancelledError before each
-      // step, so the next step never starts after cancel. A step already in
-      // flight runs to completion (agent steps are additionally aborted for real
+      const last = rest[rest.length - 1]
+      const hasOptions = typeof last === "object" && last !== null
+      const options = (hasOptions ? last : undefined) as PipelineOptions | undefined
+      const stages = (hasOptions ? rest.slice(0, -1) : rest) as ReadonlyArray<
+        (prev: unknown, item: unknown) => Promise<unknown>
+      >
+      const concurrency = options?.concurrencyLimit ? Math.max(1, options.concurrencyLimit) : "unbounded"
+      // No barrier between stages: each ITEM runs the full stage SEQUENCE as its
+      // own Effect, and items run under Effect.forEach concurrency — so item B may
+      // be in stage 2 while item A is still in stage 1. checkpoint() gates before
+      // each stage so the next stage never starts after cancel; a stage already in
+      // flight runs to completion (agent stages are additionally aborted for real
       // via PromptOps.cancel) — the bridge runs the work as a root fiber, not a
       // child of active.fiber, so interruption does not propagate down the tree.
       return input.bridge.promise(
@@ -472,17 +524,17 @@ function createContext(input: {
           items,
           (item) =>
             Effect.promise(async () => {
-              let current = item
-              for (const step of steps) {
+              let current: unknown = item
+              for (const stage of stages) {
                 checkpoint()
-                current = await step(current)
+                current = await stage(current, item)
               }
               return current
             }),
-          { concurrency: "unbounded" },
+          { concurrency },
         ),
       )
-    },
+    }) as ContextApi["pipeline"],
     agent: input.agent,
   }
 }
