@@ -384,9 +384,14 @@ export const WorkflowTool = Tool.define(
         Effect.gen(function* () {
           if (params.action === "read") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=read"))
-            const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
+            const workflows = yield* workflow.list()
             const info = workflows.find((item) => item.name === params.name)
             if (!info) return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
+            // A discovered-but-broken file must surface its load error, not a
+            // misleadingly empty <workflow> block.
+            if (info.valid === false) {
+              return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
+            }
             return {
               title: `Workflow: ${info.name}`,
               metadata: { name: info.name, path: info.path },
@@ -396,7 +401,7 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "start") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
-            const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
+            const workflows = yield* workflow.list()
             if (!workflows.some((item) => item.name === params.name)) {
               return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
             }
@@ -463,9 +468,15 @@ export const WorkflowTool = Tool.define(
             yield* events.publish(FileSystem.Event.Edited, { file: filepath })
             yield* events.publish(Watcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
             yield* lsp.touchFile(filepath, "document")
-            const workflows = yield* workflow.list().pipe(Effect.mapError(workflowError))
+            const workflows = yield* workflow.list()
             const info = workflows.find((item) => item.name === params.name)
             if (!info) return yield* Effect.fail(new Error(`Workflow was written but not discovered: ${params.name}`))
+            // The LLM-generated source may not load (bad meta / missing run /
+            // syntax error). Report that as a failure instead of claiming the file
+            // was "created and validated".
+            if (info.valid === false) {
+              return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
+            }
             return {
               title: `Workflow created: ${params.name}`,
               metadata: { name: params.name, path: filepath, exists },
