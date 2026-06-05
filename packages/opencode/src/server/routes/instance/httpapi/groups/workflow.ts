@@ -13,6 +13,11 @@ export const StartPayload = Schema.Struct({
   // Optional cost cap (USD) for the run; mirrors the engine StartInput.budget.
   // Non-negative finite: a negative/NaN/Infinity cap is rejected at validation.
   budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  // Session that should receive permission prompts raised by the run's
+  // subagents (mirrors the workflow tool path). Headless default: when omitted,
+  // permission requests follow the engine's default policy on an unobserved
+  // session — pass the caller's session id to surface them interactively.
+  permissionSessionID: Schema.optional(Schema.String),
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
