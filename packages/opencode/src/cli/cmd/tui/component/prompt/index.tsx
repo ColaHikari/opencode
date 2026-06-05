@@ -1065,7 +1065,7 @@ export function Prompt(props: PromptProps) {
       setStore("mode", "normal")
     } else if (inputText.trim() === "/workflows") {
       dialog.replace(() => <DialogWorkflow />)
-    } else if (inputText.startsWith("/workflow") || inputText.startsWith("/worfklow")) {
+    } else if (inputText.startsWith("/workflow")) {
       const firstLine = inputText.split("\n")[0]
       const [, name, ...args] = firstLine.split(" ").filter(Boolean)
       if (!name) {
