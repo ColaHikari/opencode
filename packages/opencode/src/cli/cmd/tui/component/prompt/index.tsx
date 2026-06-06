@@ -248,17 +248,6 @@ export function Prompt(props: PromptProps) {
   // Config gates only the keyword detection (default true).
   const ultracodeKeywordEnabled = createMemo(() => sync.data.config.workflows?.ultracode_keyword ?? true)
 
-  const ultracodeKeyword = createMemo(() => {
-    if (!ultracodeKeywordEnabled()) return undefined
-    if (store.mode === "shell") return undefined
-    // `/command …` inputs dispatch a slash command and never inject the ultracode
-    // directive on submit, so don't highlight a keyword inside them either — the
-    // visible highlight must mirror the submit behaviour. Mirrors the submit branch's
-    // leading-slash dispatch detection.
-    if (store.prompt.input.trimStart().startsWith("/")) return undefined
-    return detectUltracodeKeyword(store.prompt.input)
-  })
-
   event.on(TuiEvent.PromptAppend.type, (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
     if (!input || input.isDestroyed) return
@@ -320,6 +309,21 @@ export function Prompt(props: PromptProps) {
     mode: "normal",
     extmarkToPartIndex: new Map(),
     interrupt: 0,
+  })
+
+  // Declared AFTER the store it reads — an earlier declaration is a temporal-dead-zone
+  // forward reference ("Cannot access 'store' before initialization") that crashes
+  // whenever this memo computes eagerly (e.g. while the home route renders its
+  // Suspense fallback).
+  const ultracodeKeyword = createMemo(() => {
+    if (!ultracodeKeywordEnabled()) return undefined
+    if (store.mode === "shell") return undefined
+    // `/command …` inputs dispatch a slash command and never inject the ultracode
+    // directive on submit, so don't highlight a keyword inside them either — the
+    // visible highlight must mirror the submit behaviour. Mirrors the submit branch's
+    // leading-slash dispatch detection.
+    if (store.prompt.input.trimStart().startsWith("/")) return undefined
+    return detectUltracodeKeyword(store.prompt.input)
   })
 
   createEffect(

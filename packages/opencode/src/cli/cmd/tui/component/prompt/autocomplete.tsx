@@ -485,7 +485,30 @@ export function Autocomplete(props: {
     ),
   )
 
+  const [workflowInfos] = createResource(
+    () => workflowNameSearch() !== undefined || workflowArgSearch() !== undefined,
+    (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
+    { initialValue: [] },
+  )
+
+  // Separate resource feeding the direct `/<name>` slash commands: enabled the
+  // moment the `/` slash menu is visible (not just inside a `/workflow` context),
+  // so discovered workflows appear alongside built-in slash commands. Cheap and
+  // cached; listWorkflowInfos already drops invalid entries. Declared BEFORE the
+  // `commands` memo that reads it — a later declaration is a temporal-dead-zone
+  // forward reference that crashes ("Cannot access 'slashCommandWorkflowInfos'
+  // before initialization") whenever `commands` computes eagerly.
+  const [slashCommandWorkflowInfos] = createResource(
+    () => store.visible === "/",
+    (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
+    { initialValue: [] },
+  )
+
   const commands = createMemo((): AutocompleteOption[] => {
+    // Nothing to show while the menu is hidden; also avoids reading slashes() and
+    // the workflow resources during the home route's Suspense fallback render
+    // before they have resolved.
+    if (!store.visible) return []
     const results: AutocompleteOption[] = [...slashes(), workflowCommandOption(props.input())]
 
     for (const serverCommand of sync.data.command) {
@@ -535,23 +558,13 @@ export function Autocomplete(props: {
     }))
   })
 
-  const [workflowInfos] = createResource(
-    () => workflowNameSearch() !== undefined || workflowArgSearch() !== undefined,
-    (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
-    { initialValue: [] },
-  )
-
-  // Separate resource feeding the direct `/<name>` slash commands: enabled the
-  // moment the `/` slash menu is visible (not just inside a `/workflow` context),
-  // so discovered workflows appear alongside built-in slash commands. Cheap and
-  // cached; listWorkflowInfos already drops invalid entries.
-  const [slashCommandWorkflowInfos] = createResource(
-    () => store.visible === "/",
-    (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
-    { initialValue: [] },
-  )
-
   const options = createMemo((prev: AutocompleteOption[] | undefined) => {
+    // When the menu is hidden (boot, or while the home route renders its Suspense
+    // fallback) there is nothing to show. Returning early also avoids pulling the
+    // sibling memos (commands()/slashes()/files()) before they have computed —
+    // during the fallback render those are still undefined and would crash on
+    // spread/length.
+    if (!store.visible) return []
     const filesValue = files()
     const referenceMatchValue = referenceMatch()
     const agentsValue = agents()
@@ -609,7 +622,12 @@ export function Autocomplete(props: {
       .map((arr) => arr.obj)
 
     return [...fuzziedNonFiles, ...fileOptions].slice(0, 10)
-  })
+    // Initial value `[]` so a read before the memo's first computation (e.g. while
+    // the home route renders its Suspense fallback, where consumers like `height`
+    // read `options().length` eagerly) returns an empty array instead of the
+    // memo's pre-compute `undefined` — which previously crashed boot with
+    // "undefined is not an object (evaluating 'options().length')".
+  }, [] as AutocompleteOption[])
 
   createEffect(() => {
     filter()
