@@ -90,7 +90,17 @@ export const WorkflowRunTable = sqliteTable(
     definition: text({ mode: "json" }).$type<WorkflowDefinitionRow>(),
     logs: text({ mode: "json" }).notNull().$type<WorkflowLogRow[]>(),
     agents: text({ mode: "json" }).notNull().$type<WorkflowAgentRow[]>(),
-    result: text({ mode: "json" }).$type<unknown>(),
+    // Plain `text` (NOT `mode: "json"`) on purpose (Fund 42): Drizzle's JSON mode
+    // decodes BOTH the SQL value NULL and the literal JSON text `"null"` to JS
+    // `null`, collapsing two distinct states — a result that was never recorded
+    // (column empty) vs. a workflow that genuinely returned `null`. The engine
+    // must tell them apart (empty → reported `undefined` / "No result recorded.";
+    // real null → reported `null`), so it owns the JSON serialization explicitly:
+    // it writes SQL NULL for an unset result and the text `"null"` for a real one,
+    // and parses the text back in `fromRow`. The on-disk type is unchanged (`text`
+    // either way), so no migration is required. JSON mode stays on logs/agents,
+    // which never carry that null/undefined ambiguity.
+    result: text(),
     error: text(),
     ...Timestamps,
   },

@@ -5,7 +5,7 @@ import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { WorkflowRunTable } from "@opencode-ai/core/workflow/sql"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Fiber, Layer } from "effect"
@@ -42,11 +42,56 @@ function seedRunningRow(id: string, directory: string) {
   })
 }
 
+// Seeds a `running` row that ALSO carries a still-`running` agent node — the
+// shape an orphaned run leaves behind once it had dispatched an agent. The sweep
+// must normalise BOTH the run row (→ interrupted) and the zombie agent node
+// (→ failed with completed_at + error), so the TUI never renders a live agent
+// icon on a terminal run (Fund 15).
+function seedRunningRowWithAgent(id: string, directory: string) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* db
+      .insert(WorkflowRunTable)
+      .values({
+        id,
+        workflow: HELLO_FIXTURE,
+        status: "running",
+        started_at: now,
+        directory,
+        current_phase: "run",
+        logs: [],
+        agents: [
+          { id: "1", status: "running", started_at: now, phase: "run", prompt: "hang" },
+          { id: "2", status: "completed", started_at: now, completed_at: now, phase: "run", prompt: "done" },
+        ],
+      })
+      .run()
+      .pipe(Effect.orDie)
+  })
+}
+
 function fetchRunRow(id: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
     const row = yield* db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get().pipe(Effect.orDie)
     return row ?? (yield* Effect.fail(new Error(`row ${id} not found`)))
+  })
+}
+
+// Reads the RAW `result` column text (bypassing any json decode) so a test can
+// prove how the engine serialised it: SQL-NULL (never set) vs the literal JSON
+// text `"null"` (a real null result) — the distinction Fund 42 turns on.
+function fetchRawResult(id: string) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const row = yield* db
+      .select({ raw: sql<string | null>`${WorkflowRunTable.result}` })
+      .from(WorkflowRunTable)
+      .where(eq(WorkflowRunTable.id, id))
+      .get()
+      .pipe(Effect.orDie)
+    return row?.raw ?? null
   })
 }
 
@@ -79,7 +124,11 @@ function seedCompletedRow(id: string, directory: string) {
             output: "did the thing",
           },
         ],
-        result: { ok: true },
+        // The `result` column is plain text and the engine owns its JSON codec
+        // (Fund 42), so a seed must serialize exactly like persistRun does — a raw
+        // object would fail the bind. The roundtrip test reads this back through
+        // fromRow, which JSON-parses it.
+        result: JSON.stringify({ ok: true }),
       })
       .run()
       .pipe(Effect.orDie)
@@ -118,6 +167,35 @@ export async function run(args, ctx) {
   ctx.log("${STEP2_MARKER}")
   return { ok: true }
 }
+`
+
+// N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
+// forget) — der hängende ctx.agent-Promise settelt nie vor Body-Ende — und
+// returnt sofort. Die kurze Pause gibt dem dispatchten Agent-Fiber Zeit, seine
+// Child-Session zu erzeugen/registrieren und am hängenden Prompt zu blockieren,
+// BEVOR der Body zurückkehrt und der Run als `completed` finished. So bleibt ein
+// Agent-Node beim Terminal-Übergang noch `running` OHNE Autor-Fehlverhalten.
+const DETACHED_AGENT_FIXTURE = "detached-agent"
+const DETACHED_AGENT_WORKFLOW = `export const meta = { name: "${DETACHED_AGENT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  // Bewusst NICHT awaiten: der Promise hängt am Prompt, der Body returnt davor.
+  void ctx.agent({ prompt: "hang" }).catch(() => {})
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  return { ok: true }
+}
+`
+
+// Fund 42-Fixtures: ein Workflow, der explizit `null` returnt, und einer, der
+// gar nichts returnt (undefined). Beide müssen den DB-Roundtrip unterscheidbar
+// überleben: null bleibt null, undefined bleibt undefined.
+const NULL_RESULT_FIXTURE = "null-result"
+const NULL_RESULT_WORKFLOW = `export const meta = { name: "${NULL_RESULT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run"); return null }
+`
+const VOID_RESULT_FIXTURE = "void-result"
+const VOID_RESULT_WORKFLOW = `export const meta = { name: "${VOID_RESULT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run") }
 `
 
 function assistantReply(): SessionV1.WithParts {
@@ -750,6 +828,53 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // N11 (HIGH): Ein Run, der als `completed` endet, während ein Agent-Node noch
+  // `running` ist (fire-and-forget ctx.agent, dessen Settlement nach Body-Ende
+  // käme). finish('completed') MUSS den noch laufenden Node terminal schließen
+  // (failed mit erklärendem error + completed_at) UND die offene Child-Session
+  // wirklich abbrechen, sonst verbrennt die detached Session weiter Tokens.
+  it.instance("completed run closes a still-running detached agent node and aborts its session", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, DETACHED_AGENT_FIXTURE, DETACHED_AGENT_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const { ops, aborted, started } = hangingPromptOps()
+
+      const run = yield* workflow.start({ name: DETACHED_AGENT_FIXTURE, args: {}, prompt: ops })
+
+      // Auf den terminalen `completed`-Zustand warten (der Body returnt, während
+      // der detached Agent noch am Prompt hängt).
+      const done = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.status === "completed" ? current : undefined
+        }),
+        "workflow never completed",
+      )
+      expect(done.status).toBe("completed")
+      // Der noch laufende Node ist terminal geschlossen (failed + Grund + Zeit).
+      expect(done.agents.length).toBeGreaterThan(0)
+      expect(done.agents.every((a) => a.status !== "running")).toBe(true)
+      const closed = done.agents.find((a) => a.status === "failed")
+      expect(closed).toBeDefined()
+      expect(closed!.completed_at).toBeGreaterThan(0)
+      expect(closed!.error).toBeTruthy()
+
+      // Kalt-Read beweist die Terminalisierung über den DB-Roundtrip.
+      const row = yield* fetchRunRow(run.id)
+      expect(row.status).toBe("completed")
+      expect(row.agents.every((a) => a.status !== "running")).toBe(true)
+
+      // Kern: die hängende Child-Session wurde wirklich abgebrochen.
+      const childSession = done.agents[0]?.session_id
+      expect(childSession).toBeDefined()
+      expect(started.has(childSession!)).toBe(true)
+      expect(aborted.has(childSession!)).toBe(true)
+    }),
+  )
+
   // Fund 5 (HIGH): Cancel im Startup-Fenster — start() registriert den Run,
   // beantwortet aber die Initial-Phase verzögert; ein Cancel landet, BEVOR der
   // Body geforkt wird. Der Body darf NIE laufen (kein Marker) und der Run muss
@@ -955,6 +1080,34 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // Fund 15 (medium): Der Sweep schrieb bisher nur Run-Level-Spalten um, nie das
+  // agents-JSON. Ein gesweepter Orphan trug daher permanent einen Agent mit
+  // status `running` ohne completed_at/error → das TUI rendert ewig ein Live-
+  // Icon. Nach dem Sweep MUSS auch jeder noch laufende Agent-Node terminal sein.
+  it.instance("orphan sweep normalizes still-running agent nodes to failed", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const orphanId = "job_orphan_agent"
+      yield* seedRunningRowWithAgent(orphanId, test.directory)
+
+      yield* workflow.sweep()
+
+      const row = yield* fetchRunRow(orphanId)
+      expect(row.status).toBe("interrupted")
+      // Der laufende Node ist terminal geschlossen (failed + Grund + Zeit).
+      const closed = row.agents.find((a) => a.id === "1")
+      expect(closed?.status).toBe("failed")
+      expect(closed?.completed_at).toBeGreaterThan(0)
+      expect(closed?.error).toBeTruthy()
+      // Ein bereits abgeschlossener Node bleibt unberührt.
+      const intact = row.agents.find((a) => a.id === "2")
+      expect(intact?.status).toBe("completed")
+      // Kein Node bleibt `running`.
+      expect(row.agents.every((a) => a.status !== "running")).toBe(true)
+    }),
+  )
+
   it.instance("persisted run round-trips through fromRow", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -971,6 +1124,71 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(persisted.logs.map((item) => item.message)).toContain("running")
       expect(persisted.agents.length).toBeGreaterThan(0)
       expect(persisted.agents[0]?.output).toBe("did the thing")
+      // N20: das geseedete result überlebt den Roundtrip (wurde bisher nie asserted).
+      expect(persisted.result).toEqual({ ok: true })
+    }),
+  )
+
+  // Fund 42 / N20 (low): result === null darf im DB-Roundtrip NICHT zu undefined
+  // ("No result recorded.") werden. Drei Fälle, end-to-end durch den echten
+  // Engine-Persist getrieben: ein echtes result, result === null und nie gesetzt.
+  // Geprüft wird BEIDE Richtungen: die rohe Spalten-Serialisierung (write) und
+  // die Decodierung durch fromRow (read), inkl. der Unterscheidung SQL-NULL
+  // (nie gesetzt → undefined) vs. JSON-Text "null" (echtes null → null).
+  it.instance("null and undefined workflow results survive persistence distinctly", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, HELLO_FIXTURE, `export const meta = { name: "Hello" }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NULL_RESULT_FIXTURE, NULL_RESULT_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, VOID_RESULT_FIXTURE, VOID_RESULT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const finishRun = (name: string, args?: Record<string, unknown>) =>
+        Effect.gen(function* () {
+          const run = yield* workflow.start({ name, args: args ?? {} })
+          const waited = yield* workflow.wait({ id: run.id })
+          const done = waited.run ?? (yield* Effect.fail(new Error(`${name} did not finish`)))
+          expect(done.status).toBe("completed")
+          return run.id
+        })
+
+      // (a) echtes result.
+      const realId = yield* finishRun(HELLO_FIXTURE, { value: 42 })
+      expect((yield* workflow.get(realId))?.result).toEqual({ value: 42 })
+      expect(yield* fetchRawResult(realId)).toBe(JSON.stringify({ value: 42 }))
+
+      // (b) result === null: roh als JSON-Text "null" persistiert, NICHT SQL-NULL.
+      const nullId = yield* finishRun(NULL_RESULT_FIXTURE)
+      expect((yield* workflow.get(nullId))?.result).toBeNull()
+      expect(yield* fetchRawResult(nullId)).toBe("null")
+
+      // (c) nie gesetzt: roh SQL-NULL, liest als undefined zurück.
+      const voidId = yield* finishRun(VOID_RESULT_FIXTURE)
+      expect((yield* workflow.get(voidId))?.result).toBeUndefined()
+      expect(yield* fetchRawResult(voidId)).toBeNull()
+
+      // Kalt-Read durch fromRow (frische Rows, kein Registry-Eintrag): die drei
+      // rohen Spalten-Zustände dekodieren exakt zu value / null / undefined.
+      const { db } = yield* Database.Service
+      const now = Date.now()
+      // Raw INSERT so the `result` column holds the EXACT bytes under test (the
+      // text `"null"` vs SQL NULL) — a Drizzle insert would route through the
+      // engine's codec and hide the distinction. time_created/time_updated are
+      // NOT NULL with no SQL-level default (the default lives in the Drizzle
+      // Timestamps helper, which a raw INSERT bypasses), so they must be set here.
+      const seedRaw = (id: string, raw: string | null) =>
+        db.run(
+          sql`INSERT INTO ${WorkflowRunTable} (id, workflow, directory, status, started_at, completed_at, logs, agents, result, time_created, time_updated)
+              VALUES (${id}, ${HELLO_FIXTURE}, ${test.directory}, 'completed', ${now}, ${now}, '[]', '[]', ${raw}, ${now}, ${now})`,
+        ).pipe(Effect.orDie)
+      yield* seedRaw("job_result_real", JSON.stringify({ value: 7 }))
+      yield* seedRaw("job_result_null", "null")
+      yield* seedRaw("job_result_void", null)
+      expect((yield* workflow.get(Workflow.RunID.make("job_result_real")))?.result).toEqual({ value: 7 })
+      expect((yield* workflow.get(Workflow.RunID.make("job_result_null")))?.result).toBeNull()
+      expect((yield* workflow.get(Workflow.RunID.make("job_result_void")))?.result).toBeUndefined()
     }),
   )
 
