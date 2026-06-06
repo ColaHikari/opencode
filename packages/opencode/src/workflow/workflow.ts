@@ -309,6 +309,15 @@ type Module = {
 
 type Active = {
   run: Run
+  /**
+   * The workspace directory (InstanceState.directory) this run was started in.
+   * Persisted to the `directory` column so every read/delete/sweep can be scoped
+   * to the owning workspace (Fund 6/17): the DB is process-global but the
+   * workflow endpoints are per-directory, so a run started in A must never leak
+   * into / be swept from B. Not surfaced on the public `Run` schema — it is a
+   * persistence/routing concern, not part of the run's reported shape.
+   */
+  directory: string
   done: Deferred.Deferred<Run>
   fiber?: Fiber.Fiber<void, unknown>
   /**
@@ -451,6 +460,7 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
     const data = {
       id: active.run.id,
       session_id: active.run.session_id ?? null,
+      directory: active.directory,
       workflow: active.run.workflow,
       status: active.run.status,
       started_at: active.run.started_at,
@@ -491,14 +501,23 @@ function persistInScope(active: Active, bridge: EffectBridge.Shape, db: Database
  * with a completion timestamp in a single bulk UPDATE. Used by the startup sweep
  * (liveIds empty) and the exposed `sweep()` method (liveIds = currently active
  * runs); genuinely-running rows owned by a live fiber are left untouched.
+ *
+ * `directory` scopes the sweep to the calling workspace (Fund 17): the DB is
+ * process-global but every per-directory registry only knows its OWN runs, so a
+ * sweep keyed off another directory's (empty) registry must NOT flip a run that
+ * is genuinely live in a different workspace. Without the scope, the first
+ * Workflow operation in a second directory B — whose fresh registry is empty —
+ * would stamp every `running` row of every directory (including a run currently
+ * executing in A) to `interrupted`.
  */
-function sweepOrphans(db: Database.Interface["db"], liveIds: ReadonlySet<string>, now: number) {
+function sweepOrphans(db: Database.Interface["db"], liveIds: ReadonlySet<string>, now: number, directory: string) {
   return db
     .update(WorkflowRunTable)
     .set({ status: "interrupted", completed_at: now, time_updated: now })
     .where(
       and(
         eq(WorkflowRunTable.status, "running"),
+        eq(WorkflowRunTable.directory, directory),
         liveIds.size ? notInArray(WorkflowRunTable.id, [...liveIds]) : undefined,
       ),
     )
@@ -834,12 +853,16 @@ export const layer = Layer.effect(
     const sessions = yield* Session.Service
     const { db } = yield* Database.Service
     const state = yield* InstanceState.make<State>(
-      Effect.fn("Workflow.state")(function* () {
+      Effect.fn("Workflow.state")(function* (ctx) {
         const runs = yield* SynchronizedRef.make(new Map<string, Active>())
         // The registry is freshly empty here: any row still marked `running`
         // belongs to a fiber that did not survive into this process, so sweep
         // every one of them to `interrupted` (honest orphan recovery on start).
-        yield* sweepOrphans(db, new Set(), yield* Clock.currentTimeMillis)
+        // Scoped to THIS workspace directory (Fund 17): this state is created
+        // per-directory, so the startup sweep must heal only its OWN zombie rows
+        // — a sibling directory's live run shares the global DB and must be left
+        // running.
+        yield* sweepOrphans(db, new Set(), yield* Clock.currentTimeMillis, ctx.directory)
         return {
           runs,
           scope: yield* Scope.Scope,
@@ -849,9 +872,14 @@ export const layer = Layer.effect(
 
     const readRuns = Effect.fn("Workflow.readRuns")(function* () {
       const active = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
+      // Scope the listing to the calling workspace (Fund 6): the DB is global,
+      // so without the directory filter `GET /workflow/run?directory=A` would
+      // leak runs started in directory B.
+      const directory = yield* InstanceState.directory
       const rows = yield* db
         .select()
         .from(WorkflowRunTable)
+        .where(eq(WorkflowRunTable.directory, directory))
         .orderBy(desc(WorkflowRunTable.started_at))
         .all()
         .pipe(Effect.orDie)
@@ -915,7 +943,17 @@ export const layer = Layer.effect(
     const get: Interface["get"] = Effect.fn("Workflow.get")(function* (id) {
       const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
       if (active) return snapshot(active)
-      const row = yield* db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get().pipe(Effect.orDie)
+      // Cold DB read is scoped to the calling workspace (Fund 6): `get(id)` from
+      // directory B must not see a run that belongs to directory A even though
+      // both share the global DB. The in-memory branch above is already scoped
+      // because the registry is per-directory.
+      const directory = yield* InstanceState.directory
+      const row = yield* db
+        .select()
+        .from(WorkflowRunTable)
+        .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
+        .get()
+        .pipe(Effect.orDie)
       if (!row) return
       return fromRow(row)
     })
@@ -983,6 +1021,9 @@ export const layer = Layer.effect(
           isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
       })
       const inst = yield* InstanceState.get(state)
+      // The workspace this run belongs to. Persisted to the `directory` column so
+      // every later read/delete/sweep can be scoped to it (Fund 6/17).
+      const directory = yield* InstanceState.directory
       const id = RunID.ascending()
       const started_at = yield* Clock.currentTimeMillis
       const session = yield* sessions.create({ title: `Workflow: ${module.meta.name}` })
@@ -1010,6 +1051,7 @@ export const layer = Layer.effect(
           logs: [],
           agents: [],
         },
+        directory,
         done,
         runScope,
         sessions: new Set<string>(),
@@ -1283,7 +1325,7 @@ export const layer = Layer.effect(
       // `interrupted` and report that honestly instead of a misleading timeout.
       // Pass the live registry keys so genuinely-running siblings are untouched.
       if (!active) {
-        yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis)
+        yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
         return { run: yield* get(input.id), timedOut: false }
       }
       if (input.timeout === undefined) return { run: yield* Deferred.await(active.done), timedOut: false }
@@ -1361,14 +1403,22 @@ export const layer = Layer.effect(
         next.delete(id)
         return next
       })
-      const row = yield* db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get().pipe(Effect.orDie)
-      yield* db.delete(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).run().pipe(Effect.orDie)
+      // Scope both the existence probe and the delete to the calling workspace
+      // (Fund 6): `DELETE …?directory=B` must NEVER delete a row owned by A and
+      // report success. The `id` predicate alone would delete across directories
+      // because the DB is global; adding the directory equality makes the delete
+      // a no-op for a foreign row, and `row` (the scoped probe) stays undefined so
+      // a cross-directory remove honestly reports `false`.
+      const directory = yield* InstanceState.directory
+      const scope = and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory))
+      const row = yield* db.select().from(WorkflowRunTable).where(scope).get().pipe(Effect.orDie)
+      yield* db.delete(WorkflowRunTable).where(scope).run().pipe(Effect.orDie)
       return !!row || !!active
     })
 
     const sweep: Interface["sweep"] = Effect.fn("Workflow.sweep")(function* () {
       const live = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
-      yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis)
+      yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
     return Service.of({ list, runs, get, start, wait, cancel, remove, sweep })

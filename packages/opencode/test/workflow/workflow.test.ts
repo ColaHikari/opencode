@@ -4,8 +4,9 @@ import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { WorkflowRunTable } from "@opencode-ai/core/workflow/sql"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { eq } from "drizzle-orm"
-import { TestInstance } from "../fixture/fixture"
+import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Fiber, Layer } from "effect"
 import { Global } from "@opencode-ai/core/global"
@@ -14,13 +15,15 @@ import path from "path"
 
 // Database.defaultLayer is merged so the orphan-sweep tests can seed a row
 // directly through the same in-memory SQLite connection the engine uses.
-const it = testEffect(Layer.mergeAll(Workflow.defaultLayer, Database.defaultLayer))
+const it = testEffect(Layer.mergeAll(Workflow.defaultLayer, Database.defaultLayer, CrossSpawnSpawner.defaultLayer))
 
 const HELLO_FIXTURE = "hello"
 
 // Seeds a workflow_run row in status="running" with NO live registry entry,
-// the exact shape an orphaned (crashed/restarted) run leaves behind.
-function seedRunningRow(id: string) {
+// the exact shape an orphaned (crashed/restarted) run leaves behind. The row is
+// owned by the calling workspace `directory` so the directory-scoped sweep/get
+// (Fund 6/17) recognises it as a local zombie rather than a foreign run.
+function seedRunningRow(id: string, directory: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
     yield* db
@@ -30,6 +33,7 @@ function seedRunningRow(id: string) {
         workflow: HELLO_FIXTURE,
         status: "running",
         started_at: Date.now(),
+        directory,
         logs: [],
         agents: [],
       })
@@ -49,7 +53,7 @@ function fetchRunRow(id: string) {
 // Seeds a fully finished run (with log + agent telemetry) straight into the DB.
 // Because it never went through start(), it has NO live registry entry, so
 // get() is forced through the DB->fromRow path — no test-only seam required.
-function seedCompletedRow(id: string) {
+function seedCompletedRow(id: string, directory: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
     const now = Date.now()
@@ -61,6 +65,7 @@ function seedCompletedRow(id: string) {
         status: "completed",
         started_at: now,
         completed_at: now,
+        directory,
         current_phase: "run",
         logs: [{ time: now, phase: "run", message: "running" }],
         agents: [
@@ -937,9 +942,10 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   // Service-Start läuft (leere Registry -> alle running-Zeilen werden gefegt).
   it.instance("orphaned running rows are marked interrupted on service start", () =>
     Effect.gen(function* () {
+      const test = yield* TestInstance
       const workflow = yield* Workflow.Service
       const orphanId = "job_orphan_sweep"
-      yield* seedRunningRow(orphanId)
+      yield* seedRunningRow(orphanId, test.directory)
 
       yield* workflow.sweep()
 
@@ -951,11 +957,12 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
 
   it.instance("persisted run round-trips through fromRow", () =>
     Effect.gen(function* () {
+      const test = yield* TestInstance
       const workflow = yield* Workflow.Service
       const persistedId = Workflow.RunID.make("job_roundtrip")
       // Persist a finished run directly via the SQL layer (no live registry
       // entry), so get() must read it back through DB->fromRow.
-      yield* seedCompletedRow(persistedId)
+      yield* seedCompletedRow(persistedId, test.directory)
 
       const viaDb = yield* workflow.get(persistedId)
       const persisted = viaDb ?? (yield* Effect.fail(new Error("run not persisted")))
@@ -969,9 +976,10 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
 
   it.instance("wait on interrupted run resolves immediately as interrupted (not timedOut)", () =>
     Effect.gen(function* () {
+      const test = yield* TestInstance
       const workflow = yield* Workflow.Service
       const orphanId = Workflow.RunID.make("job_orphan_wait")
-      yield* seedRunningRow(orphanId)
+      yield* seedRunningRow(orphanId, test.directory)
       yield* workflow.sweep()
 
       const res = yield* workflow.wait({ id: orphanId, timeout: 50 })
@@ -1330,5 +1338,132 @@ export async function run() { return { from: "global" } }
 
       yield* Effect.promise(() => fs.rm(globalFile, { force: true }))
     }),
+  )
+
+  // Fund 6 (HIGH) — Cross-Directory-Leak. Zwei Verzeichnisse A/B teilen sich
+  // dieselbe (prozess-globale) DB. runs() von B darf As Run NICHT enthalten:
+  // jeder Run ist auf das Verzeichnis gescoped, in dem er gestartet wurde.
+  it.instance(
+    "runs() does not leak runs started in another directory",
+    () =>
+      Effect.gen(function* () {
+        const a = yield* TestInstance
+        const b = yield* tmpdirScoped({ git: true })
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            a.directory,
+            "hello",
+            `export const meta = { name: "Hello" }
+export async function run() { return { ok: true } }
+`,
+          ),
+        )
+        const workflow = yield* Workflow.Service
+        const runA = yield* workflow.start({ name: "hello" })
+        yield* workflow.wait({ id: runA.id })
+
+        // B's Liste enthält As Run NICHT.
+        const fromB = yield* workflow.runs().pipe(provideInstance(b))
+        expect(fromB.some((r) => r.id === runA.id)).toBe(false)
+        // A sieht den eigenen Run weiterhin (Regression).
+        const fromA = yield* workflow.runs()
+        expect(fromA.some((r) => r.id === runA.id)).toBe(true)
+      }),
+    { git: true },
+  )
+
+  // Fund 6 (HIGH) — get()/remove() aus dem fremden Verzeichnis dürfen As Row
+  // weder lesen noch löschen. Kalt-Read (kein Registry-Eintrag, nur DB).
+  it.instance(
+    "get()/remove() from another directory cannot see or delete a foreign run",
+    () =>
+      Effect.gen(function* () {
+        const a = yield* TestInstance
+        const b = yield* tmpdirScoped({ git: true })
+        const workflow = yield* Workflow.Service
+        // As Run direkt als Row seeden, mit As directory.
+        const idA = Workflow.RunID.make("job_dir_scoped_A")
+        const { db } = yield* Database.Service
+        const now = Date.now()
+        yield* db
+          .insert(WorkflowRunTable)
+          .values({
+            id: idA,
+            workflow: HELLO_FIXTURE,
+            status: "completed",
+            started_at: now,
+            completed_at: now,
+            directory: a.directory,
+            logs: [],
+            agents: [],
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        // B sieht ihn nicht.
+        expect(yield* workflow.get(idA).pipe(provideInstance(b))).toBeUndefined()
+        // remove aus B meldet false und lässt As Row unangetastet.
+        const removed = yield* workflow.remove(idA).pipe(provideInstance(b))
+        expect(removed).toBe(false)
+        const row = yield* fetchRunRow(idA)
+        expect(row.status).toBe("completed")
+        // A findet seinen Run weiterhin.
+        const fromA = yield* workflow.get(idA)
+        expect(fromA?.id).toBe(idA)
+      }),
+    { git: true },
+  )
+
+  // Fund 17 (medium) — Startup-Sweep cross-directory. Ein Sweep aus B (leere
+  // liveIds-Registry, frische InstanceState) darf NUR Bs eigene Zombie-Rows
+  // heilen — As running-Row im anderen Verzeichnis bleibt unangetastet.
+  it.instance(
+    "sweep from another directory leaves foreign running rows untouched",
+    () =>
+      Effect.gen(function* () {
+        const a = yield* TestInstance
+        const b = yield* tmpdirScoped({ git: true })
+        const workflow = yield* Workflow.Service
+        const { db } = yield* Database.Service
+        const now = Date.now()
+        // As running-Row (gehört Verzeichnis A).
+        yield* db
+          .insert(WorkflowRunTable)
+          .values({
+            id: "job_sweep_A",
+            workflow: HELLO_FIXTURE,
+            status: "running",
+            started_at: now,
+            directory: a.directory,
+            logs: [],
+            agents: [],
+          })
+          .run()
+          .pipe(Effect.orDie)
+        // Bs eigene Zombie-Row.
+        yield* db
+          .insert(WorkflowRunTable)
+          .values({
+            id: "job_sweep_B",
+            workflow: HELLO_FIXTURE,
+            status: "running",
+            started_at: now,
+            directory: b,
+            logs: [],
+            agents: [],
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        // Sweep aus B: heilt nur Bs Zombie, nicht As running-Row.
+        yield* workflow.sweep().pipe(provideInstance(b))
+        expect((yield* fetchRunRow("job_sweep_A")).status).toBe("running")
+        expect((yield* fetchRunRow("job_sweep_B")).status).toBe("interrupted")
+
+        // As eigener Sweep heilt dann As Zombie.
+        yield* workflow.sweep()
+        expect((yield* fetchRunRow("job_sweep_A")).status).toBe("interrupted")
+      }),
+    { git: true },
   )
 })
