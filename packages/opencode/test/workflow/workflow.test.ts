@@ -634,6 +634,29 @@ export async function run(args, ctx) {
 }
 `
 
+// Review-Fund 3i.3 (LOW): ein deklarierter Default wird selbst durch den
+// Koerzierungspfad geschickt, bevor er run() erreicht. Ein STRING-Default "7"
+// für ein number-Argument muss run() als die Zahl 7 erreichen — nicht als der
+// rohe String "7". Bewusst getrennt von DEFAULT_WORKFLOW (dessen Default schon
+// die Zahl 7 ist und den rohen Durchschlupf daher NICHT aufdecken würde).
+const STRING_DEFAULT_FIXTURE = "string-default-args"
+const STRING_DEFAULT_WORKFLOW = `export const meta = {
+  name: "${STRING_DEFAULT_FIXTURE}",
+  arguments: {
+    count: { type: "number", default: "7" },
+    flag: { type: "boolean", default: "true" },
+  },
+}
+export async function run(args, ctx) {
+  return {
+    count: args.count,
+    countType: typeof args.count,
+    flag: args.flag,
+    flagType: typeof args.flag,
+  }
+}
+`
+
 describe("Workflow", () => {
   it.instance("pipeline runs stages per item without a barrier and supports heterogeneous types", () =>
     Effect.gen(function* () {
@@ -2218,6 +2241,77 @@ export async function run() { return { ok: true } }
         .start({ name: COERCE_FIXTURE, args: { flag: "maybe" } })
         .pipe(Effect.flip)
       expect(failed._tag).toBe("WorkflowInvalidError")
+    }),
+  )
+
+  // Review-Fund 3i.1 (IMPORTANT): ein leerer / nur aus Whitespace bestehender
+  // String darf für ein number-Argument NICHT still zu 0 koerzieren
+  // (`Number("") === 0`, `Number("  ") === 0` — beide finite und würden sonst
+  // durchschlüpfen). Beide müssen wie "abc" mit InvalidError scheitern.
+  it.instance("empty / whitespace-only string for a declared number argument fails with InvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      for (const bad of ["", "  ", "\t\n"]) {
+        const failed = yield* workflow.start({ name: COERCE_FIXTURE, args: { count: bad } }).pipe(Effect.flip)
+        expect(failed._tag).toBe("WorkflowInvalidError")
+        const invalid =
+          failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
+        expect(invalid.message).toMatch(/count/)
+      }
+    }),
+  )
+
+  // Review-Fund 3i.1 (IMPORTANT): non-string, non-number Werte (null, ein Objekt,
+  // ein Boolean) für ein number-Argument dürfen nicht als NaN/true durchschlüpfen
+  // — sie müssen sauber mit InvalidError scheitern, bevor run() startet.
+  it.instance("non-string non-number value for a declared number argument fails with InvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      for (const bad of [null, {}, [], true] as const) {
+        const failed = yield* workflow.start({ name: COERCE_FIXTURE, args: { count: bad } }).pipe(Effect.flip)
+        expect(failed._tag).toBe("WorkflowInvalidError")
+      }
+    }),
+  )
+
+  // Review-Fund 3i.4 (LOW): wir akzeptieren bewusst die volle `Number()`-Semantik
+  // inkl. Hex ("0x10" -> 16) und Exponent ("1e3" -> 1000) — siehe Doc-Kommentar
+  // an coerceArgs. Das ist die geringste Überraschung für JSON/HTTP-Zahlen und
+  // konsistent mit dem Rest der numerischen Koerzierung.
+  it.instance("hex and exponent numeric strings are accepted via Number() for a declared number argument", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: COERCE_FIXTURE, args: { count: "0x10" } })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as Record<string, unknown>
+      expect(result.count).toBe(16)
+      expect(result.countType).toBe("number")
+    }),
+  )
+
+  // Review-Fund 3i.3 (LOW): ein deklarierter STRING-Default ("7") für ein
+  // number-Argument wird durch denselben Koerzierungspfad geschickt — run() sieht
+  // die Zahl 7, nicht den rohen String "7". Gleiches für den boolean-Default.
+  it.instance("declared string-shaped defaults are coerced to their declared type before run()", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, STRING_DEFAULT_FIXTURE, STRING_DEFAULT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: STRING_DEFAULT_FIXTURE, args: {} })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as Record<string, unknown>
+      expect(result.count).toBe(7)
+      expect(result.countType).toBe("number")
+      expect(result.flag).toBe(true)
+      expect(result.flagType).toBe("boolean")
     }),
   )
 

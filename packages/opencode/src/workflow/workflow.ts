@@ -653,12 +653,22 @@ function isAbortedMessage(message: SessionV1.WithParts): boolean {
 // behavior regardless of what the UI did upstream. Two concerns, in order:
 //
 //   1. Defaults: a declared `default` fills in any argument the caller omitted.
-//      An explicitly supplied value always wins over the default (it is then
-//      coerced like any other supplied value below).
+//      An explicitly supplied value always wins over the default. Either way the
+//      value (supplied OR default) is run through the SAME coercion below, so a
+//      `default: "7"` for a number-declared arg reaches run() as the number 7,
+//      consistent with the authoritative type contract.
 //   2. Coercion to the declared `type`:
 //      - number: a numeric string ("42") becomes the number 42; the result must
-//        be finite, so "abc"/"" (NaN) and "Infinity" fail with InvalidError.
-//        A value that is already a number is kept as-is.
+//        be finite, so "abc"/"Infinity" and a non-string/non-number (null,
+//        object, boolean) fail with InvalidError. Strings are trimmed first and
+//        an empty / whitespace-only string is rejected — `Number("")` and
+//        `Number("  ")` are 0 (finite!), which would silently swallow a missing
+//        value as 0; we treat those as InvalidError instead. We deliberately keep
+//        the full `Number()` parse semantics for the remaining strings, which
+//        means hex ("0x10" -> 16) and exponent ("1e3" -> 1000) are accepted; for
+//        JSON/HTTP-shaped numbers this is the least-surprising choice and stays
+//        consistent with the rest of the numeric path. A value already a number
+//        is kept as-is.
 //      - boolean: only the strings "true"/"false" (or an actual boolean) are
 //        accepted; anything else fails with InvalidError.
 //      - string: a primitive non-string (number/boolean) is coerced via
@@ -679,14 +689,19 @@ function coerceArgs(
   const supplied = args ?? {}
   const result: Record<string, unknown> = { ...supplied }
   for (const [name, argument] of Object.entries(declared)) {
+    // Supplied value wins; otherwise fall back to the declared default. Both go
+    // through the identical coercion below — a value present at all (supplied or
+    // defaulted) is coerced to the declared type before run() ever sees it.
     const hasValue = name in supplied
-    if (!hasValue) {
-      if (argument.default !== undefined) result[name] = argument.default
-      continue
-    }
-    const value = supplied[name]
+    if (!hasValue && argument.default === undefined) continue
+    const value = hasValue ? supplied[name] : argument.default
     if (argument.type === "number") {
-      const coerced = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN
+      // Trim strings first, then reject the empty trim explicitly: `Number("")`
+      // and `Number("  ")` are 0 (finite) and would otherwise swallow a blank
+      // input as 0. Non-string/non-number values short-circuit to NaN -> error.
+      const trimmed = typeof value === "string" ? value.trim() : value
+      const coerced =
+        typeof trimmed === "number" ? trimmed : typeof trimmed === "string" && trimmed !== "" ? Number(trimmed) : NaN
       if (!Number.isFinite(coerced))
         return new InvalidError({ path, message: `argument "${name}" must be a finite number, got ${JSON.stringify(value)}` })
       result[name] = coerced
@@ -706,6 +721,8 @@ function coerceArgs(
       continue
     }
     // No declared type, or value already matches it: pass through unchanged.
+    // (Default-only path still records the default verbatim here.)
+    if (!hasValue) result[name] = value
   }
   return result
 }
