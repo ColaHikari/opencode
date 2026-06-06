@@ -2051,6 +2051,10 @@ export type Config = {
     preserve_recent_tokens?: number
     reserved?: number
   }
+  workflows?: {
+    approval?: "always" | "first-run" | "never"
+    approved?: Array<string>
+  }
   experimental?: {
     disable_paste_summary?: boolean
     batch_tool?: boolean
