@@ -88,6 +88,20 @@ async function writeWorkflow(dir: string, name: string, body: string, ext = "js"
   await Bun.write(path.join(dir, ".opencode", "workflows", `${name}.${ext}`), body)
 }
 
+import os from "os"
+
+// A workflow whose TOP-LEVEL body writes a marker file the moment the module is
+// imported and executed. list()/discover() must NEVER produce this marker
+// (static meta extraction only); start() must, because it really imports the
+// target module after the permission gate.
+const SIDE_EFFECT_FIXTURE = "side-effect"
+function sideEffectWorkflow(markerPath: string) {
+  return `await Bun.write(${JSON.stringify(markerPath)}, "executed")
+export const meta = { name: "SideEffect", description: "writes a marker on import" }
+export async function run(args, ctx) { return { ok: true } }
+`
+}
+
 const STEP2_MARKER = "step-2-reached"
 const SLOW_FIXTURE = "slow"
 
@@ -394,6 +408,55 @@ export async function run(args, ctx) { ctx.setPhase("start"); ctx.log("hello"); 
       const list = yield* workflow.list()
       expect(list.map((item) => item.name)).toContain("hello")
       expect(list.find((item) => item.name === "hello")?.meta.name).toBe("Hello")
+    }),
+  )
+
+  it.instance("list() statically extracts meta and never executes module top-level code; start() does", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const marker = path.join(os.tmpdir(), `workflow-side-effect-${Math.random().toString(16).slice(2)}`)
+      yield* Effect.promise(() => writeWorkflow(test.directory, SIDE_EFFECT_FIXTURE, sideEffectWorkflow(marker)))
+      const workflow = yield* Workflow.Service
+
+      const list = yield* workflow.list()
+      const info = list.find((item) => item.name === SIDE_EFFECT_FIXTURE)
+      // Meta was extracted statically (valid + literal values present)...
+      expect(info?.valid).toBe(true)
+      expect(info?.meta.name).toBe("SideEffect")
+      expect(info?.meta.description).toBe("writes a marker on import")
+      // ...but the module's top-level code was NEVER executed: no marker file.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+
+      // start() really imports the target module, so now the marker appears.
+      const run = yield* workflow.start({ name: SIDE_EFFECT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.run?.status).toBe("completed")
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(true)
+    }),
+  )
+
+  it.instance("non-statically-analyzable meta is reported invalid without running the file", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const marker = path.join(os.tmpdir(), `workflow-dynamic-meta-${Math.random().toString(16).slice(2)}`)
+      // Dynamic meta value (process.env) plus a top-level side effect: the file
+      // must be reported invalid AND never executed during list().
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "dynamic-meta",
+          `await Bun.write(${JSON.stringify(marker)}, "executed")
+export const meta = { name: process.env.SECRET }
+export async function run(args, ctx) { return { ok: true } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      const info = list.find((item) => item.name === "dynamic-meta")
+      expect(info?.valid).toBe(false)
+      expect(info?.error).toContain("statically analyzable")
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
     }),
   )
 

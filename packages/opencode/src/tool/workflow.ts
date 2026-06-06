@@ -409,16 +409,22 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "start") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
-            const workflows = yield* workflow.list()
-            if (!workflows.some((item) => item.name === params.name)) {
-              return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
-            }
+            // Permission gate FIRST — before any discovery/list/load. The list()
+            // pre-check below is now side-effect-free (static meta extraction), but
+            // the ask still has to come first so an untrusted workspace can never
+            // drive any workflow work ahead of the user's consent.
             yield* ctx.ask({
               permission: "workflow",
               patterns: [params.name],
               always: [params.name],
               metadata: { name: params.name, args: params.args ?? {}, background: params.background === true },
             })
+            // Existence pre-check via the static list so an unknown name fails with
+            // a clear "not found" rather than surfacing deep inside start().
+            const workflows = yield* workflow.list()
+            if (!workflows.some((item) => item.name === params.name)) {
+              return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
+            }
             return yield* startWorkflow({ workflow, background, sessions, scope, params, name: params.name, ctx })
           }
 
