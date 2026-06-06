@@ -53,7 +53,7 @@ import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkflow } from "../dialog-workflow"
 import { DialogWorkflowApproval } from "../dialog-workflow-approval"
-import { approvalDecision } from "../dialog-workflow-approval-helpers"
+import { approvalDecision, isSessionApproved, rememberSessionApproval } from "../dialog-workflow-approval-helpers"
 import { parseWorkflowCommand } from "../dialog-workflow-helpers"
 import { listWorkflowInfos, parseWorkflowArgs } from "./workflow-autocomplete"
 import {
@@ -1119,7 +1119,10 @@ export function Prompt(props: PromptProps) {
           ? "start"
           : approvalDecision({
               mode: sync.data.config.workflows?.approval,
-              alreadyApproved: approved.includes(name),
+              // OR in the session-local cache so a "Yes, always" earlier in this
+              // session is honoured immediately, even before the config re-sync
+              // makes the persisted value visible here.
+              alreadyApproved: approved.includes(name) || isSessionApproved(name),
             })
         if (decision === "start") {
           startWorkflow()
@@ -1131,10 +1134,18 @@ export function Prompt(props: PromptProps) {
             // "Yes, always" persists consent so first-run never asks again for this
             // workflow; the array is rewritten whole (config.update deep-merges and
             // replaces arrays), which is fine since we append to the loaded list.
-            if (reply === "always" && !approved.includes(name))
-              await sdk.client.config
-                .update({ config: { workflows: { approved: [...approved, name] } } })
-                .catch(toast.error)
+            // Note: under approval:"always" this persists with no behavioural effect
+            // (always asks every start by design); we still record it so switching
+            // back to first-run later honours the prior consent.
+            if (reply === "always") {
+              // Remember in-session first so a second start this session never
+              // re-asks even before the persisted config re-syncs.
+              rememberSessionApproval(name)
+              if (!approved.includes(name))
+                await sdk.client.config
+                  .update({ config: { workflows: { approved: [...approved, name] } } })
+                  .catch(toast.error)
+            }
             startWorkflow()
           }
         }

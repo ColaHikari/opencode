@@ -3,15 +3,17 @@ import { useTerminalDimensions } from "@opentui/solid"
 import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
 import { createMemo, createResource, createSignal, For, Show } from "solid-js"
 import { selectedForeground, useTheme } from "@tui/context/theme"
-import { useDialog, type DialogContext } from "@tui/ui/dialog"
+import { type DialogContext } from "@tui/ui/dialog"
 import { useSDK } from "@tui/context/sdk"
 import { getScrollAcceleration } from "../util/scroll"
 import { useBindings } from "../keymap"
+import {
+  createApprovalStack,
+  type ApprovalStackController,
+  type WorkflowApprovalResult,
+} from "./dialog-workflow-approval-helpers"
 
-// The user's reply to the interactive start approval dialog. `once` starts this
-// run only; `always` persists consent (the caller appends the name to
-// `workflows.approved`); `cancel` aborts the start.
-export type WorkflowApprovalResult = "once" | "always" | "cancel"
+export type { WorkflowApprovalResult }
 
 type Option = {
   id: WorkflowApprovalResult | "source"
@@ -35,9 +37,8 @@ function formatArgs(args: Record<string, unknown>) {
 export function DialogWorkflowApproval(props: {
   info: WorkflowInfo
   args: Record<string, unknown>
-  onDecide: (result: WorkflowApprovalResult) => void
+  controller: ApprovalStackController
 }) {
-  const dialog = useDialog()
   const { theme } = useTheme()
   const [active, setActive] = createSignal(0)
 
@@ -49,30 +50,16 @@ export function DialogWorkflowApproval(props: {
   }
 
   function choose(option: Option) {
+    // "View script" swaps in the read-only source pager via the controller, which
+    // uses notifyClose:false so merely previewing the script never resolves the
+    // start promise (the approval item's onClose = decide("cancel") must not fire
+    // during the swap). The terminal Yes/Yes-always/No paths resolve and tear the
+    // stack down.
     if (option.id === "source") {
-      openSource()
+      props.controller.showSource()
       return
     }
-    props.onDecide(option.id)
-    dialog.clear()
-  }
-
-  // The read-only script pager is pushed on top of this dialog; Esc inside it
-  // pops back to this dialog (the prompt's onClose is preserved because we use
-  // notifyClose:false on the way out and re-open this exact dialog).
-  function openSource() {
-    dialog.replace(() => (
-      <DialogWorkflowSource
-        info={props.info}
-        onBack={() =>
-          dialog.replace(
-            () => <DialogWorkflowApproval info={props.info} args={props.args} onDecide={props.onDecide} />,
-            () => props.onDecide("cancel"),
-            { notifyClose: false },
-          )
-        }
-      />
-    ))
+    props.controller.commit(option.id)
   }
 
   useBindings(() => ({
@@ -197,22 +184,25 @@ function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void })
   )
 }
 
-// Opens the approval dialog and resolves with the user's decision. Esc / dialog
-// dismissal resolves "cancel" so the start is always abort-safe.
+// Opens the approval dialog and resolves with the user's decision. Esc / backdrop
+// dismissal resolves "cancel" so the start is always abort-safe. The stack
+// choreography (swap to source pager and back without prematurely resolving) lives
+// in createApprovalStack so it can be unit-tested against a fake dialog.
 DialogWorkflowApproval.show = (
   dialog: DialogContext,
   input: { info: WorkflowInfo; args: Record<string, unknown> },
 ) => {
   return new Promise<WorkflowApprovalResult>((resolve) => {
-    let settled = false
-    const decide = (result: WorkflowApprovalResult) => {
-      if (settled) return
-      settled = true
-      resolve(result)
-    }
-    dialog.replace(
-      () => <DialogWorkflowApproval info={input.info} args={input.args} onDecide={decide} />,
-      () => decide("cancel"),
-    )
+    const controller = createApprovalStack({
+      dialog,
+      resolve,
+      renderApproval: (controller) => () => (
+        <DialogWorkflowApproval info={input.info} args={input.args} controller={controller} />
+      ),
+      renderSource: (controller) => () => (
+        <DialogWorkflowSource info={input.info} onBack={() => controller.back()} />
+      ),
+    })
+    controller.showApproval()
   })
 }
