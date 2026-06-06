@@ -2193,21 +2193,38 @@ function WorkflowCall(props: ToolProps<typeof WorkflowTool>) {
 
   const content = createMemo(() => {
     if (props.input.action !== "start") return undefined
-    const label = current()?.definition?.meta.name ?? meta().workflow ?? props.input.name ?? "Workflow"
+    const run = current()
+    const label = run?.definition?.meta.name ?? meta().workflow ?? props.input.name ?? "Workflow"
     const lines = [meta().background ? `${label} (background)` : label]
     if (isRunning()) {
-      const activeAgent = current()?.agents.findLast((agent) => agent.status === "running") ?? current()?.agents.at(-1)
-      if (current()?.current_phase) lines.push(`↳ phase ${current()!.current_phase}`)
+      const activeAgent = run?.agents.findLast((agent) => agent.status === "running") ?? run?.agents.at(-1)
+      if (run?.current_phase) lines.push(`↳ phase ${run.current_phase}`)
       else if (activeAgent) {
         lines.push(
           `↳ ${activeAgent.agent ? `@${activeAgent.agent}` : "agent"}${activeAgent.phase ? ` · ${activeAgent.phase}` : ""}`,
         )
       } else lines.push("↳ starting")
     }
-    if (!isRunning() && current()) {
-      lines.push(`└ ${current()!.agents.length} agent runs · ${Locale.duration(duration())}`)
+    if (!isRunning() && run) {
+      // Fund 37: a terminal run is not always a clean success — failed/cancelled/
+      // interrupted runs must read as such instead of all looking "done". The
+      // summary line carries the terminal status, and a failure/interrupt also
+      // surfaces the error message (or a fallback) below it.
+      const summary = `└ ${run.agents.length} agent runs · ${Locale.duration(duration())}`
+      lines.push(run.status === "completed" ? summary : `${summary} · ${run.status}`)
+      if (run.status === "failed" || run.status === "interrupted") {
+        lines.push(`✖ ${run.error ?? (run.status === "interrupted" ? "run was interrupted" : "workflow failed")}`)
+      }
     }
     return lines.join("\n")
+  })
+
+  // Fund 37: a terminal run that failed or was interrupted reads in the error
+  // color so it never looks like a clean completion.
+  const color = createMemo(() => {
+    const status = current()?.status
+    if (status === "failed" || status === "interrupted") return theme.error
+    return theme.textMuted
   })
 
   if (props.input.action !== "start") return <GenericTool {...props} />
@@ -2215,7 +2232,7 @@ function WorkflowCall(props: ToolProps<typeof WorkflowTool>) {
   return (
     <InlineTool
       icon="│"
-      color={theme.textMuted}
+      color={color()}
       spinner={isRunning()}
       complete={meta().workflow ?? props.input.name ?? props.input.action}
       pending="Starting workflow..."
