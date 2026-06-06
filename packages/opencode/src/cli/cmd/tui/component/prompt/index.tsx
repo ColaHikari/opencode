@@ -52,6 +52,8 @@ import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkflow } from "../dialog-workflow"
+import { DialogWorkflowApproval } from "../dialog-workflow-approval"
+import { approvalDecision, isSessionApproved, rememberSessionApproval } from "../dialog-workflow-approval-helpers"
 import { parseWorkflowCommand } from "../dialog-workflow-helpers"
 import { listWorkflowInfos, parseWorkflowArgs } from "./workflow-autocomplete"
 import {
@@ -1196,27 +1198,71 @@ export function Prompt(props: PromptProps) {
         // supplies a synthesized meta here; an unknown name simply yields no
         // declaration and every arg stays a string (the safe default).
         const infos = await listWorkflowInfos(sdk.client.workflow, true)
-        const declaration = infos.find((info) => info.name === name)?.meta.arguments ?? {}
-        void sdk.client.workflow
-          // Fund 35: route the start's permission prompts (the workflow gate and any
-          // agent-step asks) to the ACTIVE session so they surface here in the TUI,
-          // instead of an orphaned session the user is not looking at.
-          .start({
-            name,
-            workflowStartPayload: {
-              args: parseWorkflowArgs(workflowCommand.args, declaration),
-              permissionSessionID: sessionID,
-            },
-          })
-          .then((result) => {
-            if (!result.data) {
-              toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
-              return
+        const info = infos.find((info) => info.name === name)
+        const args = parseWorkflowArgs(workflowCommand.args, info?.meta.arguments ?? {})
+        const startWorkflow = () =>
+          void sdk.client.workflow
+            // Fund 35: route the start's permission prompts (the workflow gate and any
+            // agent-step asks) to the ACTIVE session so they surface here in the TUI,
+            // instead of an orphaned session the user is not looking at.
+            .start({
+              name,
+              workflowStartPayload: {
+                args,
+                permissionSessionID: sessionID,
+              },
+            })
+            .then((result) => {
+              if (!result.data) {
+                toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
+                return
+              }
+              toast.show({ message: `Started workflow ${name}`, variant: "info" })
+              if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
+            })
+            .catch(toast.error)
+
+        // Track D: gate every interactive start behind an approval dialog. The
+        // workflow *tool* keeps its own ask-gate (Permission service) untouched;
+        // this is the TUI pendant for `/workflow <name>`. An unknown name has no
+        // info, so it cannot render a meaningful dialog — let the start surface the
+        // engine's "not found" error as before rather than asking to approve a
+        // workflow that does not exist.
+        const approved = sync.data.config.workflows?.approved ?? []
+        const decision = !info
+          ? "start"
+          : approvalDecision({
+              mode: sync.data.config.workflows?.approval,
+              // OR in the session-local cache so a "Yes, always" earlier in this
+              // session is honoured immediately, even before the config re-sync
+              // makes the persisted value visible here.
+              alreadyApproved: approved.includes(name) || isSessionApproved(name),
+            })
+        if (decision === "start") {
+          startWorkflow()
+        } else {
+          const reply = await DialogWorkflowApproval.show(dialog, { info: info!, args })
+          if (reply === "cancel") {
+            toast.show({ message: `Cancelled workflow ${name}`, variant: "info" })
+          } else {
+            // "Yes, always" persists consent so first-run never asks again for this
+            // workflow; the array is rewritten whole (config.update deep-merges and
+            // replaces arrays), which is fine since we append to the loaded list.
+            // Note: under approval:"always" this persists with no behavioural effect
+            // (always asks every start by design); we still record it so switching
+            // back to first-run later honours the prior consent.
+            if (reply === "always") {
+              // Remember in-session first so a second start this session never
+              // re-asks even before the persisted config re-syncs.
+              rememberSessionApproval(name)
+              if (!approved.includes(name))
+                await sdk.client.config
+                  .update({ config: { workflows: { approved: [...approved, name] } } })
+                  .catch(toast.error)
             }
-            toast.show({ message: `Started workflow ${name}`, variant: "info" })
-            if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
-          })
-          .catch(toast.error)
+            startWorkflow()
+          }
+        }
       }
     } else if (
       inputText.startsWith("/") &&
