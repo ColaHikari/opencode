@@ -1533,8 +1533,13 @@ export const layer = Layer.effect(
       // honestly as its persisted snapshot rather than rewritten — but it is
       // returned, NOT undefined. undefined is reserved for a genuinely unknown id
       // (which the HTTP handler in Task 3h maps to 404). The scoping mirrors get():
-      // a foreign-directory row is invisible here and so reports undefined too.
-      if (!active) {
+      // a foreign-directory row is invisible here and so reports undefined too. The
+      // same lookup also rescues a cancel that LOSES the race against the run's own
+      // natural completion (below): the body fiber's `finish(id, "completed")` can
+      // persist the terminal row and N1-evict it between this registry read and our
+      // own `finish` — leaving our `finish` to return undefined for a run that very
+      // much exists and is terminal. Both paths resolve to the persisted snapshot.
+      const persisted = Effect.fn("Workflow.cancel.persisted")(function* () {
         const directory = yield* InstanceState.directory
         const row = yield* db
           .select()
@@ -1542,12 +1547,19 @@ export const layer = Layer.effect(
           .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
           .get()
           .pipe(Effect.orDie)
-        if (!row) return
-        return fromRow(row)
-      }
+        return row ? fromRow(row) : undefined
+      })
+      if (!active) return yield* persisted()
       if (active.run.status !== "running") return snapshot(active)
       yield* abortRun(active)
-      return yield* finish(id, "cancelled")
+      // Lost-race fallback: `finish` returns undefined only when the run was already
+      // evicted (the body fiber completed and ran finish()'s N1 eviction first). The
+      // run is terminal and gone from the registry — return its persisted snapshot
+      // showing the TRUE terminal status (completed, NOT rewritten to cancelled),
+      // never undefined. remove() already tolerates the same idempotent `finish`
+      // here via `Effect.ignore`; cancel must additionally surface the snapshot.
+      const finished = yield* finish(id, "cancelled")
+      return finished ?? (yield* persisted())
     })
 
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
