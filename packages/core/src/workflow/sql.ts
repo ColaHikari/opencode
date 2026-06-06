@@ -65,6 +65,10 @@ export type WorkflowAgentRow = {
     }
   }
   error?: string
+  // `true` when this agent node was replayed from a resumed run's persisted
+  // journal rather than executed live. Omitted for a live step. Keep this in
+  // lockstep with the engine's `AgentRun` schema (asserted at compile time).
+  cached?: boolean
 }
 
 export const WorkflowRunTable = sqliteTable(
@@ -82,7 +86,16 @@ export const WorkflowRunTable = sqliteTable(
     // comparison is total.
     directory: text().notNull().default(""),
     workflow: text().notNull(),
-    status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted">().notNull(),
+    // `paused` is a non-terminal status: a run the user explicitly suspended via
+    // pause() (sessions aborted, scope closed, fiber interrupted — like cancel),
+    // but whose persisted agent journal is kept intact so a later resume can
+    // replay the completed agents instead of re-running them. Distinct from
+    // `cancelled`/`interrupted` (both terminal): a paused run is neither finished
+    // nor lost, it is parked. Keep this union in lockstep with the engine's
+    // `Status` schema (asserted assignable at compile time over there).
+    status: text()
+      .$type<"running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused">()
+      .notNull(),
     started_at: integer().notNull(),
     completed_at: integer(),
     current_phase: text(),
@@ -102,6 +115,14 @@ export const WorkflowRunTable = sqliteTable(
     // which never carry that null/undefined ambiguity.
     result: text(),
     error: text(),
+    // Nullable back-reference to the run this run was resumed FROM (a previous
+    // paused/interrupted run id). When set, start() loaded the source run's
+    // persisted agent journal and replayed every completed agent it could match
+    // instead of re-prompting them — so a resume is cheap and cross-restart
+    // (the journal lives in the DB, not in memory). NULL for an ordinary
+    // (non-resume) start. Purely a provenance/audit field on the row; the engine
+    // reads it back as `resume_of` on the public Run.
+    resume_of: text(),
     ...Timestamps,
   },
   (table) => [

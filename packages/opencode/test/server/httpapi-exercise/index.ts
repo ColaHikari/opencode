@@ -65,9 +65,14 @@ function locationData(validate: (value: any) => void) {
 // `.opencode/workflows/<name>.ts`, which is exactly where the engine's discovery
 // globs (`workflows/*.ts`) for the calling workspace.
 const WORKFLOW_FIXTURE_NAME = "httpapi-fixture"
+// The fixture stays running while `args.hang` is set (a long, abort-aware sleep)
+// so the pause scenario can deterministically catch it in the `running` state;
+// without that arg it returns synchronously and settles on its own (no LLM
+// needed), which every other workflow scenario relies on.
 const workflowFixtureSource = [
   `export const meta = { name: "${WORKFLOW_FIXTURE_NAME}", description: "httpapi exercise fixture" }`,
   `export async function run(args) {`,
+  `  if (args && args.hang) await new Promise((resolve) => setTimeout(resolve, 30000))`,
   `  return { ok: true, args }`,
   `}`,
   ``,
@@ -1602,6 +1607,78 @@ const scenarios: Scenario[] = [
       body: {},
     }))
     .status(404),
+  http.protected
+    .post("/workflow/run/{id}/pause", "workflow.pause.missing")
+    .at((ctx) => ({
+      path: route("/workflow/run/{id}/pause", { id: "job_httpapi_missing" }),
+      headers: ctx.headers(),
+      body: {},
+    }))
+    .status(404),
+  // Pause + resume happy path keyed to the pause route: start a HANGING run (so it
+  // is deterministically `running`), pause it over HTTP (200 + a paused Run), then
+  // resume-start a fresh (non-hanging) run with `resume_of` pointing at the paused
+  // run and drive it to `completed`. Exercises the pause handler's success branch
+  // plus the start handler forwarding `resume_of`.
+  http.protected
+    .post("/workflow/run/{id}/pause", "workflow.pause")
+    .mutating()
+    .seeded((ctx) => seedWorkflow(ctx))
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: { args: { hang: true } },
+    }))
+    .jsonEffect(
+      200,
+      (body, ctx) =>
+        Effect.gen(function* () {
+          const started = isWorkflowRun(body)
+          check(started.status === "running", "hanging run should report running")
+          const id = started.id
+          const headers = ctx.headers()
+
+          // Poll the pause endpoint until the run is observed `paused` (the body
+          // fork may still be settling the initial state on the first call).
+          let pausedStatus = ""
+          for (let attempt = 0; attempt < 50 && pausedStatus !== "paused"; attempt++) {
+            const paused = yield* request({
+              method: "POST",
+              path: route("/workflow/run/{id}/pause", { id }),
+              headers,
+              body: {},
+            })
+            check(paused.status === 200, `pause of a running run should be 200, got ${paused.status}`)
+            pausedStatus = isRecord(paused.body) && typeof paused.body.status === "string" ? paused.body.status : ""
+            if (pausedStatus !== "paused") yield* Effect.sleep("50 millis")
+          }
+          check(pausedStatus === "paused", `run should be paused, got "${pausedStatus}"`)
+
+          // Resume: start a fresh, non-hanging run referencing the paused source.
+          const resumed = yield* request({
+            method: "POST",
+            path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+            headers,
+            body: { resume_of: id },
+          })
+          check(resumed.status === 200, `resume start should be 200, got ${resumed.status}`)
+          const resumedId = isRecord(resumed.body) && typeof resumed.body.id === "string" ? resumed.body.id : ""
+          check(resumedId.startsWith("job"), "resumed run should have a run id")
+
+          let resumedStatus = ""
+          for (let attempt = 0; attempt < 50 && resumedStatus !== "completed"; attempt++) {
+            const got = yield* request({
+              method: "GET",
+              path: route("/workflow/run/{id}", { id: resumedId }),
+              headers,
+            })
+            resumedStatus = isRecord(got.body) && typeof got.body.status === "string" ? got.body.status : ""
+            if (resumedStatus !== "completed") yield* Effect.sleep("50 millis")
+          }
+          check(resumedStatus === "completed", `resumed run should complete, got "${resumedStatus}"`)
+        }),
+      "status",
+    ),
   http.protected
     .delete("/workflow/run/{id}", "workflow.remove.missing")
     .mutating()
