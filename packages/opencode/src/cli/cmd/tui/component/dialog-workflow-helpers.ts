@@ -1,4 +1,5 @@
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
+import path from "path"
 
 // The engine persists timestamps as numbers, but the SDK schema widens them to
 // include stringified non-finite sentinels ("NaN"/"Infinity"). Normalize any of
@@ -125,6 +126,34 @@ export type WorkflowCommand = { type: "dashboard" } | { type: "start"; name: str
 // a workflow literally named `workflows`. Anchor on the exact first token.
 // Fund 60: the start remainder is the RAW substring after the name (multiple
 // spaces preserved) so `msg="hello   world"` survives intact to parseWorkflowArgs.
+// Save-as-command: a run's persisted `definition.source` can be written to disk
+// as a real workflow file under the project or global workflows dir. The file
+// base is the workflow name, but a name is untrusted (it is just whatever the
+// run carries), so it MUST be sanitized before it becomes a path: a name with a
+// slash or `..` could escape the workflows dir. Returns the trimmed name when it
+// is a single safe path segment, or `undefined` when it must be rejected (empty,
+// contains a path separator, or is a `.`/`..` traversal segment). The caller
+// surfaces a warning on `undefined` and never writes.
+export function sanitizeWorkflowFilename(name: string): string | undefined {
+  const trimmed = name.trim()
+  if (!trimmed) return undefined
+  if (trimmed === "." || trimmed === "..") return undefined
+  if (/[\\/]/.test(trimmed)) return undefined
+  return trimmed
+}
+
+// Resolves the two save destinations for a workflow file named `name` (already
+// sanitized by the caller): `<projectDir>/.opencode/workflows/<name>.ts` and
+// `<globalDir>/workflows/<name>.ts`. `globalDir` is the global config dir
+// (Global.Path.config), matching where discovery globs global workflows from, so
+// a file saved to the global target is discoverable on the next list().
+export function saveTargets(projectDir: string, globalDir: string, name: string) {
+  return {
+    project: path.join(projectDir, ".opencode", "workflows", `${name}.ts`),
+    global: path.join(globalDir, "workflows", `${name}.ts`),
+  }
+}
+
 export function parseWorkflowCommand(input: string): WorkflowCommand | undefined {
   const firstLine = input.split("\n")[0]
   const command = firstLine.trimStart().split(/\s/)[0]

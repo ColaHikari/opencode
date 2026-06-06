@@ -2753,6 +2753,7 @@ export type WorkflowInfo = {
   meta: WorkflowMeta
   valid: boolean
   error?: string
+  source_kind?: "builtin"
 }
 
 export type WorkflowDefinition = {

@@ -27,8 +27,10 @@ import {
   workflowArgContext,
   workflowAutocompleteTriggerIndex,
   workflowCommandOption,
+  workflowCommandOptions,
   workflowNameQuery,
   workflowOptions,
+  WORKFLOW_COMMAND_PREFIX,
 } from "./workflow-autocomplete"
 
 function removeLineRange(input: string) {
@@ -502,6 +504,27 @@ export function Autocomplete(props: {
       })
     }
 
+    // Discovered workflows as direct `/<name>` slash commands. The collision set
+    // is every command name already in `results` (built-in slashes + server/MCP
+    // commands): strip the leading `/` and any `:mcp` suffix so a workflow never
+    // shadows or duplicates a real command. Selecting one routes EXACTLY like
+    // `/workflow <name>` (the existing parseWorkflowCommand dispatch) — the helper
+    // is pure, so the onSelect that inserts the routed text is attached here.
+    const existingCommandNames = new Set(results.map((item) => item.display.replace(/^\//, "").replace(/:mcp$/, "")))
+    for (const option of workflowCommandOptions(slashCommandWorkflowInfos(), existingCommandNames)) {
+      const name = option.value!
+      results.push({
+        ...option,
+        onSelect: () => {
+          const newText = `${WORKFLOW_COMMAND_PREFIX}${name} `
+          const cursor = props.input().logicalCursor
+          props.input().deleteRange(0, 0, cursor.row, cursor.col)
+          props.input().insertText(newText)
+          props.input().cursorOffset = Bun.stringWidth(newText)
+        },
+      })
+    }
+
     results.sort((a, b) => a.display.localeCompare(b.display))
 
     const max = firstBy(results, [(x) => x.display.length, "desc"])?.display.length
@@ -514,6 +537,16 @@ export function Autocomplete(props: {
 
   const [workflowInfos] = createResource(
     () => workflowNameSearch() !== undefined || workflowArgSearch() !== undefined,
+    (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
+    { initialValue: [] },
+  )
+
+  // Separate resource feeding the direct `/<name>` slash commands: enabled the
+  // moment the `/` slash menu is visible (not just inside a `/workflow` context),
+  // so discovered workflows appear alongside built-in slash commands. Cheap and
+  // cached; listWorkflowInfos already drops invalid entries.
+  const [slashCommandWorkflowInfos] = createResource(
+    () => store.visible === "/",
     (enabled) => listWorkflowInfos(sdk.client.workflow, enabled),
     { initialValue: [] },
   )
