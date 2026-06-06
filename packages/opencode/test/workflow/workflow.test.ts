@@ -1228,6 +1228,53 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // N16 (medium): cancel() auf einen persistierten, NICHT-live Run (geseedet, kein
+  // Registry-Eintrag — der Zustand nach Neustart/Eviction) darf NICHT undefined
+  // liefern. Konsistent mit get()/remove() konsultiert cancel() die (gescopte)
+  // DB-Row: gefunden → ehrlich den Run-Snapshot zurückgeben (ein bereits
+  // terminaler Run wird nicht „gecancelt", aber zurückgegeben). undefined NUR bei
+  // echtem not-found.
+  it.instance("cancel falls back to the persisted row for a non-live run; undefined only for unknown ids", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const persistedId = Workflow.RunID.make("job_cancel_nonlive")
+      // Fertiger Run direkt geseedet → kein Registry-Eintrag (nicht live).
+      yield* seedCompletedRow(persistedId, test.directory)
+
+      // cancel() findet ihn über die DB und liefert den Snapshot, nicht undefined.
+      const cancelled = yield* workflow.cancel(persistedId)
+      expect(cancelled).toBeDefined()
+      expect(cancelled?.id).toBe(persistedId)
+      // Ein bereits terminaler Run wird nicht in cancelled umgeschrieben.
+      expect(cancelled?.status).toBe("completed")
+
+      // Eine völlig unbekannte id liefert undefined (→ HTTP 404 in 3h).
+      const unknown = yield* workflow.cancel(Workflow.RunID.make("job_cancel_unknown"))
+      expect(unknown).toBeUndefined()
+    }),
+  )
+
+  // N16 — Cross-Directory: cancel() ist auf das aufrufende Verzeichnis gescoped
+  // (wie get()/remove()). Eine fremde Row darf NICHT als gefunden gelten.
+  it.instance(
+    "cancel from another directory cannot see a foreign run",
+    () =>
+      Effect.gen(function* () {
+        const a = yield* TestInstance
+        const b = yield* tmpdirScoped({ git: true })
+        const workflow = yield* Workflow.Service
+        const idA = Workflow.RunID.make("job_cancel_scoped_A")
+        yield* seedCompletedRow(idA, a.directory)
+
+        // B sieht ihn nicht → undefined (nicht „found-but-not-cancellable").
+        expect(yield* workflow.cancel(idA).pipe(provideInstance(b))).toBeUndefined()
+        // A findet ihn weiterhin.
+        expect((yield* workflow.cancel(idA))?.id).toBe(idA)
+      }),
+    { git: true },
+  )
+
   // Fund 42 / N20 (low): result === null darf im DB-Roundtrip NICHT zu undefined
   // ("No result recorded.") werden. Drei Fälle, end-to-end durch den echten
   // Engine-Persist getrieben: ein echtes result, result === null und nie gesetzt.
