@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test"
-import { parseWorkflowArgs } from "../../../../src/cli/cmd/tui/component/prompt/workflow-autocomplete"
+import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
+import {
+  isWorkflowCommandInput,
+  isWorkflowNameInput,
+  listWorkflowInfos,
+  parseWorkflowArgs,
+  workflowArgContext,
+  workflowAutocompleteTriggerIndex,
+} from "../../../../src/cli/cmd/tui/component/prompt/workflow-autocomplete"
 
 describe("parseWorkflowArgs", () => {
   test("coerces only args declared as number", () => {
@@ -40,5 +48,105 @@ describe("parseWorkflowArgs", () => {
 
   test("bare flags stay the string 'true' regardless of declaration (existing behavior)", () => {
     expect(parseWorkflowArgs("--verbose", { verbose: { type: "boolean" } })).toEqual({ verbose: "true" })
+  })
+
+  test("multi-space quoted values are preserved verbatim (Fund 60)", () => {
+    expect(parseWorkflowArgs('msg="hello   world"')).toEqual({ msg: "hello   world" })
+  })
+
+  test("pathological input does not catastrophically backtrack (N14)", () => {
+    const pathological = "=".concat('="'.repeat(50))
+    const start = performance.now()
+    parseWorkflowArgs(pathological)
+    expect(performance.now() - start).toBeLessThan(100)
+  })
+
+  test("a long unterminated-quote run still parses fast (N14)", () => {
+    const pathological = `name=${'"a'.repeat(50)}`
+    const start = performance.now()
+    parseWorkflowArgs(pathological)
+    expect(performance.now() - start).toBeLessThan(100)
+  })
+})
+
+describe("workflowArgContext (N6 — quote-aware used set)", () => {
+  test("a quoted value with spaces counts the whole token as one used arg", () => {
+    // Cursor at end; the only declared arg consumed so far is `msg` even though
+    // its value contains a space. A naive whitespace split would have seen `b"`
+    // as a separate bare token and missed that `msg` is already used.
+    const ctx = workflowArgContext('/workflow flow msg="a b" ', '/workflow flow msg="a b" '.length)
+    expect(ctx?.used.has("msg")).toBe(true)
+    expect(ctx?.used.has("b")).toBe(false)
+    expect(ctx?.used.has('b"')).toBe(false)
+  })
+
+  test("collects flag and key= forms in the used set", () => {
+    const input = "/workflow flow --verbose count=3 "
+    const ctx = workflowArgContext(input, input.length)
+    expect(ctx?.used.has("verbose")).toBe(true)
+    expect(ctx?.used.has("count")).toBe(true)
+  })
+
+  test("a cursor in the middle of a fresh token reports it as the query", () => {
+    const input = "/workflow flow ms"
+    const ctx = workflowArgContext(input, input.length)
+    expect(ctx?.query).toBe("ms")
+    expect(ctx?.used.has("ms")).toBe(false)
+  })
+
+  test("a trailing space yields an empty query ready for a new arg", () => {
+    const input = "/workflow flow count=3 "
+    const ctx = workflowArgContext(input, input.length)
+    expect(ctx?.query).toBe("")
+    expect(ctx?.used.has("count")).toBe(true)
+  })
+})
+
+describe("workflow command/name input detection", () => {
+  test("isWorkflowCommandInput recognizes the /workflow prefix", () => {
+    expect(isWorkflowCommandInput("/workflow ")).toBe(true)
+    expect(isWorkflowCommandInput("/help")).toBe(false)
+  })
+
+  test("isWorkflowNameInput is true while typing the name", () => {
+    expect(isWorkflowNameInput("/workflow rev", "/workflow rev".length)).toBe(true)
+    expect(isWorkflowNameInput("/workflow rev arg=1", "/workflow rev arg=1".length)).toBe(false)
+  })
+
+  test("workflowAutocompleteTriggerIndex anchors at the name slot", () => {
+    expect(workflowAutocompleteTriggerIndex("/workflow re", "/workflow re".length)).toBe("/workflow ".length - 1)
+  })
+})
+
+describe("listWorkflowInfos", () => {
+  const valid = { name: "a", valid: true, meta: { name: "a" } } as unknown as WorkflowInfo
+  const broken = { name: "b", valid: false, meta: { name: "b" } } as unknown as WorkflowInfo
+
+  test("disabled never calls list()", async () => {
+    let called = false
+    const result = await listWorkflowInfos(
+      {
+        list: async () => {
+          called = true
+          return { data: [valid] }
+        },
+      },
+      false,
+    )
+    expect(called).toBe(false)
+    expect(result).toEqual([])
+  })
+
+  test("an error response yields an empty list", async () => {
+    expect(await listWorkflowInfos({ list: async () => ({ error: "boom" }) }, true)).toEqual([])
+  })
+
+  test("an undefined data response yields an empty list", async () => {
+    expect(await listWorkflowInfos({ list: async () => ({ data: undefined }) }, true)).toEqual([])
+  })
+
+  test("invalid entries are filtered out", async () => {
+    const result = await listWorkflowInfos({ list: async () => ({ data: [valid, broken] }) }, true)
+    expect(result.map((info) => info.name)).toEqual(["a"])
   })
 })
