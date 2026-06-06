@@ -1413,8 +1413,46 @@ export const layer = Layer.effect(
               node.message_id = message.info.id
               if (message.info.role === "assistant") {
                 node.model = `${message.info.providerID}/${message.info.modelID}`
-                node.cost = message.info.cost
-                node.tokens = message.info.tokens
+                // `prompt.prompt` is an agentic while(true) loop (SessionPrompt.runLoop):
+                // a single ctx.agent step that uses tools persists MANY assistant
+                // messages (one per turn), each with its own per-turn `cost`/`tokens`,
+                // but only ever RETURNS the LAST one. Charging just `message.info.cost`
+                // therefore discards every intermediate turn's spend — the dashboard
+                // under-reports and the budget under-counts massively (Fund N12). Sum
+                // cost/tokens over ALL assistant messages of this child session instead.
+                // `sessions.messages` returns the raw per-message list (NOT a cumulative
+                // pre-aggregate), so summing it cannot double-count; the returned
+                // `message` is itself one of those persisted rows, so it is NOT added on
+                // top. A single-turn session yields exactly one assistant message ⇒ the
+                // sum equals that message ⇒ identical to the prior single-message read.
+                const assistants = (yield* sessions.messages({ sessionID: session.id }).pipe(Effect.orDie))
+                  .map((m) => m.info)
+                  .filter((info) => info.role === "assistant")
+                node.cost = assistants.reduce((sum, info) => sum + info.cost, 0)
+                // Keep `total` optional exactly as the per-message tokens schema has it:
+                // only emit a summed total when at least one message actually carried one,
+                // otherwise leave it `undefined` so a single-message session is byte-for-byte
+                // identical to the prior `node.tokens = message.info.tokens` assignment.
+                const totals = assistants.map((info) => info.tokens.total).filter((t) => t !== undefined)
+                node.tokens = assistants.reduce(
+                  (acc, info) => ({
+                    total: acc.total,
+                    input: acc.input + info.tokens.input,
+                    output: acc.output + info.tokens.output,
+                    reasoning: acc.reasoning + info.tokens.reasoning,
+                    cache: {
+                      read: acc.cache.read + info.tokens.cache.read,
+                      write: acc.cache.write + info.tokens.cache.write,
+                    },
+                  }),
+                  {
+                    total: totals.length > 0 ? totals.reduce((sum, t) => sum + t, 0) : undefined,
+                    input: 0,
+                    output: 0,
+                    reasoning: 0,
+                    cache: { read: 0, write: 0 },
+                  } as NonNullable<AgentRun["tokens"]>,
+                )
               }
               // Fund 4: the production runner RESOLVES (does not reject) when a
               // session is aborted — it returns the last assistant message, which
