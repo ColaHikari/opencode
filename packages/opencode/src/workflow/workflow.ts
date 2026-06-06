@@ -311,12 +311,31 @@ type Active = {
   run: Run
   done: Deferred.Deferred<Run>
   fiber?: Fiber.Fiber<void, unknown>
+  /**
+   * Per-run scope into which EVERY agent/parallel/pipeline effect is forked
+   * (via `Effect.forkIn(runScope)`), instead of running as a detached root
+   * fiber through `Effect.runPromise`. This makes all dispatched agent work a
+   * tracked child of the run: closing `runScope` on cancel/remove propagates
+   * Interrupt down to in-flight agent fibers (Fund 14), including ones that
+   * started but had not yet registered their child session (Fund 16), and ones
+   * that would otherwise re-INSERT a deleted row after delete (Fund 3). The
+   * scope is forked from the instance scope, so an instance teardown also
+   * closes it.
+   */
+  runScope: Scope.Closeable
   /** Child agent sessions currently in flight; aborted on cancel/remove. */
   sessions: Set<string>
   /** Session-abort vector for this run (the prompt-ops `cancel`); undefined when no prompt-ops were supplied. */
   cancelSession?: (sessionID: SessionID) => Effect.Effect<void>
   /** Set once a cancel/remove has been requested so the run finishes as `cancelled`, never `failed`. */
   cancelling?: boolean
+  /**
+   * Tombstone set by `remove()` BEFORE the row is deleted. `persistRun` reads
+   * it inside its `Effect.suspend` and NO-OPs for a removed run, so a settlement
+   * write racing the delete can never re-INSERT (resurrect) the deleted row
+   * (Fund 3).
+   */
+  removed?: boolean
   /**
    * Original cost cap (USD) the run was started with, or `Infinity` when no
    * budget was set. Kept alongside `budgetRemaining` purely so the
@@ -389,16 +408,46 @@ function fromRow(row: Row): Run {
   }
 }
 
-function persistRun(db: Database.Interface["db"], active: Active) {
+// Test seam (N2): when set, the NEXT terminal persist (the awaited write in
+// `finish`) fails once, simulating a DB error on the terminal write. Used only
+// by the workflow test to prove that a failing terminal persist never strands
+// the run's `done` deferred (waiters must still observe the terminal state).
+// A module-level one-shot flag is the minimal seam that does not require
+// threading a fake DB through the whole layer graph; it is inert in production.
+let failNextTerminalPersist = false
+export const __testHooks = {
+  failNextTerminalPersist: () => {
+    failNextTerminalPersist = true
+  },
+}
+
+class TerminalPersistTestError extends Error {
+  constructor() {
+    super("injected terminal persist failure (test seam)")
+  }
+}
+
+function persistRun(db: Database.Interface["db"], active: Active, options?: { terminal?: boolean }) {
   // The snapshot MUST be built at execution time (inside Effect.suspend), not
-  // at effect-construction time: progress writes are forked into the instance
-  // scope and may execute AFTER the awaited terminal write in `finish`. A
-  // snapshot captured at construction would then revert the row to a stale
-  // state (live-found regression: a completed run's row flipped back to
-  // `running`). Reading `active.run` at execution time makes every write a
-  // full snapshot of the CURRENT state, so any write ordering converges on
-  // the final row.
+  // at effect-construction time: progress writes are forked into the run scope
+  // and may execute AFTER the awaited terminal write in `finish`. A snapshot
+  // captured at construction would then revert the row to a stale state
+  // (live-found regression: a completed run's row flipped back to `running`).
+  // Reading `active.run` at execution time makes every write a full snapshot of
+  // the CURRENT state, so any write ordering converges on the final row.
   return Effect.suspend(() => {
+    // Fund 3: once a run is removed, NO write may re-create its row. A late
+    // settlement write (a detached agent that settles after `remove` deleted
+    // the row) would otherwise re-INSERT a zombie row, only swept to
+    // `interrupted` on the next restart. The tombstone is checked at execution
+    // time so it covers writes already queued before the delete.
+    if (active.removed) return Effect.void
+    // Test seam (N2): fail exactly the terminal write once, to prove the
+    // `done` deferred still resolves around a failing terminal persist.
+    if (options?.terminal && failNextTerminalPersist) {
+      failNextTerminalPersist = false
+      return Effect.fail(new TerminalPersistTestError())
+    }
     const data = {
       id: active.run.id,
       session_id: active.run.session_id ?? null,
@@ -426,15 +475,15 @@ function persistRun(db: Database.Interface["db"], active: Active) {
 }
 
 /**
- * Forks a progress-snapshot write as a child of the instance scope, so the
- * fiber is tracked and torn down with the instance instead of leaking as a
- * detached root fiber. Interrupt-on-dispose is safe for these writes: every
- * `persistRun` is an idempotent full-state upsert, the terminal write in
- * `finish` is awaited inline, and the startup orphan sweep heals any run whose
- * last progress snapshot was cut short.
+ * Forks a progress-snapshot write as a child of the run scope, so the fiber is
+ * tracked and torn down with the run (and, transitively, the instance) instead
+ * of leaking as a detached root fiber. Interrupt-on-dispose is safe for these
+ * writes: every `persistRun` is an idempotent full-state upsert that NO-OPs for
+ * a removed run, the terminal write in `finish` is awaited inline, and the
+ * startup orphan sweep heals any run whose last progress snapshot was cut short.
  */
-function persistInScope(scope: Scope.Scope, bridge: EffectBridge.Shape, db: Database.Interface["db"], active: Active) {
-  bridge.fork(persistRun(db, active).pipe(Effect.forkIn(scope)))
+function persistInScope(active: Active, bridge: EffectBridge.Shape, db: Database.Interface["db"]) {
+  bridge.fork(persistRun(db, active).pipe(Effect.forkIn(active.runScope)))
 }
 
 /**
@@ -476,6 +525,21 @@ function isCancelled(value: unknown): boolean {
     value instanceof CancelledError ||
     (typeof value === "object" && value !== null && Reflect.get(value, "_tag") === "WorkflowCancelledError")
   )
+}
+
+// Fund 4: the production session runner RESOLVES a prompt on abort (it returns
+// the last assistant message rather than rejecting), and that message carries
+// an abort marker — either an `aborted` flag or a `MessageAbortedError` error
+// (see message-v2.ts `fromError` / v1 `AbortedError`). An agent step whose
+// prompt came back abort-marked did NOT succeed and must be treated as
+// cancelled, never flipped to `completed`. Tolerant of the loose `WithParts`
+// shape the engine sees (it only reads `info`).
+function isAbortedMessage(message: SessionV1.WithParts): boolean {
+  const info = message.info as { aborted?: boolean; error?: { name?: string } } | undefined
+  if (!info) return false
+  if (info.aborted === true) return true
+  const name = info.error?.name
+  return name === "MessageAbortedError" || name === "AbortError"
 }
 
 function mutableMeta(meta: Meta): Definition["meta"] {
@@ -641,11 +705,18 @@ function createContext(input: {
   persist: () => void
   /** AbortSignal of the run fiber; fires when the run is interrupted/cancelled. */
   signal: () => AbortSignal | undefined
-  /** Bridge used to run the task/step graph via Effect.forEach concurrency. */
-  bridge: EffectBridge.Shape
+  /**
+   * Runs the parallel/pipeline task graph as a child of the run scope (not as a
+   * detached root fiber): closing the run scope on cancel/remove propagates
+   * Interrupt into the in-flight graph. An interrupted graph rejects as
+   * CancelledError so the workflow body unwinds as `cancelled`.
+   */
+  dispatch: <A>(effect: Effect.Effect<A, unknown>) => Promise<A>
 }): ContextApi {
   const checkpoint = () => {
-    if (input.signal()?.aborted) throw new CancelledError()
+    // Also treat a landed cancel as an abort even before the run fiber's signal
+    // has been observed, so a follow-up step is gated the moment cancel started.
+    if (input.signal()?.aborted || input.active.cancelling) throw new CancelledError()
   }
   return {
     // Live remaining budget (USD), read on every access so a workflow can
@@ -667,11 +738,11 @@ function createContext(input: {
       const concurrency = Math.max(1, options?.concurrencyLimit ?? 20)
       // Each task is gated by the run's abort signal via checkpoint() before it
       // starts: once cancel has fired, not-yet-started tasks throw CancelledError
-      // and never run. Note: a task already in flight is NOT force-interrupted —
-      // it runs to completion (or, if it is an agent step, is aborted for real
-      // via PromptOps.cancel on its child session). This is deliberate: the
-      // bridge runs each task as its own root fiber, not a child of active.fiber.
-      return input.bridge.promise(
+      // and never run. The whole batch runs as a child of the run scope (via
+      // dispatch), so a cancel/remove that closes the run scope ALSO interrupts
+      // tasks already in flight — and each agent task additionally aborts its
+      // child session for real via PromptOps.cancel.
+      return input.dispatch(
         Effect.forEach(
           tasks,
           (task) =>
@@ -702,11 +773,11 @@ function createContext(input: {
       // No barrier between stages: each ITEM runs the full stage SEQUENCE as its
       // own Effect, and items run under Effect.forEach concurrency — so item B may
       // be in stage 2 while item A is still in stage 1. checkpoint() gates before
-      // each stage so the next stage never starts after cancel; a stage already in
-      // flight runs to completion (agent stages are additionally aborted for real
-      // via PromptOps.cancel) — the bridge runs the work as a root fiber, not a
-      // child of active.fiber, so interruption does not propagate down the tree.
-      return input.bridge.promise(
+      // each stage so the next stage never starts after cancel. The whole graph
+      // runs as a child of the run scope (via dispatch), so a cancel/remove that
+      // closes the run scope interrupts stages already in flight too; agent
+      // stages additionally abort their child session for real via PromptOps.cancel.
+      return input.dispatch(
         Effect.forEach(
           items,
           (item) =>
@@ -874,9 +945,25 @@ export const layer = Layer.effect(
           node.error ??= status === "cancelled" ? "Cancelled" : "Workflow failed"
         }
       }
-      yield* persistRun(db, active)
-      yield* Deferred.succeed(active.done, snapshot(active)).pipe(Effect.ignore)
-      return snapshot(active)
+      // N2: resolve the `done` deferred BEFORE the terminal persist, and never
+      // let a persist failure swallow that resolve. `persistRun` is `orDie`, so
+      // a DB error on the terminal write used to kill the finish fiber and the
+      // deferred was never resolved — every no-timeout `wait()` (and background
+      // jobs) then hung forever. Resolving first guarantees waiters always see
+      // the terminal state; the persist is then best-effort (a cut-short
+      // terminal write is healed by the startup orphan sweep on next restart).
+      const result = snapshot(active)
+      yield* Deferred.succeed(active.done, result).pipe(Effect.ignore)
+      yield* persistRun(db, active, { terminal: true }).pipe(Effect.ignore)
+      // Free the per-run scope now that the run is terminal so it does not linger
+      // (one empty child scope per run) on the instance scope until teardown. By
+      // the time finish runs the body fiber has exited and all dispatched agent
+      // fibers have settled, so this interrupts nothing live; on the cancel/remove
+      // path abortRun already closed it and a second close is a no-op. Forked so a
+      // finalizer cannot delay the terminal return.
+      const inst = yield* InstanceState.get(state)
+      yield* Scope.close(active.runScope, Exit.void).pipe(Effect.ignore, Effect.forkIn(inst.scope))
+      return result
     })
 
     const start: Interface["start"] = Effect.fn("Workflow.start")(function* (input) {
@@ -900,6 +987,11 @@ export const layer = Layer.effect(
       const started_at = yield* Clock.currentTimeMillis
       const session = yield* sessions.create({ title: `Workflow: ${module.meta.name}` })
       const done = yield* Deferred.make<Run>()
+      // Per-run scope forked from the instance scope. ALL agent/parallel/pipeline
+      // work and all progress writes are forked into it (not into a detached
+      // root fiber), so closing it on cancel/remove propagates Interrupt to the
+      // in-flight agent graph; the instance teardown closes it transitively.
+      const runScope = yield* Scope.fork(inst.scope)
       const active: Active = {
         run: {
           id,
@@ -919,6 +1011,7 @@ export const layer = Layer.effect(
           agents: [],
         },
         done,
+        runScope,
         sessions: new Set<string>(),
         cancelSession: input.prompt?.cancel,
         // Unset budget ⇒ Infinity ⇒ the gate never trips and the decrement is a
@@ -952,8 +1045,27 @@ export const layer = Layer.effect(
       // on Fiber.interrupt. Read by ctx.agent/parallel/pipeline for gating.
       let runSignal: AbortSignal | undefined
 
+      // Runs an effect as a CHILD of the run scope and awaits it as a promise.
+      // Unlike `bridge.promise` (a detached root fiber via Effect.runPromise),
+      // the work is forked into `runScope`, so closing the scope on cancel/remove
+      // interrupts it. An interrupt-only outcome (the scope was closed) is
+      // surfaced as a CancelledError rejection so the workflow body unwinds as
+      // `cancelled`; any other failure is rejected with its representative error.
+      const dispatch = <A>(effect: Effect.Effect<A, unknown>): Promise<A> =>
+        bridge.promise(
+          Effect.gen(function* () {
+            const fiber = yield* Effect.forkIn(effect, runScope)
+            const exit = yield* Fiber.await(fiber)
+            if (Exit.isSuccess(exit)) return exit.value
+            if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.die(new CancelledError())
+            return yield* Effect.failCause(exit.cause)
+          }),
+        )
+
       const agent = async (agentInput: AgentInput) => {
-        if (runSignal?.aborted) throw new CancelledError()
+        // Gate the step: a fired run signal OR a landed cancel both mean the run
+        // is unwinding, so refuse to start another agent step (Fund 5/4).
+        if (runSignal?.aborted || active.cancelling || active.removed) throw new CancelledError()
         // Budget gate — ordered right AFTER the abort-signal checkpoint so a
         // cancelled run still unwinds as `cancelled` (not `failed`) before any
         // budget verdict is reached. `Infinity` (no budget set) never trips.
@@ -978,11 +1090,10 @@ export const layer = Layer.effect(
           prompt: agentInput.prompt,
         }
         active.run.agents.push(node)
-        persistInScope(inst.scope, bridge, db, active)
+        persistInScope(active, bridge, db)
         const prompt = input.prompt
         if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
-        return bridge
-          .promise(
+        return dispatch(
             Effect.gen(function* () {
               const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
               const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
@@ -997,6 +1108,15 @@ export const layer = Layer.effect(
               node.session_id = session.id
               // Track the child session so cancel()/remove() can abort it.
               active.sessions.add(session.id)
+              // Fund 16: a cancel may have landed in the window between the start
+              // gate above and registering this session. Self-abort the freshly
+              // created session if so, instead of relying on a one-shot snapshot
+              // in abortRun that could miss it. The scope-close path will also
+              // interrupt this fiber, but aborting the session here stops the
+              // model spend deterministically and is idempotent.
+              if (active.cancelling || active.removed) {
+                if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
+              }
               yield* persistRun(db, active)
               const message = yield* prompt.prompt({
                 sessionID: session.id,
@@ -1011,6 +1131,15 @@ export const layer = Layer.effect(
                 node.model = `${message.info.providerID}/${message.info.modelID}`
                 node.cost = message.info.cost
                 node.tokens = message.info.tokens
+              }
+              // Fund 4: the production runner RESOLVES (does not reject) when a
+              // session is aborted — it returns the last assistant message, which
+              // carries an abort/cancelled error. If the run is cancelling/removed
+              // OR the message itself is abort-marked, this step did not succeed:
+              // fail it as cancelled so the body unwinds as `cancelled` and the
+              // settlement callbacks below never flip the node to `completed`.
+              if (active.cancelling || active.removed || isAbortedMessage(message)) {
+                return yield* Effect.die(new CancelledError())
               }
               const structured = message.info.role === "assistant" ? message.info.structured : undefined
               // A schema was requested ⇒ a structured result is mandatory. When the
@@ -1049,9 +1178,12 @@ export const layer = Layer.effect(
                   // — the SAME `cost` (USD) the dashboard shows, set on the node
                   // from the assistant message above. Done in `ensuring` (not the
                   // success branch) so failed-but-paid steps (e.g. a structured-
-                  // output failure that still incurred model cost) and interrupted
-                  // steps are charged too. A step with no cost (cost undefined)
-                  // leaves the budget untouched; an unset budget stays Infinity.
+                  // output failure that still incurred model cost) are charged too.
+                  // EXCEPT a cancelled run: an abort-resolved step did not produce
+                  // a real result and must not be charged (Fund 4) — and any cost
+                  // on an aborted message is the abort artifact, not real spend.
+                  // A step with no cost leaves the budget untouched; unset stays Infinity.
+                  if (active.cancelling || active.removed) return
                   active.budgetRemaining -= node.cost ?? 0
                 }),
               ),
@@ -1059,20 +1191,46 @@ export const layer = Layer.effect(
           )
           .then(
             (result) => {
+              // Settlement guard (Fund 4): once the run is cancelling/removed or
+              // already terminal, the success branch is a NO-OP for the node and
+              // emits NO further write. Otherwise a resolve-on-abort step (the
+              // production runner resolves on abort) would flip a cancelled node
+              // to `completed` and re-persist after the awaited terminal write.
+              if (active.cancelling || active.removed || active.run.status !== "running") {
+                throw new CancelledError()
+              }
               node.status = "completed"
               node.completed_at = Date.now()
               node.output = result.text
-              persistInScope(inst.scope, bridge, db, active)
+              persistInScope(active, bridge, db)
               return result
             },
             (error) => {
+              // Same guard on the failure path: do not mutate/persist the node
+              // for a run that has already moved to (or is moving to) terminal —
+              // finish() owns the node's terminal state in that case.
+              if (active.cancelling || active.removed || active.run.status !== "running") {
+                return Promise.reject(error)
+              }
               node.status = "failed"
               node.completed_at = Date.now()
               node.error = errorText(error)
-              persistInScope(inst.scope, bridge, db, active)
+              persistInScope(active, bridge, db)
               return Promise.reject(error)
             },
           )
+      }
+
+      // Fund 5 (TOCTOU): a cancel/remove can land during the startup window —
+      // after the run was registered but before the body fiber exists. In that
+      // window abortRun set `cancelling`/closed the run scope and finish() already
+      // moved the row to `cancelled`. Forking the body anyway would run the whole
+      // workflow (burning tokens) under a row that already reports `cancelled`.
+      // Re-check here and skip the fork entirely if a cancel has landed: the run
+      // stays cancelled and the body never runs.
+      if (active.cancelling || active.removed || active.run.status !== "running") {
+        yield* Deferred.succeed(active.done, snapshot(active)).pipe(Effect.ignore)
+        return snapshot(active)
       }
 
       active.fiber = yield* Effect.promise((signal) => {
@@ -1082,9 +1240,9 @@ export const layer = Layer.effect(
           createContext({
             active,
             agent,
-            persist: () => void persistInScope(inst.scope, bridge, db, active),
+            persist: () => void persistInScope(active, bridge, db),
             signal: () => runSignal,
-            bridge,
+            dispatch,
           }),
         )
       }).pipe(
@@ -1096,7 +1254,7 @@ export const layer = Layer.effect(
             // error either way, so `isCancelled(squash)` catches both.
             finish(
               id,
-              active.cancelling || Cause.hasInterruptsOnly(cause) || isCancelled(Cause.squash(cause))
+              active.cancelling || active.removed || Cause.hasInterruptsOnly(cause) || isCancelled(Cause.squash(cause))
                 ? "cancelled"
                 : "failed",
               { error: errorText(Cause.squash(cause)) },
@@ -1136,19 +1294,24 @@ export const layer = Layer.effect(
       return { run: snapshot(active), timedOut: true }
     })
 
-    // Two-stage cancel. (1) Interrupt the run fiber: this fires its AbortSignal,
-    // which makes checkpoint() throw CancelledError before the NEXT ctx step, so
-    // no follow-up step starts. It does NOT reach the in-flight agent — that runs
-    // as a detached root fiber via bridge.promise, not a child of active.fiber.
-    // (2) Abort every tracked child agent session via PromptOps.cancel; that is
-    // what actually stops the in-flight agent (same path as TUI Esc / HTTP abort)
-    // and unblocks its promise so module.run can unwind and the fiber completes.
-    // Only after both do we await the fiber.
+    // Race-free cancel. The order matters and every step is idempotent.
+    // (0) Set `cancelling` FIRST — unconditionally, even when there is no fiber
+    //     yet (startup window, Fund 5): the gates in agent()/checkpoint() and the
+    //     settlement guards all key off it, and start() re-checks it before
+    //     forking the body, so a cancel that lands during startup still wins.
+    // (1) Abort every tracked child agent session via PromptOps.cancel from a
+    //     LIVE view of `active.sessions` (not a one-shot snapshot, Fund 16): this
+    //     is what actually stops the in-flight agent (same path as TUI Esc / HTTP
+    //     abort); the production runner then RESOLVES the prompt and the agent
+    //     step is recognised as cancelled. Sessions registered during this window
+    //     additionally self-abort in agent() because `cancelling` is already set.
+    // (2) Close the run scope: this propagates Interrupt into EVERY agent/parallel/
+    //     pipeline fiber forked into it (Fund 14) — including ones started but not
+    //     yet session-registered (Fund 16) and ones that have no cancel vector
+    //     (Fund 50, where the scope close is the only thing that stops them).
+    // (3) Interrupt the run fiber so checkpoint() unwinds the body, then await it.
     const abortRun = Effect.fn("Workflow.abortRun")(function* (active: Active) {
-      if (!active.fiber) return
       active.cancelling = true
-      const scope = (yield* InstanceState.get(state)).scope
-      const interrupted = yield* Fiber.interrupt(active.fiber).pipe(Effect.forkIn(scope))
       const cancelSession = active.cancelSession
       if (cancelSession) {
         yield* Effect.forEach([...active.sessions], (sessionID) => cancelSession(SessionID.make(sessionID)), {
@@ -1156,8 +1319,17 @@ export const layer = Layer.effect(
           discard: true,
         }).pipe(Effect.ignore)
       }
-      yield* Fiber.await(interrupted).pipe(Effect.ignore)
-      yield* Fiber.await(active.fiber).pipe(Effect.ignore)
+      // Closing the run scope interrupts all dispatched agent work; it is safe to
+      // close even with no live fiber (startup window). Forked so a slow finalizer
+      // cannot wedge cancel.
+      const scope = (yield* InstanceState.get(state)).scope
+      const closed = yield* Scope.close(active.runScope, Exit.void).pipe(Effect.ignore, Effect.forkIn(scope))
+      const interrupted = active.fiber
+        ? yield* Fiber.interrupt(active.fiber).pipe(Effect.forkIn(scope))
+        : undefined
+      if (interrupted) yield* Fiber.await(interrupted).pipe(Effect.ignore)
+      yield* Fiber.await(closed).pipe(Effect.ignore)
+      if (active.fiber) yield* Fiber.await(active.fiber).pipe(Effect.ignore)
     })
 
     const cancel: Interface["cancel"] = Effect.fn("Workflow.cancel")(function* (id) {
@@ -1171,9 +1343,16 @@ export const layer = Layer.effect(
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
       const inst = yield* InstanceState.get(state)
       const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
-      // A running run is cancelled first (interrupt + abort agent sessions) so
-      // delete cannot block on the in-flight run and no agent keeps running.
-      if (active?.fiber) {
+      // A registered run is cancelled first (abort agent sessions + close the run
+      // scope + interrupt the fiber) so delete cannot block on in-flight work and
+      // no agent keeps running.
+      if (active) {
+        // Fund 3: set the tombstone BEFORE the delete. abortRun closes the run
+        // scope, which interrupts dispatched agent fibers; their settlement
+        // writes are forked into that same scope and may run AFTER the delete.
+        // `persistRun` checks `removed` at execution time and NO-OPs, so a late
+        // write can never re-INSERT (resurrect) the row.
+        active.removed = true
         yield* abortRun(active)
         yield* finish(id, "cancelled").pipe(Effect.ignore)
       }
