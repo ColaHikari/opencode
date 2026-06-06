@@ -1084,7 +1084,16 @@ export function Prompt(props: PromptProps) {
         const infos = await listWorkflowInfos(sdk.client.workflow, true)
         const declaration = infos.find((info) => info.name === name)?.meta.arguments ?? {}
         void sdk.client.workflow
-          .start({ name, workflowStartPayload: { args: parseWorkflowArgs(workflowCommand.args, declaration) } })
+          // Fund 35: route the start's permission prompts (the workflow gate and any
+          // agent-step asks) to the ACTIVE session so they surface here in the TUI,
+          // instead of an orphaned session the user is not looking at.
+          .start({
+            name,
+            workflowStartPayload: {
+              args: parseWorkflowArgs(workflowCommand.args, declaration),
+              permissionSessionID: sessionID,
+            },
+          })
           .then((result) => {
             if (!result.data) {
               toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })

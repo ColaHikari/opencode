@@ -14,6 +14,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import * as Tool from "./tool"
 import { trimDiff } from "./edit"
 import { Workflow } from "@/workflow/workflow"
+import { MetaReader } from "@/workflow/meta-reader"
 
 const WORKFLOW_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT = 60 * 60 * 1000
@@ -620,6 +621,11 @@ export const WorkflowTool = Tool.define(
           if (params.action === "create") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=create"))
             if (!params.source) return yield* Effect.fail(new Error("source is required for action=create"))
+            // Fund 8 (security): the same name-sanitization start uses (N15/3b) gates
+            // the workflow permission pattern below, so a glob-metacharacter name can
+            // never produce an over-broad `always` rule. workflowPath sanitizes too,
+            // so an illegal name fails identically on either path.
+            const safeName = sanitizeWorkflowName(params.name)
             const instance = yield* InstanceState.context
             const filepath = workflowPath(projectRoot(instance), params.name)
             yield* assertExternalDirectoryEffect(ctx, filepath)
@@ -629,6 +635,18 @@ export const WorkflowTool = Tool.define(
                 new Error(`Workflow already exists: ${params.name}. Set overwrite=true to replace it.`),
               )
             }
+            // Fund 8 (security, behavior change): creating a workflow writes a
+            // project-local module that a later start will LOAD and execute, so create
+            // is itself a privileged operation. Gate it behind the SAME `workflow`
+            // permission start uses (consistent pattern/`always` shape), in addition to
+            // the `edit` gate for the write. The ask comes BEFORE any write, so a denial
+            // dies before fs.writeWithDirs and the file is never created.
+            yield* ctx.ask({
+              permission: "workflow",
+              patterns: [safeName],
+              always: [safeName],
+              metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
+            })
             const previous = exists ? ((yield* fs.readFileStringSafe(filepath)) ?? "") : ""
             yield* ctx.ask({
               permission: "edit",
@@ -641,19 +659,24 @@ export const WorkflowTool = Tool.define(
             yield* events.publish(FileSystem.Event.Edited, { file: filepath })
             yield* events.publish(Watcher.Event.Updated, { file: filepath, event: exists ? "change" : "add" })
             yield* lsp.touchFile(filepath, "document")
-            const workflows = yield* workflow.list()
-            const info = workflows.find((item) => item.name === params.name)
-            if (!info) return yield* Effect.fail(new Error(`Workflow was written but not discovered: ${params.name}`))
-            // The LLM-generated source may not load (bad meta / missing run /
-            // syntax error). Report that as a failure instead of claiming the file
-            // was "created and validated".
-            if (info.valid === false) {
-              return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
+            // Fund 8 (security): validate the freshly written source STATICALLY via the
+            // meta-reader (AST-only meta extraction). This must never dynamically import
+            // the file — importing would execute the LLM/attacker-authored top-level code
+            // right after the write, the exact root cause Task 3a removed from discovery.
+            // A bad meta (non-literal / schema-invalid / missing) is reported as a precise
+            // load failure instead of claiming the file was "created and validated".
+            const validated = MetaReader.read(params.source, filepath)
+            if (validated.valid === false) {
+              return yield* Effect.fail(new Error(`Invalid workflow ${filepath}: ${validated.error}`))
             }
             return {
               title: `Workflow created: ${params.name}`,
               metadata: { name: params.name, path: filepath, exists },
-              output: ["Workflow file created and validated.", "", formatWorkflow(info)].join("\n"),
+              output: [
+                "Workflow file created and validated.",
+                "",
+                formatWorkflow({ name: params.name, path: filepath, meta: validated.meta, valid: true }),
+              ].join("\n"),
             }
           }
           return yield* Effect.fail(new Error(`Unsupported workflow action: ${params.action}`))
