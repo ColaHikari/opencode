@@ -1,7 +1,8 @@
 import { SessionID } from "@/session/schema"
 import { Workflow } from "@/workflow/workflow"
 import { Schema } from "effect"
-import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiError, OpenApi } from "effect/unstable/httpapi"
+import { ApiNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -23,11 +24,17 @@ export const StartPayload = Schema.Struct({
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
+// 400 for a bad request against a workflow (a workflow file that fails to load:
+// bad meta / missing run / syntax error). `workflow` ALWAYS carries the workflow
+// NAME so a single field has one stable meaning; the failing file's `path` is a
+// separate optional field. (A non-existent workflow name is NOT this error — it
+// is a 404 `ApiNotFoundError`, matching the repo-wide *NotFound → 404 convention.)
 export class WorkflowApiError extends Schema.TaggedErrorClass<WorkflowApiError>()(
   "WorkflowApiError",
   {
     message: Schema.String,
     workflow: Schema.optional(Schema.String),
+    path: Schema.optional(Schema.String),
   },
   { httpApiStatus: 400 },
 ) {}
@@ -47,8 +54,10 @@ export const WorkflowApi = HttpApi.make("workflow")
       .add(
         HttpApiEndpoint.get("list", WorkflowPaths.list, {
           query: WorkspaceRoutingQuery,
+          // No error channel: list() never fails (a broken file becomes an
+          // `{ valid: false }` entry), so declaring an error here would surface a
+          // dead, unreachable 400 in the generated SDK.
           success: described(Schema.Array(Workflow.Info), "List of workflows"),
-          error: WorkflowApiError,
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "workflow.list",
@@ -63,7 +72,8 @@ export const WorkflowApi = HttpApi.make("workflow")
           OpenApi.annotations({
             identifier: "workflow.runs",
             summary: "List workflow runs",
-            description: "List in-memory workflow execution runs for this instance.",
+            description:
+              "List persisted workflow execution runs for this instance, with live in-memory state overlaid for active runs.",
           }),
         ),
         HttpApiEndpoint.get("get", WorkflowPaths.get, {
@@ -72,7 +82,11 @@ export const WorkflowApi = HttpApi.make("workflow")
           // a defect inside the handler.
           params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
-          success: described(Schema.NullOr(Workflow.Run), "Workflow run"),
+          // Id-addressed like the session endpoints: a missing run is a 404, not a
+          // 200 + null. The success body is therefore a bare (non-nullable) Run so
+          // the generated SDK type matches what callers actually receive on 200.
+          success: described(Workflow.Run, "Workflow run"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "workflow.get",
@@ -85,7 +99,10 @@ export const WorkflowApi = HttpApi.make("workflow")
           query: WorkspaceRoutingQuery,
           payload: Schema.optional(StartPayload),
           success: described(Workflow.Run, "Workflow run started"),
-          error: WorkflowApiError,
+          // A bad/broken workflow file is a 400 (WorkflowApiError); an unknown
+          // workflow name is a 404 (ApiNotFoundError), matching the repo-wide
+          // *NotFound → 404 convention.
+          error: [WorkflowApiError, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "workflow.start",
@@ -99,7 +116,12 @@ export const WorkflowApi = HttpApi.make("workflow")
           // a defect inside the handler.
           params: { id: Workflow.RunID },
           query: WorkspaceRoutingQuery,
-          success: described(Schema.NullOr(Workflow.Run), "Workflow run cancelled"),
+          // Id-addressed like the session endpoints: a run that is not known to
+          // this workspace is a 404. A known-but-already-terminal run still
+          // returns 200 with its current snapshot (cancel is idempotent). The
+          // success body is therefore a bare (non-nullable) Run.
+          success: described(Workflow.Run, "Workflow run cancelled"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "workflow.cancel",

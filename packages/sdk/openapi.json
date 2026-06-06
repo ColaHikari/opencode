@@ -6401,6 +6401,10 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "permissionSessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
                   "messageID": {
                     "type": "string",
                     "pattern": "^msg"
@@ -7283,6 +7287,10 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "permissionSessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
                   "messageID": {
                     "type": "string",
                     "pattern": "^msg"
@@ -9898,6 +9906,432 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.workspace.warp({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow": {
+      "get": {
+        "tags": ["workflow"],
+        "operationId": "workflow.list",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of workflows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowInfo"
+                  },
+                  "description": "List of workflows"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "List discovered workflow definitions.",
+        "summary": "List workflows",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.list({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run": {
+      "get": {
+        "tags": ["workflow"],
+        "operationId": "workflow.runs",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of workflow runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRun"
+                  },
+                  "description": "List of workflow runs"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "List persisted workflow execution runs for this instance, with live in-memory state overlaid for active runs.",
+        "summary": "List workflow runs",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.runs({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}": {
+      "get": {
+        "tags": ["workflow"],
+        "operationId": "workflow.get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Get details for a workflow execution run.",
+        "summary": "Get workflow run",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.get({\n  ...\n})"
+          }
+        ]
+      },
+      "delete": {
+        "tags": ["workflow"],
+        "operationId": "workflow.delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "Workflow run deleted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Delete a workflow run from persisted history.",
+        "summary": "Delete workflow run",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.delete({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/{name}/start": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.start",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "WorkflowApiError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkflowApiError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Start a workflow execution run.",
+        "summary": "Start workflow",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowStartPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.start({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}/cancel": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.cancel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run cancelled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Cancel a running workflow execution run.",
+        "summary": "Cancel workflow run",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.cancel({\n  ...\n})"
           }
         ]
       }
@@ -20348,6 +20782,372 @@
         "required": ["name", "data"],
         "additionalProperties": false
       },
+      "WorkflowArgument": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "default": {},
+          "description": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkflowMeta": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "phases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "arguments": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/WorkflowArgument"
+            }
+          }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      },
+      "WorkflowInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/WorkflowMeta"
+          },
+          "valid": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": ["name", "path", "meta", "valid"],
+        "additionalProperties": false
+      },
+      "WorkflowDefinition": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/WorkflowMeta"
+          },
+          "source": {
+            "type": "string"
+          },
+          "temporary": {
+            "type": "boolean"
+          }
+        },
+        "required": ["name", "path", "meta"],
+        "additionalProperties": false
+      },
+      "WorkflowLogEntry": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          },
+          "phase": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["time", "message"],
+        "additionalProperties": false
+      },
+      "WorkflowAgentRun": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["running", "completed", "failed"]
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          },
+          "phase": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          },
+          "cost": {
+            "type": "number"
+          },
+          "tokens": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "number"
+              },
+              "input": {
+                "type": "number"
+              },
+              "output": {
+                "type": "number"
+              },
+              "reasoning": {
+                "type": "number"
+              },
+              "cache": {
+                "type": "object",
+                "properties": {
+                  "read": {
+                    "type": "number"
+                  },
+                  "write": {
+                    "type": "number"
+                  }
+                },
+                "required": ["read", "write"],
+                "additionalProperties": false
+              }
+            },
+            "required": ["input", "output", "reasoning", "cache"],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": ["id", "status", "started_at", "prompt"],
+        "additionalProperties": false
+      },
+      "WorkflowRun": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^job"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "args": {
+            "type": "object"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/WorkflowDefinition"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["running", "completed", "failed", "cancelled", "interrupted"]
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          },
+          "current_phase": {
+            "type": "string"
+          },
+          "logs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowLogEntry"
+            }
+          },
+          "agents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowAgentRun"
+            }
+          },
+          "result": {},
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": ["id", "workflow", "status", "started_at", "logs", "agents"],
+        "additionalProperties": false
+      },
+      "WorkflowStartPayload": {
+        "type": "object",
+        "properties": {
+          "args": {
+            "type": "object"
+          },
+          "budget": {
+            "type": "number",
+            "minimum": 0
+          },
+          "permissionSessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkflowApiError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["WorkflowApiError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
       "UnauthorizedError": {
         "type": "object",
         "properties": {
@@ -28609,6 +29409,10 @@
     {
       "name": "workspace",
       "description": "Experimental HttpApi workspace routes."
+    },
+    {
+      "name": "workflow",
+      "description": "Workflow routes."
     },
     {
       "name": "opencode experimental HttpApi",
