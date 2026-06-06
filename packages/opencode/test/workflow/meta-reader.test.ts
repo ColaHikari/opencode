@@ -127,4 +127,63 @@ export async function run(args, ctx) { return { ok: true } }
       n: { type: "number", default: -3 },
     })
   })
+
+  test("`as const` on the whole meta and on a nested array is extracted (idiomatic TS)", () => {
+    const source = `export const meta = {
+  name: "Const",
+  phases: ["a", "b"] as const,
+  arguments: { x: { type: "string" } }
+} as const
+export async function run(args, ctx) { return { ok: true } }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(true)
+    if (!result.valid) throw new Error("expected valid")
+    expect(result.meta.name).toBe("Const")
+    expect(result.meta.phases).toEqual(["a", "b"])
+    expect(result.meta.arguments).toEqual({ x: { type: "string" } })
+  })
+
+  test("`satisfies` and parenthesized expressions are unwrapped transparently", () => {
+    const source = `export const meta = ({
+  name: "Sat",
+  phases: (["one"]) satisfies readonly string[]
+}) satisfies Record<string, unknown>
+export async function run(args, ctx) { return { ok: true } }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(true)
+    if (!result.valid) throw new Error("expected valid")
+    expect(result.meta.name).toBe("Sat")
+    expect(result.meta.phases).toEqual(["one"])
+  })
+
+  test("more than one default export is reported invalid (ambiguous)", () => {
+    const source = `export default { meta: { name: "First" }, run() {} }
+export default { meta: { name: "Second" }, run() {} }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error("expected invalid")
+    expect(result.error).toBeTruthy()
+  })
+
+  test("a syntax-error file is reported invalid, never crashes", () => {
+    const source = `export const meta = {`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error("expected invalid")
+    expect(result.error).toBeTruthy()
+  })
+
+  test("a template string WITH substitution in meta is reported invalid", () => {
+    const source = `const suffix = "x"
+export const meta = { name: \`Hello-\${suffix}\` }
+export async function run(args, ctx) { return { ok: true } }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error("expected invalid")
+    expect(result.error).toContain("statically analyzable")
+  })
 })
