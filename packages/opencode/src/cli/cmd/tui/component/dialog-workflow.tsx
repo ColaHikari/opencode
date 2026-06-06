@@ -10,32 +10,25 @@ import { useToast } from "@tui/ui/toast"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useBindings } from "../keymap"
+import { DialogConfirm } from "../ui/dialog-confirm"
 import * as Clipboard from "../util/clipboard"
 import { getScrollAcceleration } from "../util/scroll"
+import {
+  formatPhase,
+  formatShortElapsed,
+  phaseIcon,
+  phaseStatus,
+  reanchorSelection,
+  spentThisMonth,
+  statusIcon,
+  timestamp,
+} from "./dialog-workflow-helpers"
 
-type WorkflowData = {
-  workflows: WorkflowInfo[]
-  runs: WorkflowRun[]
-}
-
-function timestamp(value: unknown) {
-  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN
-  return Number.isFinite(parsed) ? parsed : undefined
-}
+// Re-exported so existing pure derivations keep a single import surface.
+export { phaseStatus } from "./dialog-workflow-helpers"
 
 function formatShortDuration(run: WorkflowRun) {
   return formatShortElapsed(run.started_at, run.completed_at)
-}
-
-function formatShortElapsed(started_at: unknown, completed_at?: unknown) {
-  const start = timestamp(started_at)
-  if (!start) return "--"
-  const seconds = Math.max(0, Math.floor(((timestamp(completed_at) ?? Date.now()) - start) / 1000))
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m${(seconds % 60).toString().padStart(2, "0")}s`
-  return `${Math.floor(seconds / 3600)}h${Math.floor((seconds % 3600) / 60)
-    .toString()
-    .padStart(2, "0")}m`
 }
 
 function formatStartedShort(value: unknown) {
@@ -48,14 +41,14 @@ function formatStartedShort(value: unknown) {
     .padStart(2, "0")}:${date.getMinutes().toString().padStart(2, "0")}`
 }
 
-function statusIcon(status: WorkflowRun["status"]) {
-  if (status === "running") return "●"
-  if (status === "completed") return "✔"
-  if (status === "failed") return "✖"
-  // `interrupted` is a failure-like terminal state (orphaned/zombie run), shown
-  // with a distinct broken-circle marker so it reads apart from a clean cancel.
-  if (status === "interrupted") return "⊘"
-  return "◌"
+function formatLogTime(value: unknown) {
+  const time = timestamp(value)
+  if (time === undefined) return "--:--:--"
+  const date = new Date(time)
+  return `${date.getHours().toString().padStart(2, "0")}:${date.getMinutes().toString().padStart(2, "0")}:${date
+    .getSeconds()
+    .toString()
+    .padStart(2, "0")}`
 }
 
 function agentIcon(status: WorkflowRun["agents"][number]["status"]) {
@@ -82,14 +75,6 @@ export function agentEffectiveEnd(run: WorkflowRun, agent: WorkflowRun["agents"]
   return agent.completed_at ?? (run.status !== "running" ? run.completed_at : undefined)
 }
 
-function formatPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
-  if (run.status !== "running") return "[---] complete"
-  const phases = workflow?.meta.phases ?? []
-  if (!run.current_phase || phases.length === 0) return run.current_phase ?? "pending"
-  const index = phases.indexOf(run.current_phase)
-  return `[${index >= 0 ? index + 1 : "?"}/${phases.length}] ${run.current_phase}`
-}
-
 function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
   const phases = workflow?.meta.phases?.length
     ? workflow.meta.phases
@@ -101,38 +86,6 @@ function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
         ]),
       )
   return phases.length ? phases : [run.status === "completed" ? "complete" : (run.current_phase ?? "pending")]
-}
-
-// N5: the engine never advances/clears `current_phase` at completion (only
-// `setPhase` writes it), so a run that finished on a non-last declared phase
-// (common: meta.phases declares more phases than the body walks) left every
-// later phase rendering as `pending` forever on a terminal run. A terminal run
-// will NEVER reach those phases, so they are reported `skipped` (a distinct,
-// non-live rendering) rather than the misleading `pending`. This is purely a
-// derived TUI view — the engine row is untouched, so the persisted lifecycle
-// stays honest (no synthetic "current_phase = last" lie).
-export function phaseStatus(run: WorkflowRun, phases: readonly string[], phase: string) {
-  const current = run.current_phase ? phases.indexOf(run.current_phase) : -1
-  const index = phases.indexOf(phase)
-  if (run.status === "running") {
-    if (index < current) return "completed"
-    if (index === current) return "running"
-    return "pending"
-  }
-  if (index < current || (run.status === "completed" && (current === -1 || index <= current))) return "completed"
-  if (index === current) return run.status
-  // A phase after the one the terminal run stopped on was never reached.
-  return "skipped"
-}
-
-function phaseIcon(status: ReturnType<typeof phaseStatus>) {
-  if (status === "completed") return "✔"
-  if (status === "running") return "●"
-  if (status === "failed") return "✖"
-  if (status === "interrupted") return "⊘"
-  // `skipped` (never-reached phase on a terminal run) and `pending` both read as
-  // the hollow marker — neither is live; `skipped` simply will never advance.
-  return "◌"
 }
 
 function runUsage(run: WorkflowRun) {
@@ -310,10 +263,16 @@ function dashboardPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
   return formatPhase(run, workflow)
 }
 
+// Funds 57, 58: the STATUS cell must fit "⊘ interrupt" (icon + space + the 9-char
+// "interrupt" label) without truncation, so the cell is 11 wide and the layout
+// budget reserves 12 for it (cell + its separator space). Previously the cell was
+// 8 wide and "interrupt" was clipped to "interr…".
+const STATUS_WIDTH = 11
+
 function dashboardWidths(width: number) {
   const total = Math.min(width, 150)
   const phase = total < 104 ? 8 : 12
-  const fixed = 2 + 10 + 8 + 11 + 7 + phase + 8 + 8
+  const fixed = 2 + 10 + (STATUS_WIDTH + 1) + 11 + 7 + phase + 8 + 8
   const available = Math.max(28, total - fixed)
   const workflow = Math.min(26, Math.max(14, Math.floor(available * 0.38)))
   return { workflow, phase, input: Math.max(14, available - workflow), total }
@@ -353,7 +312,7 @@ function dashboardRowText(
       fitCell(input.marker, 2),
       fitCell(input.id, 10),
       fitCell(input.workflow, columns.workflow),
-      fitCell(input.status, 8),
+      fitCell(input.status, STATUS_WIDTH),
       fitCell(input.started, 12),
       fitCell(input.duration, 7),
       fitCell(input.phase, columns.phase),
@@ -382,45 +341,47 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   const dimensions = useTerminalDimensions()
   dialog.setSize("fullscreen")
 
-  const [store, setStore] = createStore({ selected: 0 })
+  // Selection is anchored on a run.id, not an index: the runs list re-sorts on
+  // every poll, so a positional selection would silently jump to a different run.
+  const [store, setStore] = createStore({ selected: 0, selectedID: "" })
   let scroll: ScrollBoxRenderable | undefined
 
-  const [data, { refetch }] = createResource(async (): Promise<WorkflowData> => {
-    const [workflows, runs] = await Promise.all([sdk.client.workflow.list(), sdk.client.workflow.runs()])
-    return {
-      workflows: workflows.data ?? [],
-      runs: (runs.data ?? []).toSorted((a, b) => (timestamp(b.started_at) ?? 0) - (timestamp(a.started_at) ?? 0)),
-    }
+  // N17: workflow.list() is the static definition discovery and only changes when
+  // files change, so it is fetched once on open (and on explicit refresh) rather
+  // than re-run every second. Only the runs are polled.
+  const [workflowsResource, { refetch: refetchWorkflows }] = createResource(async () => {
+    const result = await sdk.client.workflow.list()
+    return result.data ?? []
   })
-  const runs = createMemo(() => data()?.runs ?? [])
-  const workflows = createMemo(() => data()?.workflows ?? [])
+  const [runsResource, { refetch }] = createResource(async () => {
+    const result = await sdk.client.workflow.runs()
+    return (result.data ?? []).toSorted((a, b) => (timestamp(b.started_at) ?? 0) - (timestamp(a.started_at) ?? 0))
+  })
+  const runs = createMemo(() => runsResource() ?? [])
+  const workflows = createMemo(() => workflowsResource() ?? [])
   const selected = createMemo(() => runs()[store.selected])
   const activeWorkers = createMemo(() => runs().filter((run) => run.status === "running").length)
   const tableWidth = createMemo(() => Math.max(40, dimensions().width - 5))
-  const spentThisMonth = createMemo(() => {
-    const start = new Date()
-    start.setDate(1)
-    start.setHours(0, 0, 0, 0)
-    const end = new Date(start)
-    end.setMonth(end.getMonth() + 1)
-    return runs()
-      .filter((run) => {
-        const started = Number(run.started_at)
-        return Number.isFinite(started) && started >= start.getTime() && started < end.getTime()
-      })
-      .reduce((total, run) => total + run.agents.reduce((sum, agent) => sum + (agent.cost ?? 0), 0), 0)
-  })
+  const monthlySpend = createMemo(() => spentThisMonth(runs()))
 
+  // Fund 10: re-anchor the selection to the row that still carries the previously
+  // selected id after each re-sort, clamping when that run is gone (e.g. deleted).
   createEffect(() => {
-    if (store.selected >= runs().length) setStore("selected", Math.max(0, runs().length - 1))
+    const next = reanchorSelection(store.selectedID || selected()?.id, runs())
+    if (next !== store.selected) setStore("selected", next)
+    const id = runs()[next]?.id ?? ""
+    if (id !== store.selectedID) setStore("selectedID", id)
   })
 
   let openedInitial = false
   createEffect(() => {
     if (openedInitial) return
     if (!props?.openRunID) return
+    // N18: a deep-link must open the run even when no workflow definitions are
+    // discovered (the run itself is enough); previously the missing-definitions
+    // guard made the deep-link silently fail.
     const run = runs().find((item) => item.id === props.openRunID)
-    if (!run || workflows().length === 0) return
+    if (!run) return
     openedInitial = true
     dialog.replace(
       () => (
@@ -452,9 +413,15 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     if (runs().length === 0) return
     const next = Math.max(0, Math.min(runs().length - 1, store.selected + direction))
     setStore("selected", next)
+    setStore("selectedID", runs()[next]?.id ?? "")
     if (!scroll) return
     if (next < scroll.scrollTop) scroll.scrollBy(next - scroll.scrollTop)
     if (next >= scroll.scrollTop + scroll.height) scroll.scrollBy(next - scroll.scrollTop - scroll.height + 1)
+  }
+
+  function selectIndex(index: number) {
+    setStore("selected", index)
+    setStore("selectedID", runs()[index]?.id ?? "")
   }
 
   function openSelected() {
@@ -481,16 +448,31 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       .catch(toast.error)
   }
 
-  function deleteSelected() {
+  // Fund 10 (behavior change): deleting a run from history is irreversible, so it
+  // now asks for confirmation first. DialogConfirm.show replaces the dashboard, so
+  // the dashboard is re-opened afterwards whichever way the prompt resolves.
+  async function deleteSelected() {
     const run = selected()
     if (!run) return
-    void sdk.client.workflow
+    const reopen = () => dialog.replace(() => <DialogWorkflow />, undefined, { notifyClose: false })
+    const confirmed = await DialogConfirm.show(
+      dialog,
+      "Delete workflow run",
+      `Delete run ${shortRunID(run)} (${run.workflow}) from history? This cannot be undone.`,
+      "keep",
+    )
+    if (!confirmed) {
+      reopen()
+      return
+    }
+    sdk.client.workflow
       .delete({ id: run.id })
-      .then(() => {
-        toast.show({ message: `Deleted workflow ${run.id}`, variant: "info" })
+      .then(() => toast.show({ message: `Deleted workflow ${run.id}`, variant: "info" }))
+      .catch(toast.error)
+      .finally(() => {
+        reopen()
         void refetch()
       })
-      .catch(toast.error)
   }
 
   useBindings(() => ({
@@ -498,8 +480,9 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       { key: "up,k", desc: "Previous workflow run", group: "Workflow", cmd: () => move(-1) },
       { key: "down,j", desc: "Next workflow run", group: "Workflow", cmd: () => move(1) },
       { key: "return", desc: "View workflow details", group: "Workflow", cmd: openSelected },
+      { key: "r", desc: "Refresh workflows", group: "Workflow", cmd: () => void refetchWorkflows() },
       { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancelSelected },
-      { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: deleteSelected },
+      { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => void deleteSelected() },
       { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => dialog.clear() },
     ],
   }))
@@ -565,7 +548,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                 paddingLeft={1}
                 paddingRight={1}
                 backgroundColor={active() ? theme.primary : undefined}
-                onMouseDown={() => setStore("selected", index())}
+                onMouseDown={() => selectIndex(index())}
                 onMouseUp={openSelected}
               >
                 <text fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
@@ -593,10 +576,10 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       <text fg={theme.textMuted}>{"─".repeat(tableWidth())}</text>
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.textMuted}>
-          Spent this month: {formatCost(spentThisMonth())} | Active Background Workers: {activeWorkers()}
+          Spent this month: {formatCost(monthlySpend())} | Active Background Workers: {activeWorkers()}
         </text>
         <text fg={theme.textMuted}>
-          [Enter] View Details | [X] Kill workflow run | [D] Delete history | [Esc]/[B] Exit
+          [Enter] View Details | [R] Refresh | [X] Kill | [D] Delete history | [Esc]/[B] Exit
         </text>
       </box>
     </box>
@@ -637,6 +620,13 @@ function DialogWorkflowRun(props: {
   })
   const selectedPhase = createMemo(() => phases()[store.selectedPhase] ?? phases()[0])
   const selectedPhaseRows = createMemo(() => phaseRows(current(), phases(), selectedPhase()))
+  // N7: ctx.log entries are persisted on the run but were never surfaced anywhere
+  // in the TUI (the docs promise they are visible). Show the logs scoped to the
+  // selected phase, plus any phase-less entries (the engine writes some logs
+  // before a phase is set).
+  const phaseLogs = createMemo(() =>
+    current().logs.filter((entry) => !entry.phase || entry.phase === selectedPhase()),
+  )
   const selectedRow = createMemo(() => selectedPhaseRows()[store.selectedAgent])
   const selectedResult = createMemo(() => selectedRow()?.type === "result" && current().result !== undefined)
   const phasePanelWidth = createMemo(() => Math.min(44, Math.max(28, Math.floor((dimensions().width - 6) * 0.28))))
@@ -873,7 +863,7 @@ function DialogWorkflowRun(props: {
           )}
         </text>
         <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-          {fitColumns(description(), `${statusIcon(current().status)} ${current().status}`, headerWidth())}
+          {fitColumns(description(), `${statusIcon(current().status)} ${statusLabel(current().status)}`, headerWidth())}
         </text>
       </box>
 
@@ -1013,6 +1003,21 @@ function DialogWorkflowRun(props: {
                   </text>
                 </box>
               </Show>
+            </box>
+          </Show>
+          <Show when={phaseLogs().length}>
+            <box height={1} flexShrink={0} border={["top"]} borderColor={theme.border} />
+            <box flexShrink={0} paddingLeft={1}>
+              <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+                {sectionTitle("Logs", agentPanelWidth() - 4)}
+              </text>
+              <For each={phaseLogs()}>
+                {(entry) => (
+                  <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+                    {formatLogTime(entry.time)} {entry.message}
+                  </text>
+                )}
+              </For>
             </box>
           </Show>
         </box>
