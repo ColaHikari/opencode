@@ -41,7 +41,12 @@ const Parameters = Schema.Struct({
   background: Schema.optional(Schema.Boolean).annotate({
     description: "Start the workflow asynchronously and notify this session when it finishes",
   }),
-  timeout: Schema.optional(Schema.Number).annotate({
+  // Non-negative finite, mirroring the budget field above: a plain Schema.Number
+  // accepts NaN/±Infinity. timeout:Infinity would override the 1h DEFAULT_TIMEOUT
+  // cap (wait hangs forever); NaN slips past the engine's `<=0` guard (NaN<=0 is
+  // false) so wait times out at once yet still reports "still running". Rejecting
+  // both at the argument boundary keeps the wait bound honest.
+  timeout: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))).annotate({
     description: "Maximum milliseconds to wait for foreground start/wait before returning the running state",
   }),
   run_id: Schema.optional(Schema.String).annotate({
@@ -86,23 +91,47 @@ function workflowError(error: Workflow.InvalidError | Workflow.NotFoundError) {
   return new Error(`Workflow not found: ${error.name}`)
 }
 
+// Fund 56: the inspect/result/agents/logs output is a pseudo-XML envelope built
+// by string interpolation, and several interpolated fields are model- or
+// attacker-controlled (a subagent's prompt/output/error, the workflow result,
+// run args, log messages, the workflow source). Without escaping, a crafted
+// value containing literal `</output></agents><result>…` could forge the
+// envelope structure (prompt-injection of the reader).
+//
+// TEXT content only needs `& < >` escaped — the forging vector relies on `<`/`>`
+// to open/close tags, and `&` is escaped so the escaping itself is unambiguous.
+// `"`/`'` are deliberately left intact in text so embedded JSON (args/result)
+// stays readable.
+function escapeXmlText(value: string) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+}
+
+// ATTRIBUTE values additionally escape the quote characters so an untrusted value
+// can never break out of the `="…"` it sits in.
+function escapeXmlAttr(value: string) {
+  return escapeXmlText(value).replaceAll('"', "&quot;").replaceAll("'", "&apos;")
+}
+
+// Untrusted structured values (args/result/tokens) are JSON-stringified, then the
+// rendering is escaped as text so the serialized output cannot break the envelope
+// while keeping its quotes readable.
 function formatUnknown(value: unknown) {
   if (value === undefined) return ""
-  if (typeof value === "string") return value
-  return JSON.stringify(value, null, 2) ?? String(value)
+  const text = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? String(value))
+  return escapeXmlText(text)
 }
 
 function formatWorkflow(info: Workflow.Info) {
   return [
-    `<workflow name="${info.name}">`,
-    `<path>${info.path}</path>`,
-    `<display_name>${info.meta.name}</display_name>`,
-    info.meta.description ? `<description>${info.meta.description}</description>` : undefined,
-    info.meta.phases?.length ? `<phases>${info.meta.phases.join(", ")}</phases>` : undefined,
+    `<workflow name="${escapeXmlAttr(info.name)}">`,
+    `<path>${escapeXmlText(info.path)}</path>`,
+    `<display_name>${escapeXmlText(info.meta.name)}</display_name>`,
+    info.meta.description ? `<description>${escapeXmlText(info.meta.description)}</description>` : undefined,
+    info.meta.phases?.length ? `<phases>${escapeXmlText(info.meta.phases.join(", "))}</phases>` : undefined,
     "<arguments>",
     ...Object.entries(info.meta.arguments ?? {}).map(
       ([name, arg]) =>
-        `  <argument name="${name}" type="${arg.type ?? "string"}"${arg.default === undefined ? "" : ` default=${JSON.stringify(arg.default)}`}>${arg.description ?? ""}</argument>`,
+        `  <argument name="${escapeXmlAttr(name)}" type="${escapeXmlAttr(arg.type ?? "string")}"${arg.default === undefined ? "" : ` default=${escapeXmlAttr(JSON.stringify(arg.default))}`}>${escapeXmlText(arg.description ?? "")}</argument>`,
     ),
     "</arguments>",
     "</workflow>",
@@ -113,15 +142,15 @@ function formatWorkflow(info: Workflow.Info) {
 
 function formatRunSummary(run: Workflow.Run) {
   return [
-    `<workflow_run id="${run.id}" state="${run.status}">`,
-    `<workflow>${run.workflow}</workflow>`,
-    run.definition ? `<path>${run.definition.path}</path>` : undefined,
+    `<workflow_run id="${escapeXmlAttr(run.id)}" state="${run.status}">`,
+    `<workflow>${escapeXmlText(run.workflow)}</workflow>`,
+    run.definition ? `<path>${escapeXmlText(run.definition.path)}</path>` : undefined,
     run.definition?.temporary ? "<temporary>true</temporary>" : undefined,
     `<started_at>${new Date(run.started_at).toISOString()}</started_at>`,
     run.completed_at ? `<completed_at>${new Date(run.completed_at).toISOString()}</completed_at>` : undefined,
-    run.current_phase ? `<current_phase>${run.current_phase}</current_phase>` : undefined,
+    run.current_phase ? `<current_phase>${escapeXmlText(run.current_phase)}</current_phase>` : undefined,
     run.args ? `<args>${formatUnknown(run.args)}</args>` : undefined,
-    run.error ? `<error>${run.error}</error>` : undefined,
+    run.error ? `<error>${escapeXmlText(run.error)}</error>` : undefined,
     "</workflow_run>",
   ]
     .filter((line): line is string => line !== undefined)
@@ -133,8 +162,8 @@ function formatLogs(run: Workflow.Run) {
   return [
     "<logs>",
     ...run.logs.map((log) => {
-      const phase = log.phase ? ` phase="${log.phase}"` : ""
-      return `  <log time="${new Date(log.time).toISOString()}"${phase}>${log.message}</log>`
+      const phase = log.phase ? ` phase="${escapeXmlAttr(log.phase)}"` : ""
+      return `  <log time="${new Date(log.time).toISOString()}"${phase}>${escapeXmlText(log.message)}</log>`
     }),
     "</logs>",
   ].join("\n")
@@ -145,15 +174,15 @@ function formatAgents(run: Workflow.Run, includeOutput: boolean) {
   return [
     "<agents>",
     ...run.agents.flatMap((agent) => [
-      `  <agent id="${agent.id}" state="${agent.status}"${agent.agent ? ` name="${agent.agent}"` : ""}>`,
-      agent.phase ? `    <phase>${agent.phase}</phase>` : undefined,
-      agent.session_id ? `    <session_id>${agent.session_id}</session_id>` : undefined,
-      agent.model ? `    <model>${agent.model}</model>` : undefined,
+      `  <agent id="${escapeXmlAttr(agent.id)}" state="${agent.status}"${agent.agent ? ` name="${escapeXmlAttr(agent.agent)}"` : ""}>`,
+      agent.phase ? `    <phase>${escapeXmlText(agent.phase)}</phase>` : undefined,
+      agent.session_id ? `    <session_id>${escapeXmlText(agent.session_id)}</session_id>` : undefined,
+      agent.model ? `    <model>${escapeXmlText(agent.model)}</model>` : undefined,
       agent.tokens?.total ? `    <tokens>${agent.tokens.total}</tokens>` : undefined,
       agent.cost ? `    <cost>${agent.cost}</cost>` : undefined,
-      includeOutput ? `    <prompt>${agent.prompt}</prompt>` : undefined,
-      includeOutput && agent.output ? `    <output>${agent.output}</output>` : undefined,
-      agent.error ? `    <error>${agent.error}</error>` : undefined,
+      includeOutput ? `    <prompt>${escapeXmlText(agent.prompt)}</prompt>` : undefined,
+      includeOutput && agent.output ? `    <output>${escapeXmlText(agent.output)}</output>` : undefined,
+      agent.error ? `    <error>${escapeXmlText(agent.error)}</error>` : undefined,
       "  </agent>",
     ]),
     "</agents>",
@@ -167,17 +196,17 @@ function formatAgent(run: Workflow.Run, id?: string) {
   const agent = run.agents.find((item) => item.id === id)
   if (!agent) throw new Error(`Workflow agent run not found: ${id}`)
   return [
-    `<workflow_agent run_id="${run.id}" id="${agent.id}" state="${agent.status}">`,
-    agent.phase ? `<phase>${agent.phase}</phase>` : undefined,
-    agent.agent ? `<agent>${agent.agent}</agent>` : undefined,
-    agent.session_id ? `<session_id>${agent.session_id}</session_id>` : undefined,
-    agent.message_id ? `<message_id>${agent.message_id}</message_id>` : undefined,
-    agent.model ? `<model>${agent.model}</model>` : undefined,
+    `<workflow_agent run_id="${escapeXmlAttr(run.id)}" id="${escapeXmlAttr(agent.id)}" state="${agent.status}">`,
+    agent.phase ? `<phase>${escapeXmlText(agent.phase)}</phase>` : undefined,
+    agent.agent ? `<agent>${escapeXmlText(agent.agent)}</agent>` : undefined,
+    agent.session_id ? `<session_id>${escapeXmlText(agent.session_id)}</session_id>` : undefined,
+    agent.message_id ? `<message_id>${escapeXmlText(agent.message_id)}</message_id>` : undefined,
+    agent.model ? `<model>${escapeXmlText(agent.model)}</model>` : undefined,
     agent.tokens ? `<tokens>${formatUnknown(agent.tokens)}</tokens>` : undefined,
     agent.cost ? `<cost>${agent.cost}</cost>` : undefined,
-    `<prompt>${agent.prompt}</prompt>`,
-    agent.output ? `<output>${agent.output}</output>` : undefined,
-    agent.error ? `<error>${agent.error}</error>` : undefined,
+    `<prompt>${escapeXmlText(agent.prompt)}</prompt>`,
+    agent.output ? `<output>${escapeXmlText(agent.output)}</output>` : undefined,
+    agent.error ? `<error>${escapeXmlText(agent.error)}</error>` : undefined,
     "</workflow_agent>",
   ]
     .filter((line): line is string => line !== undefined)
@@ -192,7 +221,7 @@ function formatResult(run: Workflow.Run) {
 
 function formatSource(run: Workflow.Run) {
   if (!run.definition?.source) return "<source>No source recorded.</source>"
-  return `<source path="${run.definition.path}">${run.definition.source}</source>`
+  return `<source path="${escapeXmlAttr(run.definition.path)}">${escapeXmlText(run.definition.source)}</source>`
 }
 
 function formatInspect(run: Workflow.Run, view: Schema.Schema.Type<typeof InspectView>, agentID?: string) {
@@ -210,17 +239,20 @@ function formatInspect(run: Workflow.Run, view: Schema.Schema.Type<typeof Inspec
 
 function backgroundStarted(run: Workflow.Run) {
   return [
-    `<workflow_run id="${run.id}" state="running">`,
+    `<workflow_run id="${escapeXmlAttr(run.id)}" state="running">`,
     "<summary>Workflow started in background.</summary>",
     "<instructions>You will be notified automatically when it finishes; do not poll unless the user asks for progress.</instructions>",
     "</workflow_run>",
   ].join("\n")
 }
 
+// `text` is intentionally NOT escaped: on the completed path it is the already-
+// built (and already-escaped) terminalOutput envelope, and on the error path it
+// is a Cause.pretty diagnostic — both belong verbatim inside the result/error tag.
 function backgroundMessage(run: Workflow.Run, state: "completed" | "error", text: string) {
   return [
-    `<workflow_run id="${run.id}" state="${state}">`,
-    `<summary>Background workflow ${state}: ${run.workflow}</summary>`,
+    `<workflow_run id="${escapeXmlAttr(run.id)}" state="${state}">`,
+    `<summary>Background workflow ${state}: ${escapeXmlText(run.workflow)}</summary>`,
     state === "completed" ? "<workflow_result>" : "<workflow_error>",
     text,
     state === "completed" ? "</workflow_result>" : "</workflow_error>",
@@ -247,9 +279,26 @@ function terminalOutput(run: Workflow.Run) {
   return [formatRunSummary(run), formatLogs(run), formatAgents(run, false), formatResult(run)].join("\n")
 }
 
+// Any non-"completed" TERMINAL status is a failure the tool must surface — not
+// only failed/cancelled but also "interrupted" (a crashed/orphaned run swept on
+// restart). Returning undefined only for the genuinely-completed run keeps every
+// path (foreground/wait/background) from cheerfully reporting "completed" for a
+// run that did not actually succeed.
 function runFailure(run: Workflow.Run) {
-  if (run.status === "failed") return new Error(run.error ?? `Workflow failed: ${run.id}`)
-  if (run.status === "cancelled") return new Error(`Workflow cancelled: ${run.id}`)
+  if (run.status === "completed") return undefined
+  return new Error(run.error ?? `Workflow ${run.status}: ${run.id}`)
+}
+
+// Fund 7: `run_id` is unconstrained LLM input (Schema.optional(Schema.String)),
+// but `Workflow.RunID.make` runs the brand's `isStartsWith("job")` check and
+// THROWS synchronously for any id without the "job" prefix. With the trailing
+// `.pipe(Effect.orDie)` on the execute body that throw became an unrecoverable
+// defect carrying a cryptic Schema message instead of the intended clean
+// `Effect.fail("Workflow run not found: <id>")`. Guarding on the prefix first
+// keeps a malformed id on the not-found path (every non-existent run reads the
+// same regardless of shape).
+function decodeRunId(raw: string) {
+  return raw.startsWith("job") ? Workflow.RunID.make(raw) : undefined
 }
 
 function waitForWorkflow(workflow: Workflow.Interface, run: Workflow.Run, timeout?: number) {
@@ -401,6 +450,21 @@ function startWorkflow(input: {
       input.ctx.abort,
       input.params.timeout ?? DEFAULT_TIMEOUT,
     )
+    // Fund 30: a TERMINAL non-completed run (failed/cancelled/interrupted) must fail
+    // the tool here too, consistent with the background path — never report
+    // "Workflow finished" for a run that did not succeed. A timed-out run is still
+    // running, so it is reported as such, not failed.
+    //
+    // N10 carve-out: when the PARENT TURN aborted (ctx.abort), the run was cancelled
+    // as the deliberate, graceful response to that abort — not a workflow failure.
+    // Returning the cancelled state as success (rather than failing) keeps the abort
+    // flow clean; failing here would surface a spurious "Workflow cancelled" error
+    // for a user-initiated stop. A run that failed/cancelled/interrupted on its own
+    // (no abort) still fails the tool.
+    if (!waited.timedOut && !input.ctx.abort.aborted) {
+      const failure = runFailure(waited.run)
+      if (failure) return yield* Effect.fail(failure)
+    }
     return {
       title: waited.timedOut ? `Workflow still running: ${run.workflow}` : `Workflow finished: ${run.workflow}`,
       metadata: { ...workflowMetadata(run, false), jobId: "", timedOut: waited.timedOut },
@@ -460,28 +524,52 @@ export const WorkflowTool = Tool.define(
             // shape create writes; an illegal name fails here instead of becoming
             // an over-broad rule.
             const safeName = sanitizeWorkflowName(params.name)
-            // Permission gate FIRST — before any discovery/list/load. The list()
-            // pre-check below is now side-effect-free (static meta extraction), but
-            // the ask still has to come first so an untrusted workspace can never
-            // drive any workflow work ahead of the user's consent.
+            // Existence + validity pre-check via the static list. This is
+            // side-effect-free (static meta extraction, NO module execution), so it
+            // is safe to run BEFORE the permission ask: an unknown name fails with a
+            // clear "not found", and — Fund 55 — a discovered-but-unloadable workflow
+            // (bad meta / non-literal / schema-invalid) fails here exactly like read,
+            // rather than firing the interactive workflow prompt only to fail deep
+            // inside the engine afterwards. The actual module load (which DOES run
+            // code) still happens later, AFTER the ask below.
+            const workflows = yield* workflow.list()
+            const info = workflows.find((item) => item.name === params.name)
+            if (!info) return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
+            if (info.valid === false) {
+              return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
+            }
+            // Permission gate before any module LOAD/execution. The check above is
+            // side-effect-free, so the ask still gates every line of foreign code: an
+            // untrusted workspace can never drive any workflow execution ahead of the
+            // user's consent.
             yield* ctx.ask({
               permission: "workflow",
               patterns: [safeName],
               always: [safeName],
               metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
             })
-            // Existence pre-check via the static list so an unknown name fails with
-            // a clear "not found" rather than surfacing deep inside start().
-            const workflows = yield* workflow.list()
-            if (!workflows.some((item) => item.name === params.name)) {
-              return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
-            }
-            return yield* startWorkflow({ workflow, background, sessions, scope, params, name: params.name, ctx })
+            // Fund 54: populate definition.source from the workflow file so inspect
+            // view="all" renders the real <source> (the engine persists it on the
+            // run, and the TUI reads it too). Best-effort: a read failure just leaves
+            // source unset, falling back to "No source recorded." rather than failing
+            // the start.
+            const source = yield* fs.readFileStringSafe(info.path)
+            return yield* startWorkflow({
+              workflow,
+              background,
+              sessions,
+              scope,
+              params,
+              name: params.name,
+              source: source ?? undefined,
+              ctx,
+            })
           }
 
           if (params.action === "wait") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=wait"))
-            const runId = Workflow.RunID.make(params.run_id)
+            const runId = decodeRunId(params.run_id)
+            if (!runId) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             // N10: honor ctx.abort here too — a wait action that blocks during a
             // turn abort must unblock and cancel the run rather than hang.
             const waited = yield* Effect.raceFirst(
@@ -491,6 +579,16 @@ export const WorkflowTool = Tool.define(
               ),
             )
             if (!waited.run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
+            // Fund 30: a terminal non-completed run (failed/cancelled/interrupted)
+            // fails the wait too, consistent with foreground/background — never
+            // report "Workflow finished" for a run that did not succeed. A timed-out
+            // run is still running, so it is reported, not failed. N10 carve-out: a
+            // cancellation caused by THIS turn's abort is the graceful abort response,
+            // not a workflow failure, so it returns the cancelled state as success.
+            if (!waited.timedOut && !ctx.abort.aborted) {
+              const failure = runFailure(waited.run)
+              if (failure) return yield* Effect.fail(failure)
+            }
             return {
               title: waited.timedOut
                 ? `Workflow still running: ${params.run_id}`
@@ -507,7 +605,9 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "inspect") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=inspect"))
-            const run = yield* workflow.get(Workflow.RunID.make(params.run_id))
+            const runId = decodeRunId(params.run_id)
+            if (!runId) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
+            const run = yield* workflow.get(runId)
             if (!run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             const view = params.view ?? "summary"
             return {
