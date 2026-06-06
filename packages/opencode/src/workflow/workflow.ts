@@ -29,6 +29,7 @@ import type {
   WorkflowPipelineStage,
 } from "@opencode-ai/plugin/workflow"
 import { WorkflowRunTable } from "./workflow.sql"
+import { MetaReader } from "./meta-reader"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
 // / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a
@@ -734,34 +735,27 @@ export const layer = Layer.effect(
 
     const list: Interface["list"] = Effect.fn("Workflow.list")(function* () {
       const workflows = yield* discoverWorkflows()
-      // Per-file error isolation: each file is loaded inside Effect.result so a
-      // failure becomes an `{ valid: false, error }` entry instead of aborting
-      // the whole list. One broken file (bad meta / missing run / syntax error)
-      // therefore never makes the entire list — and, transitively, every
-      // workflow — unloadable. loadModule rejects with InvalidError on bad meta /
-      // missing run and with the raw load error on a syntax error.
+      // Discovery NEVER executes workflow module code: meta is extracted purely
+      // from each file's source text via the static AST reader. `loadModule` (a
+      // real dynamic import that runs the module's top-level code) is reserved for
+      // start(), AFTER the permission gate. This closes the root cause where merely
+      // listing/reading/autocompleting workflows in a cloned workspace ran foreign
+      // code before any prompt. Per-file error isolation is kept: a file whose meta
+      // is missing, dynamic (not statically analyzable), or schema-invalid becomes
+      // an `{ valid: false, error }` entry instead of aborting the whole list.
       return yield* Effect.forEach(
         workflows,
         (workflow) =>
-          Effect.tryPromise({
-            try: () => loadModule(workflow.path),
-            catch: (error) =>
-              isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
-          }).pipe(
-            Effect.result,
-            Effect.map((result): Info =>
-              result._tag === "Success"
-                ? { ...workflow, meta: result.success.meta, valid: true }
-                : {
-                    ...workflow,
-                    // Synthesize a minimal meta so the schema stays satisfied and
-                    // consumers can still show the file's name; `valid: false`
-                    // signals the entry is not runnable.
-                    meta: { name: workflow.name },
-                    valid: false,
-                    error: result.failure.message,
-                  },
-            ),
+          Effect.promise(() => Bun.file(workflow.path).text()).pipe(
+            Effect.map((source): Info => {
+              const result = MetaReader.read(source, workflow.path)
+              return result.valid
+                ? { ...workflow, meta: result.meta, valid: true }
+                : // Synthesize a minimal meta so the schema stays satisfied and
+                  // consumers can still show the file's name; `valid: false`
+                  // signals the entry is not runnable.
+                  { ...workflow, meta: { name: workflow.name }, valid: false, error: result.error }
+            }),
           ),
         { concurrency: "unbounded" },
       )

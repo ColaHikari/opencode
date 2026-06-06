@@ -2,6 +2,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Exit, Layer } from "effect"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
@@ -331,6 +332,37 @@ export async function run() { return "done" }
         // prompt went out.
         expect(metadataCalls.length).toBe(0)
         expect(recorder.prompts.length).toBe(0)
+      }),
+    ),
+  )
+
+  it.live("denied workflow permission never imports the module (no top-level side effect runs)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const marker = path.join(os.tmpdir(), `tool-workflow-deny-${Math.random().toString(16).slice(2)}`)
+        // Top-level marker write: the module must NOT be imported when the
+        // permission is denied, because the ask gate comes BEFORE any load.
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "hello",
+            `await Bun.write(${JSON.stringify(marker)}, "executed")
+export const meta = { name: "Hello" }
+export async function run() { return "done" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const ctx: Tool.Context = {
+          ...recorder.ctx,
+          ask: () => Effect.die(new Error("Permission denied: workflow")),
+        }
+
+        const exit = yield* Effect.exit(tool.execute({ action: "start", name: "hello" }, ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        // The module was never imported: its top-level side effect never ran.
+        expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
       }),
     ),
   )
