@@ -52,6 +52,7 @@ import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkflow } from "../dialog-workflow"
+import { parseWorkflowCommand } from "../dialog-workflow-helpers"
 import { listWorkflowInfos, parseWorkflowArgs } from "./workflow-autocomplete"
 import {
   confirmWorkspaceFileChanges,
@@ -1051,6 +1052,8 @@ export function Prompt(props: PromptProps) {
           ]
         : []
 
+    const workflowCommand = store.mode === "shell" ? undefined : parseWorkflowCommand(inputText)
+
     if (store.mode === "shell") {
       move.startSubmit()
       void sdk.client.session.shell({
@@ -1063,14 +1066,16 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
-    } else if (inputText.trim() === "/workflows") {
-      dialog.replace(() => <DialogWorkflow />)
-    } else if (inputText.startsWith("/workflow")) {
-      const firstLine = inputText.split("\n")[0]
-      const [, name, ...args] = firstLine.split(" ").filter(Boolean)
-      if (!name) {
+    } else if (workflowCommand) {
+      // Fund 59: `/workflows ...` opens the dashboard while `/workflow <name> ...`
+      // starts the named workflow; the dispatch is decided by parseWorkflowCommand
+      // so `/workflows foo` can never be misread as starting a workflow literally
+      // named `workflows`. Fund 60: the raw arg remainder (multi-spaces preserved)
+      // is handed to parseWorkflowArgs untouched.
+      if (workflowCommand.type === "dashboard") {
         dialog.replace(() => <DialogWorkflow />)
       } else {
+        const name = workflowCommand.name
         // Resolve the workflow's declared argument types so parsing coerces only
         // declared-number args (e.g. `version=1.0` stays the string "1.0").
         // listWorkflowInfos already drops invalid entries, so a broken file never
@@ -1079,7 +1084,7 @@ export function Prompt(props: PromptProps) {
         const infos = await listWorkflowInfos(sdk.client.workflow, true)
         const declaration = infos.find((info) => info.name === name)?.meta.arguments ?? {}
         void sdk.client.workflow
-          .start({ name, workflowStartPayload: { args: parseWorkflowArgs(args.join(" "), declaration) } })
+          .start({ name, workflowStartPayload: { args: parseWorkflowArgs(workflowCommand.args, declaration) } })
           .then((result) => {
             if (!result.data) {
               toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
