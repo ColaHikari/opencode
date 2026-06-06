@@ -1472,7 +1472,27 @@ export const layer = Layer.effect(
 
     const cancel: Interface["cancel"] = Effect.fn("Workflow.cancel")(function* (id) {
       const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
-      if (!active) return
+      // N16: a run that is not in the live registry is NOT automatically "not
+      // found" — every persisted run after a restart, and every terminal run
+      // evicted by N1, lives only in the DB. Consult the (directory-scoped) DB
+      // row, exactly like get()/remove() do, so cancel never confuses
+      // "found-but-not-cancellable" with "absent". A found-but-non-live run is
+      // already terminal/orphaned (no live fiber to interrupt), so it is returned
+      // honestly as its persisted snapshot rather than rewritten — but it is
+      // returned, NOT undefined. undefined is reserved for a genuinely unknown id
+      // (which the HTTP handler in Task 3h maps to 404). The scoping mirrors get():
+      // a foreign-directory row is invisible here and so reports undefined too.
+      if (!active) {
+        const directory = yield* InstanceState.directory
+        const row = yield* db
+          .select()
+          .from(WorkflowRunTable)
+          .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return
+        return fromRow(row)
+      }
       if (active.run.status !== "running") return snapshot(active)
       yield* abortRun(active)
       return yield* finish(id, "cancelled")
