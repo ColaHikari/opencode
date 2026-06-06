@@ -687,7 +687,7 @@ function DialogWorkflowSave(props: { run: WorkflowRun; onClose: () => void }) {
         <text attributes={TextAttributes.BOLD} fg={theme.text}>
           Save workflow as command
         </text>
-        <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
+        <text fg={theme.textMuted} onMouseUp={() => props.onClose()}>
           esc
         </text>
       </box>

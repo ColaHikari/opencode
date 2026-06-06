@@ -56,7 +56,7 @@ export default workflow({
     const findings = await ctx.parallel(
       plan.data.angles.map((angle) => () =>
         ctx.agent({
-          prompt: \`Research this angle using your available web/search tools. If NO web tools are available, reply exactly NO_WEB_TOOLS. Angle: \${angle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
+          prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "no_web_tools": true} via the schema. Angle: \${angle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
           schema: {
             type: "object",
             required: ["claims"],
@@ -72,12 +72,17 @@ export default workflow({
                   },
                 },
               },
+              no_web_tools: { type: "boolean" },
             },
           },
         }),
       ),
     )
-    if (findings.some((f) => typeof f.text === "string" && f.text.includes("NO_WEB_TOOLS")))
+    // Gate via the structured schema (a forced-JSON schema makes the old plaintext
+    // sentinel unreachable — StructuredOutputError would fire before any reply
+    // text could carry it). An agent with no web/search tools instead sets the
+    // optional no_web_tools flag, which we surface as an honest hard failure.
+    if (findings.some((f) => (f.data as { no_web_tools?: boolean }).no_web_tools))
       throw new Error("deep-research requires web/search tools to be available to agents")
 
     const claims = findings.flatMap((f) => f.data.claims)
