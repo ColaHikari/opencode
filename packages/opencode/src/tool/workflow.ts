@@ -372,6 +372,10 @@ function startWorkflow(input: {
         budget: input.params.budget,
         prompt: ops,
         permissionSessionID: input.ctx.sessionID,
+        // Pass the caller's identity so every subagent the run spawns inherits
+        // this session's deny/external_directory rules and this agent's edit-class
+        // denies (Plan Mode) — the same ruleset the task tool derives (#26514).
+        caller: { sessionID: input.ctx.sessionID, agent: input.ctx.agent },
         source: input.source,
         temporary: input.temporary,
       })
