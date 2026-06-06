@@ -4,12 +4,15 @@
 // the TUI runtime; the prompt component wires detection, highlighting, stripping,
 // and directive injection on top of it.
 
-// Word-boundary match: `\b` sits between an identifier char ([A-Za-z0-9_]) and a
-// non-identifier char, so "ultracodex", "xultracode", "ultracode2", and
-// "ultracode_mode" never match while "ultracode:", "(ultracode)", and
-// "foo-ultracode" do. The `i` flag makes detection case-insensitive.
+// Word-boundary match via Unicode lookarounds: the keyword only matches when it is
+// not flanked by a letter, digit, or underscore (\p{L}\p{N}_). Unlike the ASCII-only
+// `\b`, this treats non-ASCII letters as word characters too, so "ultracodeö",
+// "öultracode", "ultracodex", "ultracode2", and "ultracode_mode" never match while
+// "ultracode:", "(ultracode)", and "foo-ultracode" do. The `i` flag makes detection
+// case-insensitive, `u` enables Unicode property escapes.
 const KEYWORD = "ultracode"
-const KEYWORD_RE = new RegExp(`\\b${KEYWORD}\\b`, "i")
+const BOUNDARY = `(?<![\\p{L}\\p{N}_])${KEYWORD}(?![\\p{L}\\p{N}_])`
+const KEYWORD_RE = new RegExp(BOUNDARY, "iu")
 
 export const ULTRACODE_PROMPT_DIRECTIVE =
   "The user opted into workflow orchestration for this task (ultracode). " +
@@ -38,7 +41,7 @@ export function detectUltracodeKeyword(input: string): { index: number; length: 
 // (e.g. "ultracode: audit") is dropped, and the result is trimmed.
 export function stripUltracodeKeyword(input: string): string {
   return input
-    .replace(new RegExp(`\\b${KEYWORD}\\b`, "gi"), "")
+    .replace(new RegExp(BOUNDARY, "giu"), "")
     .replace(/\s+/g, " ")
     .replace(/\s+([:;,.!?])/g, "$1")
     .replace(/^[:\s]+/, "")
