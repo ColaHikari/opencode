@@ -63,9 +63,9 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
     })
 
     const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: Workflow.RunID } }) {
-      // The engine returns undefined ONLY when the run is not in this workspace's
-      // registry → 404. A known run (running or already-terminal) returns its
-      // snapshot → 200.
+      // The engine returns undefined ONLY when the run is unknown to this
+      // workspace (not in the live registry and no persisted row) → 404. A known
+      // run (running or already-terminal) returns its snapshot → 200.
       const run = yield* workflow.cancel(ctx.params.id)
       if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
       return run
