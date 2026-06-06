@@ -206,6 +206,27 @@ const VOID_RESULT_WORKFLOW = `export const meta = { name: "${VOID_RESULT_FIXTURE
 export async function run(args, ctx) { ctx.setPhase("run") }
 `
 
+// N2/N13-Fixture: ein Workflow, dessen Rückgabewert NICHT strukturell klonbar ist
+// (eine Funktion ist weder JSON-serialisierbar noch structuredClone-fähig). Der
+// frühere structuredClone-Snapshot warf hier (DOMException) und strandete jeden
+// no-timeout-wait() / verhinderte den Terminal-Persist. Der Engine normalisiert
+// das result jetzt über denselben JSON-Codec wie der Persist: Funktionen werden
+// (wie bei JSON.stringify) still verworfen, der Run schließt sauber ab, und
+// Live-Snapshot wie DB-Row tragen dieselbe (entfunktionalisierte) Form.
+const UNSERIALIZABLE_RESULT_FIXTURE = "unserializable-result"
+const UNSERIALIZABLE_RESULT_WORKFLOW = `export const meta = { name: "${UNSERIALIZABLE_RESULT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run"); return { kept: 1, cb: () => {} } }
+`
+
+// N2/N13-Fixture: ein Workflow, dessen Rückgabewert eine ZIRKULÄRE Referenz hat —
+// JSON.stringify wirft darauf (TypeError). Der mit Effect.try abgesicherte
+// Normalisierungspfad muss den Run dennoch terminal abschließen und das result
+// auf den $unserializable-Platzhalter setzen, statt zu hängen.
+const CIRCULAR_RESULT_FIXTURE = "circular-result"
+const CIRCULAR_RESULT_WORKFLOW = `export const meta = { name: "${CIRCULAR_RESULT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run"); const r = { a: 1 }; r.self = r; return r }
+`
+
 function assistantReply(): SessionV1.WithParts {
   return { info: { role: "assistant" }, parts: [] } as unknown as SessionV1.WithParts
 }
@@ -324,6 +345,45 @@ function resolveOnAbortPromptOps(options?: { delayMs?: number }) {
   }
   return { ops, aborted, started }
 }
+
+// N13-Fixture (tokens-Alias): der Agent-Prompt RESOLVED sofort mit echter
+// Token-Telemetrie (nicht-null, damit eine Mutation beobachtbar ist), so dass
+// der Engine den Node mit `tokens`/`cache` befüllt. Danach hält der Body den Run
+// LIVE (langer, unterbrechbarer Timer), so dass get() einen Live-Snapshot liefert
+// (nicht den fromRow-Pfad nach der N1-Eviction). cancel() bricht den Timer ab.
+function tokensPromptOps() {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        return {
+          info: {
+            id: "msg_test",
+            role: "assistant",
+            providerID: "test",
+            modelID: "test-model",
+            cost: 0,
+            tokens: { input: 11, output: 22, reasoning: 0, cache: { read: 33, write: 44 } },
+          },
+          parts: [{ type: "text", text: "ok" }],
+        } as unknown as SessionV1.WithParts
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
+// Body: ein Agent-Step (setzt tokens) und danach ein langer Timer, der den Run
+// LIVE in der Registry hält, bis der Test cancelt.
+const AGENT_THEN_HANG_FIXTURE = "agent-then-hang"
+const AGENT_THEN_HANG_WORKFLOW = `export const meta = { name: "${AGENT_THEN_HANG_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "produce tokens" })
+  await new Promise((resolve) => setTimeout(resolve, 30000))
+  return { ok: true }
+}
+`
 
 // Schema-Fixtures: Workflows, deren run(ctx) den Agenten MIT Schema aufruft
 // (strukturierte Ausgabe angefordert). Der Promtp-Ops-Fake (unten) steuert, ob
@@ -1314,12 +1374,122 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
       const again = yield* workflow.get(run.id)
       expect((again!.args as { nested: { value: number } }).nested.value).toBe(1)
 
-      // Auch nach Abschluss: das result mutieren beeinflusst die DB-Row nicht.
+      // Nach Abschluss kommt der Run NICHT mehr aus dem Live-Snapshot: finish()
+      // evictet den terminalen Run aus der Registry (N1), so dass jeder folgende
+      // get() ihn frisch aus der DB-Row über fromRow rekonstruiert. Eine Mutation
+      // an `done.result` und ein erneuter get() würden hier also nur die (ohnehin
+      // garantierte) fromRow-Frische prüfen — NICHT die Alias-Trennung des
+      // Live-Snapshots. Die result-Alias-Trennung am LIVEN Run ist daher in
+      // "snapshot severs agents[].tokens aliasing on a live run" abgedeckt; hier
+      // verifizieren wir nur ehrlich, dass das result den DB-Roundtrip überlebt.
       const waited = yield* workflow.wait({ id: run.id })
       const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
-      ;(done.result as { nested: { ok: boolean } }).nested.ok = false
+      expect((done.result as { nested: { ok: boolean } }).nested.ok).toBe(true)
+    }),
+  )
+
+  // N13 (spec): die öffentliche Run-Projektion darf das verschachtelte
+  // `agents[].tokens` (inkl. des weiter genesteten `cache`) NICHT aliasen. Der
+  // frühere snapshot kopierte agents nur flach (`{ ...item }`), so dass ein
+  // Verbraucher über `snapshot.agents[0].tokens.input` den internen Engine-State
+  // mutieren konnte. Geprüft am LIVEN Run (Run noch in der Registry, Agent-Node
+  // mit echter Token-Telemetrie), damit get() einen Live-Snapshot liefert und
+  // NICHT den ohnehin frischen fromRow-Pfad.
+  it.instance("snapshot severs agents[].tokens aliasing on a live run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, AGENT_THEN_HANG_FIXTURE, AGENT_THEN_HANG_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: AGENT_THEN_HANG_FIXTURE, args: {}, prompt: tokensPromptOps() })
+
+      // Warten, bis der Agent-Step gesettlet ist (tokens befüllt) und der Run
+      // dabei NOCH läuft (Body hängt am 30s-Timer) — get() liefert dann live.
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.status === "running" && current.agents[0]?.tokens ? current : undefined
+        }),
+        "agent tokens never populated on a live run",
+      )
+      const tokens = live.agents[0]!.tokens!
+      expect(tokens.input).toBe(11)
+      expect(tokens.cache.read).toBe(33)
+
+      // Über den Snapshot in den verschachtelten tokens/cache schreiben …
+      tokens.input = 999
+      tokens.cache.read = 888
+
+      // … darf den internen Engine-State NICHT verändern: ein zweiter Live-Snapshot
+      // zeigt die Originalwerte.
+      const again = yield* workflow.get(run.id)
+      expect(again?.status).toBe("running")
+      expect(again!.agents[0]!.tokens!.input).toBe(11)
+      expect(again!.agents[0]!.tokens!.cache.read).toBe(33)
+
+      // Aufräumen: den hängenden Run abbrechen, damit der 30s-Timer den Test nicht hält.
+      yield* workflow.cancel(run.id)
+    }),
+  )
+
+  // N2/N13 (regression): ein Workflow, der einen NICHT strukturell klonbaren Wert
+  // zurückgibt (`{ kept: 1, cb: () => {} }`), darf weder den no-timeout-wait()
+  // strandlassen noch den Terminal-Persist verhindern. Der frühere
+  // structuredClone-Snapshot warf darauf (DOMException) und hing. Der Engine
+  // normalisiert das result jetzt über denselben JSON-Codec wie der Persist:
+  // Funktionen werden (wie JSON.stringify) still verworfen, der Run schließt
+  // sauber als `completed` ab, und Live-Snapshot wie DB-Row tragen dieselbe Form.
+  it.instance("a non-cloneable workflow result never hangs wait(); JSON-normalized like the persist", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, UNSERIALIZABLE_RESULT_FIXTURE, UNSERIALIZABLE_RESULT_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: UNSERIALIZABLE_RESULT_FIXTURE, args: {} })
+
+      // wait() OHNE timeout: kommt terminal zurück (kein Hang) und meldet keinen Timeout.
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.timedOut).toBe(false)
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
+      expect(done.status).toBe("completed")
+      // Funktionen werden (wie bei JSON.stringify) verworfen, serialisierbare
+      // Felder bleiben erhalten.
+      expect(done.result).toEqual({ kept: 1 })
+
+      // DB-Row und Live-Verhalten konsistent: ein kalter Spalten-Read zeigt
+      // dieselbe entfunktionalisierte Form.
+      expect(yield* fetchRawResult(run.id)).toBe(JSON.stringify({ kept: 1 }))
       const persisted = yield* workflow.get(run.id)
-      expect((persisted!.result as { nested: { ok: boolean } }).nested.ok).toBe(true)
+      expect(persisted?.status).toBe("completed")
+      expect(persisted?.result).toEqual({ kept: 1 })
+    }),
+  )
+
+  // N2/N13 (regression): ein result mit ZIRKULÄRER Referenz lässt JSON.stringify
+  // selbst werfen (TypeError). Der mit Effect.try abgesicherte
+  // Normalisierungspfad muss den Run dennoch terminal als `completed` abschließen
+  // (kein Hang, kein verlorener Terminal-Übergang) und das result auf den
+  // $unserializable-Platzhalter setzen.
+  it.instance("a circular workflow result finishes with the $unserializable placeholder", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, CIRCULAR_RESULT_FIXTURE, CIRCULAR_RESULT_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: CIRCULAR_RESULT_FIXTURE, args: {} })
+
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.timedOut).toBe(false)
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { $unserializable: string }).$unserializable).toBeDefined()
+
+      // Konsistent in der DB-Row.
+      const persisted = yield* workflow.get(run.id)
+      expect((persisted?.result as { $unserializable: string }).$unserializable).toBeDefined()
     }),
   )
 
