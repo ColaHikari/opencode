@@ -963,6 +963,60 @@ export async function run(args, ctx) {
 }
 `
 
+// Drift-Fixture (Fund: ungeschütztes JSON.parse auf einem Plaintext-Journal-Node).
+// Der Journal-Key ist NUR { prompt, agent, phase } — das Schema gehört NICHT dazu.
+// Eine V1-Datei mit einem PLAINTEXT-Agenten (kein Schema) erzeugt einen Journal-
+// Node, dessen output kein gültiges JSON ist. Wird die SELBE Datei (gleicher Name
+// → gleiche path/journalKey) zwischen Lauf und Resume zu V2 überschrieben — jetzt
+// fordert derselbe Agent-Call ein Schema an — matcht der Plaintext-Node die Schema-
+// Anfrage. Das alte JSON.parse(cached.output) würde synchron werfen (Defect). Der
+// Resume MUSS das stattdessen als Cache-MISS behandeln und den Agenten LIVE laufen
+// lassen. Beide Versionen teilen Name/Phase/Prompt, damit der Key identisch ist.
+const DRIFT_FIXTURE = "resume-schema-drift"
+const DRIFT_WORKFLOW_PLAINTEXT = `export const meta = { name: "${DRIFT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.agent({ prompt: "drift agent" })
+  return { value: r.text }
+}
+`
+const DRIFT_WORKFLOW_SCHEMA = `export const meta = { name: "${DRIFT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.agent({ prompt: "drift agent", schema: { type: "object" } })
+  return { value: r.data }
+}
+`
+
+// Prompt-Ops für den Drift-Test: zählt jeden GEFEUERTEN (live) Prompt und liefert,
+// wenn ein Schema angefordert wurde (input.format gesetzt), eine strukturierte
+// Antwort (message.info.structured) — sonst PLAINTEXT, dessen Text KEIN gültiges
+// JSON ist. So beweist der Resume: matcht die Schema-Anfrage den Plaintext-Journal-
+// Node, läuft der Agent live (count +1) und liefert ein echtes structured-Ergebnis,
+// statt am JSON.parse des Plaintext-Outputs zu defecten.
+function driftPromptOps(db: Database.Interface["db"]) {
+  const state = { count: 0 }
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        state.count++
+        const wantsSchema = input.format?.type === "json_schema"
+        const turn: AssistantTurn = {
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        }
+        if (wantsSchema) turn.structured = SCHEMA_OBJECT
+        const last = yield* persistTurns(db, input.sessionID, [turn])
+        // Plaintext-Pfad: ein Text, der bewusst KEIN gültiges JSON ist.
+        const parts = wantsSchema ? [] : [{ type: "text", text: "not json at all" }]
+        return { info: last.info, parts } as unknown as SessionV1.WithParts
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, state }
+}
+
 // Prompt-Ops, die jeden Agent-Prompt SOFORT mit einem PROMPT-spezifischen Output
 // beantworten und (a) jeden gestarteten Prompt-Text protokollieren sowie (b) echte
 // Kosten verbuchen. So kann der Resume-Test beweisen, dass für gecachte Agenten
@@ -3459,6 +3513,27 @@ export async function run() { return { ok: true } }
       expect(firstDone.status).toBe("completed")
       expect(firstDone.result).toEqual({ first: "out:0", second: "out:1" })
 
+      // Nur paused/interrupted Runs sind gültige Resume-Quellen (Status-Guard). Der
+      // erste Lauf completed mit beiden Journal-Einträgen; wir versetzen die Row auf
+      // `paused` (Journal/agents bleiben erhalten), um eine legitime Resume-Quelle
+      // zu erhalten — der Occurrence-Index ist das, was dieser Test prüft. Das Update
+      // wird im Poll wiederholt, bis es sichtbar `paused` ist (der terminale Run wird
+      // ASYNCHRON aus der Registry evictet — bis dahin könnte ein letzter Snapshot die
+      // DB-Mutation überschreiben; nach Eviction fällt get() auf die Row zurück).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
       // Resume: beide identischen Prompts müssen aus dem Journal kommen (kein neuer
       // Prompt), und zwar getrennt: first→out:0, second→out:1 (Occurrence-Reihenfolge).
       const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
@@ -3494,6 +3569,24 @@ export async function run() { return { ok: true } }
         (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
       expect(firstDone.status).toBe("completed")
 
+      // Status-Guard: nur paused/interrupted Runs sind gültige Resume-Quellen. Die
+      // completed-Row auf `paused` versetzen (Journal bleibt), damit der Resume die
+      // invalidate_agents-Semantik prüfen kann. Im Poll wiederholt, bis sichtbar
+      // `paused` (asynchrone Eviction des terminalen Runs — siehe oben).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
       // Resume mit invalidate_agents:[0] → Agent #0 (A) läuft live neu, B cacht.
       const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
       const resumed = yield* workflow.start({
@@ -3513,6 +3606,144 @@ export async function run() { return { ok: true } }
       expect(agentA?.cached).not.toBe(true)
       const agentB = done.agents.find((a) => a.prompt === "agent B")
       expect(agentB?.cached).toBe(true)
+    }),
+  )
+
+  // Status-Guard (Fund: kein Guard auf dem Resume-Source-Status): nur paused/
+  // interrupted Runs sind gültige Resume-Quellen. Ein COMPLETED Quell-Run darf
+  // NICHT resumt werden — das würde seine Arbeit verdoppeln. Erwartung: ehrlicher
+  // WorkflowInvalidError (HTTP 400), dessen Message den Status nennt, statt stillem
+  // Degradieren zu einem Normallauf.
+  it.instance("resume from a completed source run fails with WorkflowInvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Quell-Run läuft regulär bis completed.
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      // Resume von einer completed-Quelle MUSS scheitern.
+      const { ops: resumeOps } = recordingPromptOps(db, 0)
+      const failed = yield* workflow
+        .start({ name: RESUME_FIXTURE, args: {}, prompt: resumeOps, resume_of: first.id })
+        .pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+      const invalid =
+        failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
+      // Die Message nennt den tatsächlichen Status der Quelle.
+      expect(invalid.message).toContain("completed")
+      expect(invalid.message).toContain(first.id)
+    }),
+  )
+
+  // Status-Guard / cancel-paused-Race: ein CANCELLED Quell-Run (hier: hängender Run
+  // → pause → cancel, exakt die cancel-of-a-paused-run-Semantik) darf NICHT resumt
+  // werden. Ein direkter DB-UPDATE auf cancelled (die Race) wäre sonst re-resumebar.
+  // Erwartung: WorkflowInvalidError, der den Status `cancelled` nennt.
+  it.instance("resume from a cancelled source run fails with WorkflowInvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PAUSE_FIXTURE, PAUSE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Hängenden Run starten, pausieren, dann cancellen → terminal cancelled.
+      const { ops } = hangingPromptOps()
+      const run = yield* workflow.start({ name: PAUSE_FIXTURE, args: {}, prompt: ops })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
+        }),
+        "agent never started",
+      )
+      const paused = yield* workflow.pause(run.id)
+      expect(paused?.status).toBe("paused")
+      const cancelled = yield* workflow.cancel(run.id)
+      expect(cancelled?.status).toBe("cancelled")
+
+      // Resume von einer cancelled-Quelle MUSS scheitern.
+      const { ops: resumeOps } = recordingPromptOps(db, 0)
+      const failed = yield* workflow
+        .start({ name: PAUSE_FIXTURE, args: {}, prompt: resumeOps, resume_of: run.id })
+        .pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+      const invalid =
+        failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
+      expect(invalid.message).toContain("cancelled")
+      expect(invalid.message).toContain(run.id)
+    }),
+  )
+
+  // Schema/Journal-Drift (Fund: ungeschütztes JSON.parse(cached.output)): der
+  // Journal-Key ignoriert das Schema. Ein PLAINTEXT-Quell-Node kann beim Resume
+  // eine Schema-Anfrage matchen, wenn die Workflow-Datei zwischen Lauf und Resume
+  // driftet (gleicher Name/Prompt/Phase, jetzt mit schema im agent-Call). Statt am
+  // JSON.parse des Plaintext-Outputs zu defecten, MUSS der Resume das als Cache-MISS
+  // behandeln und den Agenten LIVE laufen lassen (PromptOps-Zähler +1, Run completed).
+  it.instance("a schema call matching a plaintext journal node runs live instead of defecting", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      // V1: Plaintext-Agent (kein Schema) → Journal-Node mit nicht-JSON-Output.
+      yield* Effect.promise(() => writeWorkflow(test.directory, DRIFT_FIXTURE, DRIFT_WORKFLOW_PLAINTEXT))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const { ops: firstOps, state: firstState } = driftPromptOps(db)
+      const first = yield* workflow.start({ name: DRIFT_FIXTURE, args: {}, prompt: firstOps })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      // Der Quell-Node trägt Plaintext (kein gültiges JSON).
+      expect(firstDone.result).toEqual({ value: "not json at all" })
+      expect(firstState.count).toBe(1)
+
+      // Quell-Row auf `paused` versetzen → legitime Resume-Quelle (Journal bleibt).
+      // Im Poll wiederholt, bis sichtbar `paused` (asynchrone Eviction, siehe oben).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
+      // Drift: SELBE Datei (gleicher Name → gleicher path/journalKey) wird zu V2
+      // überschrieben — derselbe Agent-Call fordert jetzt ein Schema an.
+      yield* Effect.promise(() => writeWorkflow(test.directory, DRIFT_FIXTURE, DRIFT_WORKFLOW_SCHEMA))
+
+      // Resume: die Schema-Anfrage matcht den Plaintext-Journal-Node. Kein Defect —
+      // der Agent läuft LIVE und liefert ein echtes structured-Ergebnis.
+      const { ops: resumeOps, state: resumeState } = driftPromptOps(db)
+      const resumed = yield* workflow.start({
+        name: DRIFT_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      // Kein Defect: der Run completed sauber.
+      expect(done.status).toBe("completed")
+      // Der Agent lief LIVE (Zähler +1), NICHT aus dem Journal repliziert.
+      expect(resumeState.count).toBe(1)
+      // Das Live-Ergebnis ist das geparste Schema-Objekt, nicht der Plaintext.
+      expect(done.result).toEqual({ value: SCHEMA_OBJECT })
+      // Der Agent-Node ist NICHT als cached markiert (Cache-MISS → Live-Lauf).
+      const node = done.agents.find((a) => a.prompt === "drift agent")
+      expect(node?.cached).not.toBe(true)
     }),
   )
 })

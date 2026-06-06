@@ -244,9 +244,10 @@ export type StartOptions = StartInput & {
    * run re-executes the SAME workflow body, each `ctx.agent` call first looks up
    * the journal: a matching COMPLETED source agent (whose index is not in
    * `invalidate_agents`) is replayed verbatim (output/structured/cost/tokens,
-   * `cached: true`) with NO prompt, and the new run's budget is pre-decremented by
-   * its cost; a miss runs live. The resume is cross-restart because the journal
-   * lives in the DB, not in memory.
+   * `cached: true`) with NO prompt, and the replayed cost is charged once via the
+   * shared `ensuring` (post-step), just like a live step; a miss runs live. The
+   * budget gate before the lookup still fails honestly when exhausted. The resume
+   * is cross-restart because the journal lives in the DB, not in memory.
    */
   resume_of?: RunID
   /**
@@ -1449,6 +1450,19 @@ export const layer = Layer.effect(
           .get()
           .pipe(Effect.orDie)
         if (sourceRow) {
+          // Status guard: only a paused or interrupted run is a legitimate resume
+          // source. A completed/cancelled/failed/running source must fail the start
+          // honestly rather than silently degrade — resuming a terminal run would
+          // duplicate its work, and the cancel-of-a-paused-run race could otherwise
+          // be re-resumed via a direct DB UPDATE to `cancelled`. HTTP maps
+          // WorkflowInvalidError to 400. An unknown id leaves `sourceRow` undefined
+          // and still degrades to a normal run (every call runs live), unchanged.
+          if (sourceRow.status !== "paused" && sourceRow.status !== "interrupted") {
+            return yield* new InvalidError({
+              path: workflow.path,
+              message: `Cannot resume run ${input.resume_of}: status is ${sourceRow.status} (only paused or interrupted runs can be resumed)`,
+            })
+          }
           const invalidate = new Set(input.invalidate_agents ?? [])
           sourceRow.agents.forEach((node, index) => {
             if (node.status !== "completed") return
@@ -1605,9 +1619,10 @@ export const layer = Layer.effect(
               // resume_of), consume the next unused source agent for this call's
               // key (occurrence order) and replay it verbatim — NO session, NO
               // prompt. The node adopts the source output/cost/tokens, is marked
-              // `cached`, and the budget is decremented by the replayed cost here
-              // (the live-step path's `ensuring` decrement never runs for a cache
-              // hit). `structured` is re-parsed from the stored output when a
+              // `cached`, and the replayed cost is charged once via the shared
+              // `ensuring` (post-step) — the SAME decrement the live-step path uses;
+              // the budget gate before this lookup still fails honestly when
+              // exhausted. `structured` is re-parsed from the stored output when a
               // schema was requested so `result.data` stays the parsed object,
               // identical to a live structured step. A miss falls through to the
               // live path below. The agent name is resolved (`selected.name`)
@@ -1618,25 +1633,45 @@ export const layer = Layer.effect(
                 const cursor = active.journalCursor.get(key) ?? 0
                 const cached = bucket?.[cursor]
                 if (cached) {
-                  active.journalCursor.set(key, cursor + 1)
-                  node.agent = selected.name
-                  node.status = "completed"
-                  node.completed_at = Date.now()
-                  node.output = cached.output
-                  node.cost = cached.cost
-                  node.tokens = cached.tokens
-                  node.model = cached.model
-                  node.cached = true
-                  // The budget decrement is left to the shared `ensuring` below
-                  // (node.cost is set), so a cache hit is charged exactly once.
-                  yield* persistRun(db, active)
-                  const structured =
+                  // A schema was requested ⇒ the replayed output must parse as JSON
+                  // to satisfy `result.data`. The source node may be a PLAINTEXT
+                  // agent whose journal key happens to match this schema call (the
+                  // workflow FILE drifted between the original run and the resume:
+                  // same prompt/agent/phase, but the agent now asks for a schema).
+                  // `JSON.parse` on that plaintext would throw SYNCHRONOUSLY and
+                  // turn into a defect. Guard it with `Effect.try` captured as an
+                  // `Effect.exit` (engine style; no try/catch). On a parse FAILURE
+                  // we treat the lookup as a cache MISS — semantically correct: the
+                  // cache cannot serve this schema, so we DON'T consume the journal
+                  // entry, fall through, and let the agent run live (which yields a
+                  // real structured result). Only commit the cache hit once we know
+                  // the parse succeeded.
+                  const parsedExit =
                     agentInput.schema && cached.output !== undefined
-                      ? (JSON.parse(cached.output) as unknown)
+                      ? yield* Effect.try({
+                          try: () => JSON.parse(cached.output!) as unknown,
+                          catch: (error) => (error instanceof Error ? error.message : String(error)),
+                        }).pipe(Effect.exit)
                       : undefined
-                  return {
-                    data: structured !== undefined ? structured : (cached.output ?? ""),
-                    text: cached.output ?? "",
+                  const parseFailed = parsedExit !== undefined && Exit.isFailure(parsedExit)
+                  if (!parseFailed) {
+                    active.journalCursor.set(key, cursor + 1)
+                    node.agent = selected.name
+                    node.status = "completed"
+                    node.completed_at = Date.now()
+                    node.output = cached.output
+                    node.cost = cached.cost
+                    node.tokens = cached.tokens
+                    node.model = cached.model
+                    node.cached = true
+                    // The budget decrement is left to the shared `ensuring` below
+                    // (node.cost is set), so a cache hit is charged exactly once.
+                    yield* persistRun(db, active)
+                    const structured = parsedExit !== undefined ? parsedExit.value : undefined
+                    return {
+                      data: structured !== undefined ? structured : (cached.output ?? ""),
+                      text: cached.output ?? "",
+                    }
                   }
                 }
               }
