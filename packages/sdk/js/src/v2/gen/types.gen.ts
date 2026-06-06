@@ -2052,6 +2052,7 @@ export type Config = {
     reserved?: number
   }
   workflows?: {
+    ultracode_keyword?: boolean
     approval?: "always" | "first-run" | "never"
     approved?: Array<string>
   }

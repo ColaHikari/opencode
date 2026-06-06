@@ -245,13 +245,8 @@ export function Prompt(props: PromptProps) {
   // it when the session toggle is turned off.
   let ultracodeRestoreVariant: string | undefined | false = false
 
-  // Config gates only the keyword detection (default true). The SDK Config type is
-  // generated and does not yet carry the workflows block, so read it through a
-  // narrow optional shape rather than `any`.
-  const ultracodeKeywordEnabled = createMemo(() => {
-    const config = sync.data.config as { workflows?: { ultracode_keyword?: boolean } }
-    return config.workflows?.ultracode_keyword ?? true
-  })
+  // Config gates only the keyword detection (default true).
+  const ultracodeKeywordEnabled = createMemo(() => sync.data.config.workflows?.ultracode_keyword ?? true)
 
   const ultracodeKeyword = createMemo(() => {
     if (!ultracodeKeywordEnabled()) return undefined
