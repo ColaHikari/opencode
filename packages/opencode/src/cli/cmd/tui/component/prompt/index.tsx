@@ -254,6 +254,11 @@ export function Prompt(props: PromptProps) {
   const ultracodeKeyword = createMemo(() => {
     if (!ultracodeKeywordEnabled()) return undefined
     if (store.mode === "shell") return undefined
+    // `/command …` inputs dispatch a slash command and never inject the ultracode
+    // directive on submit, so don't highlight a keyword inside them either — the
+    // visible highlight must mirror the submit behaviour. Mirrors the submit branch's
+    // leading-slash dispatch detection.
+    if (store.prompt.input.trimStart().startsWith("/")) return undefined
     return detectUltracodeKeyword(store.prompt.input)
   })
 
@@ -325,9 +330,13 @@ export function Prompt(props: PromptProps) {
       () => props.sessionID,
       () => {
         setStore("placeholder", randomIndex(list().length))
-        // Ultracode session mode is session-scoped state, so reset it (and any
-        // reasoning-variant boost) whenever the session changes.
-        if (ultracodeSession()) setUltracodeSession(false)
+        // Ultracode session mode is session-scoped state, so reset it whenever the
+        // session changes. The reasoning-variant boost is disk-persistent model
+        // state, so restore the pre-boost variant before clearing — otherwise the
+        // boost leaks onto the model for the next session.
+        if (ultracodeSession() && ultracodeRestoreVariant !== false)
+          local.model.variant.set(ultracodeRestoreVariant)
+        setUltracodeSession(false)
         ultracodeRestoreVariant = false
       },
       { defer: true },
@@ -1083,15 +1092,16 @@ export function Prompt(props: PromptProps) {
     }
 
     const messageID = MessageID.ascending()
-    const inputText = expandTrackedPastedText(
-      store.prompt.input,
-      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
-        const partIndex = store.extmarkToPartIndex.get(extmark.id)
-        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
-        if (part?.type !== "text") return []
-        return [{ start: extmark.start, end: extmark.end, text: part.text }]
-      }),
-    )
+    // Paste-placeholder spans tracked on the RAW input. Expansion is positional, so
+    // these offsets are valid only against the raw text (or a sentinel-protected
+    // copy of it, see below).
+    const pastedRanges = input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
+      const partIndex = store.extmarkToPartIndex.get(extmark.id)
+      const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
+      if (part?.type !== "text") return []
+      return [{ start: extmark.start, end: extmark.end, text: part.text }]
+    })
+    const inputText = expandTrackedPastedText(store.prompt.input, pastedRanges)
 
     // Filter out text parts (pasted content) since they're now expanded inline
     const nonTextParts = store.prompt.parts.filter((part) => part.type !== "text")
@@ -1124,8 +1134,31 @@ export function Prompt(props: PromptProps) {
     // single turn that contains a standalone `ultracode` token, which is stripped from
     // the visible text. Both are prepended as synthetic text parts so the agent sees
     // the orchestration instruction before the user's words.
-    const keywordActive = ultracodeKeywordEnabled() && detectUltracodeKeyword(inputText) !== undefined
-    const promptText = keywordActive ? stripUltracodeKeyword(inputText) : inputText
+    //
+    // Detection AND stripping run on the RAW input (store.prompt.input), exactly what
+    // the live highlight sees — never on the paste-expanded text. Otherwise an
+    // `ultracode` token *inside* pasted content would trigger invisibly (no highlight)
+    // and a real typed keyword that the highlight shows would be stripped from the
+    // expanded text instead. To strip on raw yet keep the positional paste expansion
+    // correct, the placeholder spans are protected with unique sentinels across the
+    // strip, then expanded normally.
+    const keywordActive = ultracodeKeywordEnabled() && detectUltracodeKeyword(store.prompt.input) !== undefined
+    const promptText = keywordActive
+      ? iife(() => {
+          // Replace each placeholder span with a sentinel the keyword strip cannot
+          // touch: no `ultracode`, no whitespace (so the `\s+` collapse, leading-`\s`
+          // strip, and trim leave it intact), no colon/punctuation (so the dangling-
+          // punctuation cleanup skips it). NUL delimiters keep it from colliding with
+          // real input. Strip on the raw text, then expand the sentinels back.
+          const sentinels = pastedRanges.map((range, i) => ({ ...range, sentinel: "\u0000P" + i + "\u0000" }))
+          const protectedRaw = expandTrackedPastedText(
+            store.prompt.input,
+            sentinels.map((s) => ({ start: s.start, end: s.end, text: s.sentinel })),
+          )
+          const stripped = stripUltracodeKeyword(protectedRaw)
+          return sentinels.reduce((acc, s) => acc.replace(s.sentinel, s.text), stripped)
+        })
+      : inputText
     const ultracodeParts = [
       ...(ultracodeSession()
         ? [{ id: PartID.ascending(), type: "text" as const, text: ULTRACODE_SESSION_DIRECTIVE, synthetic: true }]

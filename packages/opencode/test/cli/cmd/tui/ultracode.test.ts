@@ -40,6 +40,15 @@ describe("ultracode keyword", () => {
     expect(detectUltracodeKeyword("ultracode")?.index).toBe(0)
   })
 
+  // Unicode-Wortgrenzen: `\b` ist ASCII-only und würde "ultracodeö" fälschlich als
+  // Treffer werten. Mit Unicode-Lookarounds zählen auch Nicht-ASCII-Buchstaben als
+  // Wortzeichen, also blockieren sie den Match links wie rechts.
+  it("respektiert Unicode-Buchstaben an der Wortgrenze", () => {
+    expect(detectUltracodeKeyword("ultracodeö")).toBeUndefined()
+    expect(detectUltracodeKeyword("öultracode")).toBeUndefined()
+    expect(detectUltracodeKeyword("ödann ultracode jetzt")?.index).toBe(6)
+  })
+
   it("liefert das erste Vorkommen", () => {
     const hit = detectUltracodeKeyword("ultracode then ultracode again")
     expect(hit?.index).toBe(0)
