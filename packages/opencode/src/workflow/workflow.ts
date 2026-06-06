@@ -9,6 +9,7 @@ import { Session } from "@/session/session"
 import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
+import { Global } from "@opencode-ai/core/global"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
 import type { WorkflowAgentRow, WorkflowDefinitionRow, WorkflowLogRow } from "@opencode-ai/core/workflow/sql"
@@ -29,6 +30,7 @@ import type {
 import { WorkflowRunTable } from "./workflow.sql"
 import { MetaReader } from "./meta-reader"
 import { Meta } from "./meta"
+import { BUILTIN_WORKFLOWS, builtinPath } from "./builtin"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
 // / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a
@@ -61,6 +63,12 @@ export const Info = Schema.Struct({
   // string. Valid entries are explicitly `valid: true` (never omitted).
   valid: Schema.Boolean,
   error: Schema.optional(Schema.String),
+  // `source_kind: "builtin"` flags a workflow that ships INSIDE opencode (its
+  // module source is a bundled string, `path` is the synthetic `builtin:<name>`
+  // marker, not a real file). Omitted for the common case of an on-disk
+  // project/global file. Builtins are the lowest-precedence discovery root:
+  // a same-named project or global file shadows the builtin entirely.
+  source_kind: Schema.optional(Schema.Literals(["builtin"])),
 }).annotate({ identifier: "WorkflowInfo" })
 export type Info = Schema.Schema.Type<typeof Info>
 
@@ -778,8 +786,32 @@ function tempFileName(file: string): string {
 // (the realtime-update bug). Correctness over micro-optimization — the
 // double-load that motivated the original finding is already gone because
 // start() now loads only the target module instead of calling list().
-async function loadModule(file: string): Promise<Module> {
-  const source = await Bun.file(file).text()
+// `builtinSource`, when given, is the module SOURCE of a built-in workflow whose
+// `file` is the synthetic `builtin:<name>` marker (not a real path). The marker
+// has no source directory, so the temp copy is written into the GLOBAL workflows
+// directory (`<Global.Path.config>/workflows`) rather than `import.meta.dir`: the
+// builtin source does `import { workflow } from "@opencode-ai/plugin"`, and that
+// bare specifier only resolves from inside a tree where the package is installed.
+// In a compiled Bun binary `import.meta.dir` is `/$bunfs/root` (read-only —
+// `Bun.write` throws ENOENT there), whereas the global config dir is the same
+// binary-proven location where config.ts installs `@opencode-ai/plugin` into
+// `<configdir>/node_modules` (resolution via walk-up) and where normal global
+// workflows already load from. The directory is ensured (the workflows subdir may
+// not exist on a cold system) and the temp file keeps TEMP_FILE_RE's name shape so
+// the per-directory sweep in discover() cleans up any orphan. A write failure is a
+// hard error (there is no original file to fall back to).
+async function loadModule(file: string, builtinSource?: string): Promise<Module> {
+  const source = builtinSource ?? (await Bun.file(file).text())
+  if (builtinSource !== undefined) {
+    const workflowsDir = path.join(Global.Path.config, "workflows")
+    await fs.mkdir(workflowsDir, { recursive: true })
+    const cachePath = path.join(workflowsDir, tempFileName(`${file.replace(/^builtin:/, "")}.ts`))
+    await Bun.write(cachePath, source)
+    const imported = (await import(pathToFileURL(cachePath).href).finally(() =>
+      Bun.file(cachePath).delete(),
+    )) as Record<string, unknown>
+    return finishModule(imported, file)
+  }
   const dir = path.dirname(file)
   const cachePath = path.join(dir, tempFileName(file))
   // Fund 40 (b): the temp copy must live in the source directory so relative
@@ -800,6 +832,14 @@ async function loadModule(file: string): Promise<Module> {
     cleanup = () => Promise.resolve()
   }
   const imported = (await import(pathToFileURL(importPath).href).finally(cleanup)) as Record<string, unknown>
+  return finishModule(imported, file)
+}
+
+// Unwraps the imported module (default-object vs named exports), validates its
+// meta against the same `Meta` schema, and asserts a `run` function — shared by
+// the file and built-in load paths so both fail identically (InvalidError naming
+// the source) when meta is bad or `run` is missing.
+function finishModule(imported: Record<string, unknown>, file: string): Module {
   const module = (
     typeof imported.default === "object" && imported.default !== null ? imported.default : imported
   ) as Record<string, unknown>
@@ -861,9 +901,11 @@ async function withinWorkflowsDir(file: string, workflowsDir: string): Promise<b
 // NAME wins, so a project workflow shadows a same-named global one. Within a
 // directory the glob excludes temp copies by extension; TEMP_FILE_RE filters
 // any remaining match defensively, and the symlink boundary check drops escapes.
+type Discovered = { name: string; path: string; source?: string }
+
 async function discover(directories: readonly string[]) {
   const seen = new Set<string>()
-  const result: { name: string; path: string }[] = []
+  const result: Discovered[] = []
   for (const dir of directories) {
     const workflowsDir = path.join(dir, "workflows")
     // Fire-and-forget sweep of stale temp copies in this directory.
@@ -887,6 +929,16 @@ async function discover(directories: readonly string[]) {
       seen.add(name)
       result.push({ name, path: file })
     }
+  }
+  // Built-in workflows are the LOWEST-precedence root: appended after every
+  // project/global directory so a same-named file already in `seen` shadows the
+  // builtin (first-wins). A builtin carries its module SOURCE inline and a
+  // synthetic `builtin:<name>` path marker — list() reads meta from that source
+  // string and start() loads the module from it, neither touching the filesystem.
+  for (const [name, source] of Object.entries(BUILTIN_WORKFLOWS)) {
+    if (seen.has(name)) continue
+    seen.add(name)
+    result.push({ name, path: builtinPath(name), source })
   }
   return result.toSorted((a, b) => a.name.localeCompare(b.name))
 }
@@ -1099,15 +1151,30 @@ export const layer = Layer.effect(
       return yield* Effect.forEach(
         workflows,
         (workflow) =>
-          Effect.promise(() => Bun.file(workflow.path).text()).pipe(
+          // A builtin carries its module source inline (no file to read); an
+          // on-disk workflow's source comes from its file. MetaReader.read takes
+          // the source string directly either way, so a builtin is meta-extracted
+          // through the identical static (never-executed) path. `source_kind` is
+          // stamped only on builtins so consumers can tell them apart.
+          Effect.promise(() =>
+            workflow.source !== undefined ? Promise.resolve(workflow.source) : Bun.file(workflow.path).text(),
+          ).pipe(
             Effect.map((source): Info => {
+              const kind = workflow.source !== undefined ? ({ source_kind: "builtin" } as const) : {}
               const result = MetaReader.read(source, workflow.path)
               return result.valid
-                ? { ...workflow, meta: result.meta, valid: true }
+                ? { name: workflow.name, path: workflow.path, meta: result.meta, valid: true, ...kind }
                 : // Synthesize a minimal meta so the schema stays satisfied and
                   // consumers can still show the file's name; `valid: false`
                   // signals the entry is not runnable.
-                  { ...workflow, meta: { name: workflow.name }, valid: false, error: result.error }
+                  {
+                    name: workflow.name,
+                    path: workflow.path,
+                    meta: { name: workflow.name },
+                    valid: false,
+                    error: result.error,
+                    ...kind,
+                  }
             }),
           ),
         { concurrency: "unbounded" },
@@ -1263,7 +1330,10 @@ export const layer = Layer.effect(
       // surfaces as a typed InvalidError naming the file, not as an unhandled
       // defect (Effect.promise would treat a rejection as a die).
       const module = yield* Effect.tryPromise({
-        try: () => loadModule(workflow.path),
+        // A builtin carries its module source inline (`workflow.source`); an
+        // on-disk workflow loads from its file. Both go through loadModule's
+        // temp-file import so a builtin runs the IDENTICAL load + validation path.
+        try: () => loadModule(workflow.path, workflow.source),
         catch: (error) =>
           isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
       })
