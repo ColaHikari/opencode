@@ -258,6 +258,41 @@ function waitForWorkflow(workflow: Workflow.Interface, run: Workflow.Run, timeou
     .pipe(Effect.map((waited) => ({ run: waited.run ?? run, timedOut: waited.timedOut })))
 }
 
+// Resolves the moment `ctx.abort` fires (or immediately if already aborted).
+// Mirrors the shell tool's abort observer (tool/shell.ts).
+function awaitAbort(abort: AbortSignal) {
+  return Effect.callback<void>((resume) => {
+    if (abort.aborted) return resume(Effect.void)
+    const handler = () => resume(Effect.void)
+    abort.addEventListener("abort", handler, { once: true })
+    return Effect.sync(() => abort.removeEventListener("abort", handler))
+  })
+}
+
+// N10: a FOREGROUND wait must honor the parent turn's abort signal. Without this
+// a TUI Esc / `POST /:id/abort` during a foreground workflow would leave the tool
+// blocked (up to the 1h wait timeout) AND the run executing (model cost keeps
+// burning). We race the wait against the abort: when abort wins, cancel the run
+// (stopping its agent spend) and return the cancelled state so the tool unblocks
+// immediately. The wait branch is unchanged when no abort fires.
+function waitForWorkflowHonoringAbort(
+  workflow: Workflow.Interface,
+  run: Workflow.Run,
+  abort: AbortSignal,
+  timeout?: number,
+) {
+  return Effect.raceFirst(
+    waitForWorkflow(workflow, run, timeout),
+    awaitAbort(abort).pipe(
+      Effect.andThen(
+        workflow
+          .cancel(run.id)
+          .pipe(Effect.map((cancelled) => ({ run: cancelled ?? run, timedOut: false }))),
+      ),
+    ),
+  )
+}
+
 function workflowMetadata(run: Workflow.Run, background: boolean) {
   return {
     runId: run.id,
@@ -360,7 +395,12 @@ function startWorkflow(input: {
       }
     }
 
-    const waited = yield* waitForWorkflow(input.workflow, run, input.params.timeout ?? DEFAULT_TIMEOUT)
+    const waited = yield* waitForWorkflowHonoringAbort(
+      input.workflow,
+      run,
+      input.ctx.abort,
+      input.params.timeout ?? DEFAULT_TIMEOUT,
+    )
     return {
       title: waited.timedOut ? `Workflow still running: ${run.workflow}` : `Workflow finished: ${run.workflow}`,
       metadata: { ...workflowMetadata(run, false), jobId: "", timedOut: waited.timedOut },
@@ -441,10 +481,15 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "wait") {
             if (!params.run_id) return yield* Effect.fail(new Error("run_id is required for action=wait"))
-            const waited = yield* workflow.wait({
-              id: Workflow.RunID.make(params.run_id),
-              timeout: params.timeout ?? DEFAULT_TIMEOUT,
-            })
+            const runId = Workflow.RunID.make(params.run_id)
+            // N10: honor ctx.abort here too — a wait action that blocks during a
+            // turn abort must unblock and cancel the run rather than hang.
+            const waited = yield* Effect.raceFirst(
+              workflow.wait({ id: runId, timeout: params.timeout ?? DEFAULT_TIMEOUT }),
+              awaitAbort(ctx.abort).pipe(
+                Effect.andThen(workflow.cancel(runId).pipe(Effect.map((run) => ({ run, timedOut: false })))),
+              ),
+            )
             if (!waited.run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             return {
               title: waited.timedOut
