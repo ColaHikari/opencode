@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
+import { Session } from "@/session/session"
+import { Agent } from "@/agent/agent"
+import { SessionID } from "@/session/schema"
 import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -17,7 +20,19 @@ import path from "path"
 
 // Database.defaultLayer is merged so the orphan-sweep tests can seed a row
 // directly through the same in-memory SQLite connection the engine uses.
-const it = testEffect(Layer.mergeAll(Workflow.defaultLayer, Database.defaultLayer, CrossSpawnSpawner.defaultLayer))
+// Session/Agent.defaultLayer are merged so the subagent-permission-inheritance
+// tests can create a caller session (with a deny ruleset) and read back the
+// child session the engine spawns — through the SAME memoised services the
+// engine resolves (Effect dedupes shared layer builds, exactly as for Database).
+const it = testEffect(
+  Layer.mergeAll(
+    Workflow.defaultLayer,
+    Database.defaultLayer,
+    Session.defaultLayer,
+    Agent.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+  ),
+)
 
 const HELLO_FIXTURE = "hello"
 
@@ -170,6 +185,28 @@ export async function run(args, ctx) {
   return { ok: true }
 }
 `
+
+// Subagent-permission-inheritance fixture (#26514 regression / Fund N9): a
+// single agent step that completes. The engine must spawn its child session
+// with a derived `permission` ruleset when a `caller` context is supplied.
+const SINGLE_AGENT_FIXTURE = "single-agent"
+const SINGLE_AGENT_WORKFLOW = `export const meta = { name: "${SINGLE_AGENT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "do the thing" })
+  return { ok: true }
+}
+`
+
+// Prompt-ops that resolve every agent prompt immediately (no hang), so the run
+// reaches `completed` and the child session is fully created/projected.
+function immediatePromptOps() {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: () => Effect.succeed(assistantReply()),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
 // forget) — der hängende ctx.agent-Promise settelt nie vor Body-Ende — und
@@ -2453,6 +2490,91 @@ export async function run() { return { ok: true } }
       // Die nicht übergebenen behalten ihre Defaults.
       expect(result.name).toBe("x")
       expect(result.flag).toBe(true)
+    }),
+  )
+
+  // #26514 regression / Fund N9 (security): a workflow subagent MUST inherit the
+  // caller's deny/external_directory rules (and the caller agent's edit-class
+  // denies, i.e. Plan Mode) — the same ruleset the task tool derives. Before the
+  // fix the engine spawned the child session with NO `permission`, so a parent
+  // `edit: deny` (Plan Mode) or `external_directory` confinement silently leaked.
+  it.instance("workflow subagent inherits the caller session's deny/external_directory rules", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sessions = yield* Session.Service
+
+      // The caller session carries the exact rules a Plan-Mode / confined parent
+      // would: an edit deny and an external_directory rule. The fix must forward
+      // both onto every subagent session the run spawns.
+      const caller = yield* sessions.create({
+        title: "Caller",
+        permission: [
+          { permission: "edit", pattern: "**", action: "deny" },
+          { permission: "external_directory", pattern: "/outside/**", action: "allow" },
+        ],
+      })
+
+      const run = yield* workflow.start({
+        name: SINGLE_AGENT_FIXTURE,
+        args: {},
+        prompt: immediatePromptOps(),
+        caller: { sessionID: caller.id, agent: "build" },
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+
+      const childSessionID = done.agents[0]?.session_id
+      expect(childSessionID).toBeDefined()
+      // The projector persists the session row off the Created event, so poll the
+      // read until the row (and its derived permission) is visible. A not-yet-
+      // projected row fails get() with NotFound → map to undefined to keep polling.
+      const child = yield* pollWithTimeout(
+        sessions
+          .get(SessionID.make(childSessionID!))
+          .pipe(
+            Effect.map((s) => (s.permission ? s : undefined)),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          ),
+        "child session permission never populated",
+      )
+      const rules = child.permission ?? []
+      // Core security assertion: the caller's deny + external_directory rules are
+      // present on the child (regression of #26514 would leave these absent).
+      expect(rules).toContainEqual({ permission: "edit", pattern: "**", action: "deny" })
+      expect(rules).toContainEqual({ permission: "external_directory", pattern: "/outside/**", action: "allow" })
+    }),
+  )
+
+  // Fallback (documented behavior): a programmatic start with NO caller context
+  // keeps the prior behavior — the child session carries no derived `permission`.
+  it.instance("workflow subagent has no inherited ruleset when no caller context is supplied", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sessions = yield* Session.Service
+
+      const run = yield* workflow.start({
+        name: SINGLE_AGENT_FIXTURE,
+        args: {},
+        prompt: immediatePromptOps(),
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+
+      const childSessionID = done.agents[0]?.session_id
+      expect(childSessionID).toBeDefined()
+      // No caller ⇒ no derived ruleset. The session row exists (the run created
+      // it), but its `permission` column stays unset (fromRow → undefined). Poll
+      // until the row is visible (NotFound → undefined keeps polling), then assert
+      // no permission was stored.
+      const child = yield* pollWithTimeout(
+        sessions.get(SessionID.make(childSessionID!)).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
+        "child session never created",
+      )
+      expect(child.permission).toBeUndefined()
     }),
   )
 

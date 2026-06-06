@@ -57,6 +57,12 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
           budget: ctx.payload?.budget,
           // Already branded by the StartPayload schema decode (SessionID).
           permissionSessionID: ctx.payload?.permissionSessionID,
+          // When the HTTP caller supplied a session identity, derive subagent
+          // permission inheritance from it (parent-session deny/external_directory
+          // rules). The HTTP payload carries no caller-agent, so the agent-level
+          // edit denies (Plan Mode) are only inherited on the tool path; without a
+          // session id this is the documented fallback (no inherited ruleset).
+          caller: ctx.payload?.permissionSessionID ? { sessionID: ctx.payload.permissionSessionID } : undefined,
           prompt,
         })
         .pipe(Effect.mapError(apiError(ctx.params.name)))
