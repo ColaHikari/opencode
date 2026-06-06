@@ -412,7 +412,11 @@ function fromRow(row: Row): Run {
     current_phase: row.current_phase ?? undefined,
     logs: row.logs.map((item) => ({ ...item })),
     agents: row.agents.map((item) => ({ ...item })),
-    result: row.result ?? undefined,
+    // Fund 42: the `result` column is plain JSON text (the engine owns the codec,
+    // see persistRun). SQL NULL means the result was never recorded → `undefined`;
+    // any stored text is JSON-parsed, so the literal `"null"` decodes back to the
+    // real `null` a workflow returned rather than being flattened to `undefined`.
+    result: row.result === null ? undefined : JSON.parse(row.result),
     error: row.error ?? undefined,
   }
 }
@@ -470,7 +474,12 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
       definition: active.run.definition ?? null,
       logs: active.run.logs,
       agents: active.run.agents,
-      result: active.run.result ?? null,
+      // Fund 42: the `result` column is plain text and the engine owns its JSON
+      // codec, so a real `null` result survives the roundtrip distinct from an
+      // unset one. An unset result (`undefined`) is stored as SQL NULL; any other
+      // value — including the literal `null` a workflow may return — is stringified
+      // to JSON text (a `null` result becomes the text `"null"`, NOT SQL NULL).
+      result: active.run.result === undefined ? null : JSON.stringify(active.run.result),
       error: active.run.error ?? null,
     }
     return db
@@ -983,16 +992,23 @@ export const layer = Layer.effect(
           node.error ??= status === "cancelled" ? "Cancelled" : "Workflow failed"
         }
       }
-      // N2: resolve the `done` deferred BEFORE the terminal persist, and never
-      // let a persist failure swallow that resolve. `persistRun` is `orDie`, so
-      // a DB error on the terminal write used to kill the finish fiber and the
-      // deferred was never resolved — every no-timeout `wait()` (and background
-      // jobs) then hung forever. Resolving first guarantees waiters always see
-      // the terminal state; the persist is then best-effort (a cut-short
-      // terminal write is healed by the startup orphan sweep on next restart).
+      // N2: a failing terminal persist must NEVER strand the `done` deferred —
+      // `persistRun` is `orDie`, so a DB error on the terminal write used to kill
+      // the finish fiber and the deferred was never resolved, hanging every
+      // no-timeout `wait()` (and background jobs) forever. `Effect.exit` captures
+      // ANY outcome of the persist (success, failure, or the `orDie` defect) as a
+      // value, so execution ALWAYS continues to the resolve below — the persist
+      // can fail and waiters still observe the terminal state (a cut-short write
+      // is healed by the startup orphan sweep on next restart).
+      //
+      // Fund 42: the persist runs BEFORE the resolve so a successful terminal
+      // write is already committed by the time a waiter wakes — a direct DB read
+      // right after `wait()` sees the final row (incl. a `null` result serialized
+      // as the text `"null"`) instead of racing an in-flight progress write. The
+      // `Effect.exit` guard keeps this ordering safe for the failing-persist case.
       const result = snapshot(active)
+      yield* persistRun(db, active, { terminal: true }).pipe(Effect.exit)
       yield* Deferred.succeed(active.done, result).pipe(Effect.ignore)
-      yield* persistRun(db, active, { terminal: true }).pipe(Effect.ignore)
       // Free the per-run scope now that the run is terminal so it does not linger
       // (one empty child scope per run) on the instance scope until teardown. By
       // the time finish runs the body fiber has exited and all dispatched agent
