@@ -932,6 +932,115 @@ export async function run() {
     ),
   )
 
+  // Task 3g (Fund 8, HIGH): creating a workflow writes a project-local .ts file
+  // that subsequent start actions will LOAD and execute, so create is itself a
+  // privileged operation. It must ask the `workflow` permission (the same gate
+  // start uses), in addition to the `edit` permission for the file write. The
+  // recorded asks must include a `workflow` request carrying the sanitized name
+  // as its pattern/`always`, consistent with start.
+  it.live("create asks the workflow permission with the sanitized name", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Made", description: "Created by test." }
+export async function run(args, ctx) { return "ok" }
+`
+        const result = yield* tool.execute({ action: "create", name: "made", source }, recorder.ctx)
+
+        const workflowAsk = recorder.requests.find((req) => req.permission === "workflow")
+        expect(workflowAsk).toBeDefined()
+        expect(workflowAsk!.patterns).toEqual(["made"])
+        expect(workflowAsk!.always).toEqual(["made"])
+        // The edit permission for the file write is still asked.
+        expect(recorder.requests.some((req) => req.permission === "edit")).toBe(true)
+        expect(result.output).toContain("Workflow file created and validated.")
+        const written = yield* Effect.promise(() =>
+          fs.readFile(path.join(dir, ".opencode", "workflows", "made.ts"), "utf8"),
+        )
+        expect(written).toContain(`name: "Made"`)
+      }),
+    ),
+  )
+
+  // Task 3g (Fund 8, HIGH): denying the `workflow` permission on create must
+  // prevent the file write entirely — the file must NOT exist afterwards. The
+  // workflow gate is asked BEFORE the write, so a denial dies before
+  // fs.writeWithDirs ever runs.
+  it.live("denied workflow permission on create prevents the file write", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const ctx: Tool.Context = {
+          ...recorder.ctx,
+          // Deny only the workflow gate; the edit gate (if it came first) would be
+          // allowed, but the workflow gate must be reached and refused before any write.
+          ask: (req) =>
+            req.permission === "workflow"
+              ? Effect.die(new Error("Permission denied: workflow"))
+              : Effect.sync(() => {
+                  recorder.requests.push(req)
+                }),
+        }
+        const source = `export const meta = { name: "Denied" }
+export async function run() { return "ok" }
+`
+        const exit = yield* Effect.exit(tool.execute({ action: "create", name: "denied", source }, ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        // The file was never written because the workflow permission was refused.
+        expect(
+          yield* Effect.promise(() => Bun.file(path.join(dir, ".opencode", "workflows", "denied.ts")).exists()),
+        ).toBe(false)
+      }),
+    ),
+  )
+
+  // Task 3g (Fund 8, HIGH): create must NOT dynamically import the freshly written
+  // module to validate it — doing so would EXECUTE attacker/LLM-authored top-level
+  // code right after the write (the very thing Task 3a moved off discovery). The
+  // module carries a top-level side effect (a marker file write) that would only
+  // run if create imported it; validation must instead go through the static
+  // meta-reader, so the marker must stay absent while the create still succeeds.
+  it.live("create validates statically and never imports the written module", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const marker = path.join(os.tmpdir(), `tool-workflow-create-${Math.random().toString(16).slice(2)}`)
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `await Bun.write(${JSON.stringify(marker)}, "executed")
+export const meta = { name: "Marker", description: "Has a top-level side effect." }
+export async function run() { return "ok" }
+`
+        const result = yield* tool.execute({ action: "create", name: "marker", source }, recorder.ctx)
+        expect(result.output).toContain("Workflow file created and validated.")
+        expect(result.output).toContain(`<workflow name="marker">`)
+        // The module was never imported during create: its top-level marker write
+        // never ran (validation is static via the meta-reader, not a dynamic import).
+        expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+      }),
+    ),
+  )
+
+  // Task 3g (Fund 8, HIGH): a written source whose meta is invalid must produce a
+  // precise "Invalid workflow" failure through the SAME static meta-reader path
+  // (no dynamic import) — meta.name is a number, which statically parses but fails
+  // the Meta schema.
+  it.live("create with an invalid meta fails statically with a precise error", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: 42 }
+export async function run() { return "ok" }
+`
+        const exit = yield* Effect.exit(tool.execute({ action: "create", name: "badmeta", source }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("Invalid workflow")
+      }),
+    ),
+  )
+
   // Fund 56 (low): model/attacker-influenced strings (here a workflow log message)
   // must be XML-escaped in the pseudo-XML envelope so a crafted output cannot
   // forge envelope structure with literal `</log>...` etc.
