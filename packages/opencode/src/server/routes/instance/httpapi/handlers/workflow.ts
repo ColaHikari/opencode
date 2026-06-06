@@ -57,6 +57,12 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
           budget: ctx.payload?.budget,
           // Already branded by the StartPayload schema decode (SessionID).
           permissionSessionID: ctx.payload?.permissionSessionID,
+          // Resume the named source run's journal when supplied (already branded
+          // by the StartPayload decode). Absent ⇒ an ordinary fresh start.
+          resume_of: ctx.payload?.resume_of,
+          // Copy to a mutable array: the engine's StartOptions takes `number[]`
+          // while the decoded schema yields a `readonly number[]`.
+          invalidate_agents: ctx.payload?.invalidate_agents ? [...ctx.payload.invalidate_agents] : undefined,
           // When the HTTP caller supplied a session identity, derive subagent
           // permission inheritance from it (parent-session deny/external_directory
           // rules). The HTTP payload carries no caller-agent, so the agent-level
@@ -77,6 +83,14 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       return run
     })
 
+    const pause = Effect.fn("WorkflowHttpApi.pause")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      // Same contract as cancel: undefined ⇒ unknown id → 404; a known run returns
+      // its snapshot (paused on success) → 200.
+      const run = yield* workflow.pause(ctx.params.id)
+      if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return run
+    })
+
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
       return yield* workflow.remove(ctx.params.id)
     })
@@ -87,6 +101,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("get", get)
       .handle("start", start)
       .handle("cancel", cancel)
+      .handle("pause", pause)
       .handle("remove", remove)
   }),
 )

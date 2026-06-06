@@ -68,6 +68,7 @@ const it = testEffect(
           start: () => Effect.fail(new Workflow.NotFoundError({ name: "test" })),
           wait: () => Effect.succeed({ timedOut: false }),
           cancel: () => Effect.succeed(undefined),
+          pause: () => Effect.succeed(undefined),
           remove: () => Effect.succeed(false),
           sweep: () => Effect.void,
         }),

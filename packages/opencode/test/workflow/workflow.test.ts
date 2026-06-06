@@ -891,6 +891,106 @@ export async function run(args, ctx) {
 }
 `
 
+// Track B — Cap-Fixture: N parallele ctx.agent-Aufrufe, jeder am Barrier-Gate
+// geparkt (über die Prompt-Ops, nicht im Body), damit der Test den ECHTEN Peak
+// gleichzeitig laufender Agent-Dispatches misst. Die Run-weite Semaphore deckelt
+// diesen Peak auf min(16, max(2, cpus-2)). Anders als PARALLEL_BARRIER (das
+// schlichte Tasks parkt und so NUR die parallel-Concurrency misst), parkt diese
+// Fixture innerhalb von ctx.agent — genau der Pfad, den die Semaphore deckelt.
+const AGENT_CAP_FIXTURE = "agent-cap"
+const AGENT_CAP_WORKFLOW = `export const meta = { name: "${AGENT_CAP_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const tasks = Array.from({ length: args.count }, (_, i) => () => ctx.agent({ prompt: "cap " + i }))
+  const result = await ctx.parallel(tasks, { concurrencyLimit: args.count })
+  return { result: result.length }
+}
+`
+
+// Lifetime-Fixture: ruft ctx.agent in einer Schleife N-mal SEQUENTIELL auf, fängt
+// einen geworfenen Fehler ab und meldet, wie viele Aufrufe gelangen, bevor das
+// Lifetime-Limit zugeschlagen hat.
+const LIFETIME_FIXTURE = "agent-lifetime"
+const LIFETIME_WORKFLOW = `export const meta = { name: "${LIFETIME_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  for (let i = 0; i < args.count; i++) {
+    await ctx.agent({ prompt: "step " + i })
+  }
+  return { ok: true }
+}
+`
+
+// Pause-Fixture: ein Agent-Step, der am Gate hängt (über hangingPromptOps), danach
+// ein zweiter Step, der bei korrekter Pause NIE läuft (PAUSE_AFTER_MARKER).
+const PAUSE_FIXTURE = "pause-hang"
+const PAUSE_AFTER_MARKER = "pause-after-reached"
+const PAUSE_WORKFLOW = `export const meta = { name: "${PAUSE_FIXTURE}", phases: ["run", "after"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  ctx.log("pause-started")
+  await ctx.agent({ prompt: "hang" })
+  ctx.setPhase("after")
+  ctx.log("${PAUSE_AFTER_MARKER}")
+  return { ok: true }
+}
+`
+
+// Resume-Fixture: zwei sequentielle ctx.agent-Aufrufe (A, dann B). Beim ersten
+// Lauf wird A completed, B durch die Pause unterbrochen. Beim Resume muss A aus
+// dem Journal kommen (KEIN neuer Prompt), B live laufen. Der Body gibt beide
+// Outputs zurück, damit der Test die Werte prüfen kann.
+const RESUME_FIXTURE = "resume-two-agents"
+const RESUME_WORKFLOW = `export const meta = { name: "${RESUME_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.agent({ prompt: "agent A" })
+  const b = await ctx.agent({ prompt: "agent B" })
+  return { a: a.text, b: b.text }
+}
+`
+
+// Occurrence-Fixture: ZWEI identische Prompts hintereinander. Beim Resume müssen
+// beide getrennt aus dem Journal aufgelöst werden (Occurrence-Index), nicht beide
+// auf denselben Journal-Eintrag.
+const RESUME_DUP_FIXTURE = "resume-dup-prompts"
+const RESUME_DUP_WORKFLOW = `export const meta = { name: "${RESUME_DUP_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const first = await ctx.agent({ prompt: "same prompt" })
+  const second = await ctx.agent({ prompt: "same prompt" })
+  return { first: first.text, second: second.text }
+}
+`
+
+// Prompt-Ops, die jeden Agent-Prompt SOFORT mit einem PROMPT-spezifischen Output
+// beantworten und (a) jeden gestarteten Prompt-Text protokollieren sowie (b) echte
+// Kosten verbuchen. So kann der Resume-Test beweisen, dass für gecachte Agenten
+// KEIN neuer Prompt gefeuert wird (Prompt-Text fehlt in `prompted`) und der Output
+// aus dem Journal stammt. Der Output ist `"out:" + prompt-text` damit identische
+// Prompts dennoch denselben Output liefern (die Occurrence-Trennung wird über die
+// Zähl-Logik geprüft, nicht über unterschiedliche Outputs).
+function recordingPromptOps(db: Database.Interface["db"], cost = 0) {
+  const prompted: string[] = []
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        const text = input.parts?.[0]?.type === "text" ? input.parts[0].text : ""
+        prompted.push(text)
+        const last = yield* persistTurns(db, input.sessionID, [
+          { cost, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+        ])
+        return {
+          info: last.info,
+          parts: [{ type: "text", text: "out:" + text }],
+        } as unknown as SessionV1.WithParts
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, prompted }
+}
+
 describe("Workflow", () => {
   // Fund 48 (deterministic ordering): the pipeline runs each item's stage SEQUENCE
   // independently — there is NO barrier between stages, so item B can be in stage 2
@@ -1883,7 +1983,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
       // Exakt die deklarierten Run-Schlüssel (Teilmenge: optionale können fehlen).
       const allowed = new Set([
         "id", "session_id", "workflow", "args", "definition", "status",
-        "started_at", "completed_at", "current_phase", "logs", "agents", "result", "error",
+        "started_at", "completed_at", "current_phase", "logs", "agents", "result", "error", "resume_of",
       ])
       for (const key of Object.keys(liveAny)) expect(allowed.has(key)).toBe(true)
 
@@ -3051,4 +3151,368 @@ export async function run() { return { ok: true } }
       expect(line).not.toContain('"Infinity"')
     }
   })
+
+  // ===========================================================================
+  // Track B — Run-Caps (Concurrency + Lifetime) und Pause/Resume
+  // ===========================================================================
+
+  // Spec §5.1 (Concurrency-Cap): eine Run-weite Semaphore deckelt ALLE
+  // ctx.agent-Dispatches auf min(16, max(2, cpus-2)) — unabhängig von einem
+  // großzügigeren per-call concurrencyLimit. 30 parallele Quick-Agents, jeder am
+  // Barrier-Gate über die Prompt-Ops geparkt, dürfen daher höchstens cap viele
+  // gleichzeitig laufen lassen. Der Peak wird deterministisch über den Barrier-
+  // Counter gemessen (wie die Fund-49-Tests), nicht über eine Timing-Window.
+  it.instance("run-wide cap bounds concurrent ctx.agent dispatches regardless of per-call limit", () =>
+    Effect.gen(function* () {
+      const cap = Math.min(16, Math.max(2, os.cpus().length - 2))
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, AGENT_CAP_FIXTURE, AGENT_CAP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const sync = installBarrier()
+      // Prompt-Ops, die jeden Agent-Prompt am Barrier-Gate parken (Peak messbar)
+      // und ihn dann mit Telemetrie beantworten.
+      const capOps: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            const barrier = globalThis.__workflowTestBarriers![sync.token]
+            barrier.active++
+            barrier.peak = Math.max(barrier.peak, barrier.active)
+            yield* Effect.promise(() => barrier.gate)
+            barrier.active--
+            return yield* persistTurns(db, input.sessionID, [
+              { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+            ])
+          }),
+        cancel: () => Effect.void,
+      }
+      // 30 parallele Agenten, per-call-Limit 30 (>> cap): die Run-weite Semaphore
+      // muss dennoch greifen.
+      const run = yield* workflow.start({
+        name: AGENT_CAP_FIXTURE,
+        args: { count: 30 },
+        prompt: capOps,
+      })
+      // Warten bis cap viele Agenten gleichzeitig am Gate parken.
+      yield* sync.awaitPeak(cap)
+      // Selbst nach einer Settle-Pause darf der Peak NIE über den Cap klettern:
+      // ein (cap+1)-ter gleichzeitiger Dispatch würde die Semaphore verletzen.
+      yield* Effect.sleep("200 millis")
+      expect(sync.barrier.active).toBe(cap)
+      expect(sync.barrier.peak).toBe(cap)
+      // Gate öffnen, alle 30 abarbeiten lassen.
+      sync.barrier.release()
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("cap run did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { result: number }).result).toBe(30)
+      delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // Spec §5.2 (Lifetime-Cap): ab 1.000 gestarteten Agenten wirft ctx.agent einen
+  // WorkflowAgentLimitError. Über den Test-Seam __testHooks.agentLimit wird das
+  // Limit auf 5 gesetzt: der 6. ctx.agent-Aufruf scheitert mit _tag
+  // "WorkflowAgentLimitError", der Run failt EHRLICH, und genau 5 Agenten sind
+  // sichtbar (completed).
+  it.instance("agent lifetime limit fails the run at the configured ceiling with a tagged error", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, LIFETIME_FIXTURE, LIFETIME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      Workflow.__testHooks.agentLimit(5)
+      const run = yield* workflow.start({
+        name: LIFETIME_FIXTURE,
+        args: { count: 10 },
+        prompt: costPromptOps(db, 0),
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/WorkflowAgentLimitError|agent.*limit/i)
+      // Genau 5 Agenten gelangen; der 6. wird vom Lifetime-Gate geblockt (kein
+      // Node für den geblockten Aufruf).
+      expect(done.agents.filter((a) => a.status === "completed").length).toBe(5)
+      expect(done.agents.length).toBe(5)
+    }),
+  )
+
+  // Spec §5.3 (pause): ein am Agent-Gate hängender Run wird pausiert — die
+  // Sessions werden abgebrochen (Recorder), der Scope geschlossen, der Fiber
+  // unterbrochen, aber der Run finished mit Status `paused` (NICHT cancelled) und
+  // das Journal (agents[]) bleibt erhalten. wait() liefert sofort den
+  // paused-Snapshot (timedOut:false). Der Folge-Step läuft nie.
+  it.instance("pause suspends a running run as paused, aborts sessions, keeps the journal", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PAUSE_FIXTURE, PAUSE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, aborted } = hangingPromptOps()
+      const run = yield* workflow.start({ name: PAUSE_FIXTURE, args: {}, prompt: ops })
+
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
+        }),
+        "agent never started",
+      )
+      const childSession = live.agents[0]?.session_id
+      expect(childSession).toBeDefined()
+
+      const paused = yield* workflow.pause(run.id)
+      expect(paused?.status).toBe("paused")
+      // Die Child-Session wurde abgebrochen (wie cancel).
+      expect(aborted.has(childSession!)).toBe(true)
+
+      // Persistierte Row trägt paused; das Journal bleibt erhalten.
+      const row = yield* fetchRunRow(run.id)
+      expect(row.status).toBe("paused")
+      expect(row.agents.length).toBeGreaterThanOrEqual(1)
+
+      // wait() auf einen paused Run liefert sofort den paused-Snapshot (kein Timeout).
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.timedOut).toBe(false)
+      expect(waited.run?.status).toBe("paused")
+
+      // Der Folge-Step lief nie.
+      const after = yield* workflow.get(run.id)
+      expect(after?.logs.some((l) => l.message?.includes(PAUSE_AFTER_MARKER))).toBe(false)
+    }),
+  )
+
+  // Spec §5.3 (Sweep lässt paused in Ruhe): der Orphan-Sweep darf NUR running-Rows
+  // ohne Live-Fiber zu interrupted machen — paused-Rows bleiben unangetastet.
+  it.instance("sweep leaves paused rows untouched", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const pausedId = "job_paused_sweep"
+      const now = Date.now()
+      yield* db
+        .insert(WorkflowRunTable)
+        .values({
+          id: pausedId,
+          workflow: HELLO_FIXTURE,
+          status: "paused",
+          started_at: now,
+          directory: test.directory,
+          logs: [],
+          agents: [{ id: "1", status: "completed", started_at: now, completed_at: now, prompt: "done", output: "x" }],
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* workflow.sweep()
+      const row = yield* fetchRunRow(pausedId)
+      expect(row.status).toBe("paused")
+    }),
+  )
+
+  // Spec §5.3 (cancel auf paused → cancelled): ein cancel auf einen pausierten Run
+  // überführt ihn in den terminalen Status cancelled.
+  it.instance("cancel on a paused run transitions it to cancelled", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PAUSE_FIXTURE, PAUSE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops } = hangingPromptOps()
+      const run = yield* workflow.start({ name: PAUSE_FIXTURE, args: {}, prompt: ops })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
+        }),
+        "agent never started",
+      )
+      const paused = yield* workflow.pause(run.id)
+      expect(paused?.status).toBe("paused")
+      const cancelled = yield* workflow.cancel(run.id)
+      expect(cancelled?.status).toBe("cancelled")
+      const after = yield* workflow.get(run.id)
+      expect(after?.status).toBe("cancelled")
+    }),
+  )
+
+  // Spec §5.4 (Resume-Journal): ein Run mit Agent A (completed) + B (durch pause
+  // unterbrochen). Ein resume-Start mit resume_of übernimmt A aus dem Journal
+  // (KEIN neuer Prompt für A, output/cost übernommen, cached:true), B läuft live;
+  // das Budget des neuen Runs wird um As Kosten vor-dekrementiert.
+  it.instance("resume replays the completed agent from the journal and runs the rest live", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Erster Lauf: A completed sofort, B hängt → pause unterbricht B.
+      const firstAborted = new Set<string>()
+      const firstGates = new Map<string, Deferred.Deferred<void>>()
+      let promptCount = 0
+      const firstOps: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            promptCount++
+            const text = input.parts?.[0]?.type === "text" ? input.parts[0].text : ""
+            // Agent A beantwortet sofort mit Kosten 0.25; Agent B hängt.
+            if (text === "agent A") {
+              const last = yield* persistTurns(db, input.sessionID, [
+                { cost: 0.25, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+              ])
+              return { info: last.info, parts: [{ type: "text", text: "out:A" }] } as unknown as SessionV1.WithParts
+            }
+            const gate = yield* Deferred.make<void>()
+            firstGates.set(input.sessionID, gate)
+            yield* Effect.race(
+              Effect.sleep("30 seconds"),
+              Deferred.await(gate).pipe(Effect.flatMap(() => Effect.interrupt)),
+            )
+            return assistantReply()
+          }),
+        cancel: (sessionID) =>
+          Effect.gen(function* () {
+            firstAborted.add(sessionID)
+            const gate = firstGates.get(sessionID)
+            if (gate) yield* Deferred.succeed(gate, undefined)
+          }),
+      }
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps })
+      // Warten bis A completed und B running ist.
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(first.id)
+          const completed = current?.agents.filter((a) => a.status === "completed") ?? []
+          const running = current?.agents.filter((a) => a.status === "running" && a.session_id) ?? []
+          return completed.length >= 1 && running.length >= 1 ? current : undefined
+        }),
+        "first run did not reach A-completed + B-running",
+      )
+      const pausedFirst = yield* workflow.pause(first.id)
+      expect(pausedFirst?.status).toBe("paused")
+      const firstPromptCount = promptCount
+
+      // Zweiter Lauf (resume): recordingPromptOps protokolliert jeden GEFEUERTEN
+      // Prompt. A muss aus dem Journal kommen (NICHT in prompted), B live.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0.5)
+      const resumed = yield* workflow.start({
+        name: RESUME_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        budget: 10,
+      })
+      const done = (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // A kam aus dem Journal: KEIN neuer Prompt "agent A" wurde gefeuert.
+      expect(prompted).not.toContain("agent A")
+      // B lief live.
+      expect(prompted).toContain("agent B")
+      // Das resume hat den Quell-Run NICHT erneut geprompt (firstPromptCount fix).
+      expect(firstPromptCount).toBeGreaterThanOrEqual(1)
+      // A's Output (aus dem Journal) und B's Live-Output sind im Resultat.
+      const result = done.result as { a: string; b: string }
+      expect(result.a).toBe("out:A")
+      expect(result.b).toBe("out:agent B")
+      // Agent-Node A ist als cached markiert, B nicht.
+      const agentA = done.agents.find((a) => a.output === "out:A")
+      expect(agentA?.cached).toBe(true)
+      const agentB = done.agents.find((a) => a.output === "out:agent B")
+      expect(agentB?.cached).not.toBe(true)
+      // resume_of ist auf der Row vermerkt.
+      const row = yield* fetchRunRow(resumed.id)
+      expect(row.resume_of).toBe(first.id)
+    }),
+  )
+
+  // Spec §5.4 (Occurrence-Index): zwei identische Prompts müssen beim Resume
+  // getrennt aus dem Journal aufgelöst werden (je nach Aufruf-Reihenfolge), nicht
+  // beide auf denselben Eintrag. Beide A-Agenten kommen aus dem Journal, also wird
+  // KEIN Prompt erneut gefeuert.
+  it.instance("resume caches two identical prompts separately by occurrence", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_DUP_FIXTURE, RESUME_DUP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Erster Lauf: beide identischen Prompts completen sofort mit
+      // UNTERSCHEIDBAREN Outputs (out:0, out:1), damit der Test beweisen kann, dass
+      // die zwei Journal-Einträge getrennt aufgelöst werden.
+      let counter = 0
+      const firstOps: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            const idx = counter++
+            const last = yield* persistTurns(db, input.sessionID, [
+              { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+            ])
+            return { info: last.info, parts: [{ type: "text", text: "out:" + idx }] } as unknown as SessionV1.WithParts
+          }),
+        cancel: () => Effect.void,
+      }
+      const first = yield* workflow.start({ name: RESUME_DUP_FIXTURE, args: {}, prompt: firstOps })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first dup run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      expect(firstDone.result).toEqual({ first: "out:0", second: "out:1" })
+
+      // Resume: beide identischen Prompts müssen aus dem Journal kommen (kein neuer
+      // Prompt), und zwar getrennt: first→out:0, second→out:1 (Occurrence-Reihenfolge).
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: RESUME_DUP_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume dup did not finish")))
+      expect(done.status).toBe("completed")
+      // Kein Prompt wurde gefeuert: beide kamen aus dem Journal.
+      expect(prompted).toHaveLength(0)
+      // Getrennt aufgelöst, in Occurrence-Reihenfolge.
+      expect(done.result).toEqual({ first: "out:0", second: "out:1" })
+    }),
+  )
+
+  // Spec §5.4 (invalidate_agents): mit invalidate_agents:[0] läuft Agent #0 live
+  // neu, alle anderen cachen.
+  it.instance("resume with invalidate_agents reruns the named index live and caches the rest", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Erster Lauf: beide Agenten completen sofort.
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      // Resume mit invalidate_agents:[0] → Agent #0 (A) läuft live neu, B cacht.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: RESUME_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        invalidate_agents: [0],
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // Nur Agent A (#0) lief live neu; B kam aus dem Journal.
+      expect(prompted).toContain("agent A")
+      expect(prompted).not.toContain("agent B")
+      const agentA = done.agents.find((a) => a.prompt === "agent A")
+      expect(agentA?.cached).not.toBe(true)
+      const agentB = done.agents.find((a) => a.prompt === "agent B")
+      expect(agentB?.cached).toBe(true)
+    }),
+  )
 })
