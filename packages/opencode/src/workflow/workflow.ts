@@ -1018,16 +1018,40 @@ export const layer = Layer.effect(
       active.run.result = data?.result
       active.run.error = data?.error
       active.fiber = undefined
-      // Close out any agent that is still marked running when the run ends as
-      // cancelled/failed — its session was aborted (cancel) or the run unwound,
-      // so it is no longer running.
-      if (status !== "completed") {
-        for (const node of active.run.agents) {
-          if (node.status !== "running") continue
-          node.status = "failed"
-          node.completed_at = completed_at
-          node.error ??= status === "cancelled" ? "Cancelled" : "Workflow failed"
-        }
+      // Close out EVERY agent node still marked `running` at the terminal
+      // transition — for ALL terminal statuses, completed included (N11). A run
+      // can reach `completed` while an agent node is still running without any
+      // author error: a fire-and-forget `ctx.agent` whose promise settles after
+      // the body returns, or a settlement race. Gating this on the non-completed
+      // statuses left such a node persisted as `running` forever (TUI live icon),
+      // and its detached child session kept burning tokens. Now the node always
+      // gets a terminal status + completed_at + an explanatory error, and the
+      // still-open child sessions are aborted below.
+      const lingering = active.run.agents.filter((node) => node.status === "running")
+      for (const node of lingering) {
+        node.status = "failed"
+        node.completed_at = completed_at
+        node.error ??=
+          status === "cancelled"
+            ? "Cancelled"
+            : status === "completed"
+              ? "agent step never settled before the run completed"
+              : "Workflow failed"
+      }
+      // Abort the child session of every node that was still running, so a
+      // detached agent does not keep spending after the run is terminal (N11).
+      // The per-run scope close below interrupts the dispatched agent FIBER, but
+      // that does not run the prompt-ops `cancel` vector (the actual session
+      // abort, same path as TUI Esc / HTTP abort) — so abort explicitly here.
+      // Idempotent: on the cancel/remove path abortRun already aborted these, and
+      // a node with no session_id (never reached session creation) is skipped.
+      if (active.cancelSession) {
+        const cancelSession = active.cancelSession
+        yield* Effect.forEach(
+          lingering.flatMap((node) => (node.session_id ? [node.session_id] : [])),
+          (sessionID) => cancelSession(SessionID.make(sessionID)),
+          { concurrency: "unbounded", discard: true },
+        ).pipe(Effect.ignore)
       }
       // N2: a failing terminal persist must NEVER strand the `done` deferred —
       // `persistRun` is `orDie`, so a DB error on the terminal write used to kill
