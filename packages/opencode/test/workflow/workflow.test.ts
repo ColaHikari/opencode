@@ -1137,6 +1137,97 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // N1 (medium): Ein terminaler Run muss nach finish() aus der In-Memory-Registry
+  // evictet sein, sonst wächst die Map unbeschränkt UND get()/runs() pinnen für
+  // immer den In-Memory-Snapshot eines toten Runs statt der DB-Row (gepinnte
+  // Divergenz). Seam (ohne neuen Produktions-Export): nach Abschluss die DB-Row
+  // direkt über die SQL-Schicht mutieren und get() lesen. Hielte die Registry den
+  // Run noch, läse get() den (stale) In-Memory-Snapshot und ignorierte die
+  // Mutation; nach Eviction fällt get() auf fromRow → die Mutation ist sichtbar.
+  it.instance("a finished run is evicted from the in-memory registry (get falls back to the DB row)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "hello",
+          `export const meta = { name: "Hello" }
+export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); return { value: args.value } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "hello", args: { value: 42 } })
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.run?.status).toBe("completed")
+      expect(waited.run?.result).toEqual({ value: 42 })
+
+      // Direkt die DB-Row mutieren (umgeht die Engine vollständig) UND innerhalb
+      // der Poll-Schleife re-applizieren: eine zuletzt noch geforkte Progress-
+      // Schreibung (aus ctx.setPhase/log) kann unmittelbar nach wait() einmalig
+      // current_phase auf "run" zurückschreiben — das Re-Apply macht den Test
+      // robust gegen dieses kurze Fenster. Hielte die Registry den Run dagegen
+      // noch, läse get() den gepinnten In-Memory-Snapshot (current_phase === "run")
+      // und die DB-Mutation bliebe — egal wie oft geschrieben — für immer
+      // unsichtbar. Nach Eviction (Designreihenfolge 3e/N2: NACH dem Deferred-
+      // Resolve) fällt get() auf die DB-Row zurück → die Mutation wird sichtbar.
+      const { db } = yield* Database.Service
+      const after = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ current_phase: "db-mutated" })
+            .where(eq(WorkflowRunTable.id, run.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(run.id)
+          return current?.current_phase === "db-mutated" ? current : undefined
+        }),
+        "finished run was never evicted from the registry (get stayed pinned to the in-memory snapshot)",
+      )
+      expect(after.current_phase).toBe("db-mutated")
+      // Der Terminalstand bleibt sonst korrekt (kein Stale-Verlust).
+      expect(after.status).toBe("completed")
+      expect(after.result).toEqual({ value: 42 })
+      expect(after.logs.map((l) => l.message)).toContain("running")
+    }),
+  )
+
+  // N1 (medium) — Reihenfolge-Sicherung gegen 3e/N2: ein wait()-Warter, der GENAU
+  // um den finish()-Übergang aufwacht, muss noch den Terminalzustand erhalten —
+  // die Eviction darf den Waiter nicht entwerten (der Run kommt aus dem resolved
+  // done-Deferred; ein get() danach liest die DB-Row, die der Terminal-Persist
+  // VOR der Eviction geschrieben hat).
+  it.instance("a waiter receives the terminal state across eviction; the DB row is present afterwards", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "hello",
+          `export const meta = { name: "Hello" }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "hello", args: { value: 7 } })
+      // wait() ohne Timeout hängt am done-Deferred und wacht beim Terminal-Übergang
+      // auf — nach Persist + Deferred.succeed, danach folgt die Eviction.
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.run?.status).toBe("completed")
+      expect(waited.run?.result).toEqual({ value: 7 })
+      // Der Terminal-Persist lief VOR der Eviction: die DB-Row existiert (kein
+      // Read-after-Evict-Loch).
+      const row = yield* fetchRunRow(run.id)
+      expect(row.status).toBe("completed")
+      // Und get() nach Abschluss liefert exakt den persistierten Stand.
+      const got = yield* workflow.get(run.id)
+      expect(got?.status).toBe("completed")
+      expect(got?.result).toEqual({ value: 7 })
+    }),
+  )
+
   // Fund 42 / N20 (low): result === null darf im DB-Roundtrip NICHT zu undefined
   // ("No result recorded.") werden. Drei Fälle, end-to-end durch den echten
   // Engine-Persist getrieben: ein echtes result, result === null und nie gesetzt.

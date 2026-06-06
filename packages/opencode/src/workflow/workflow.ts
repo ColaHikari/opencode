@@ -1070,13 +1070,32 @@ export const layer = Layer.effect(
       const result = snapshot(active)
       yield* persistRun(db, active, { terminal: true }).pipe(Effect.exit)
       yield* Deferred.succeed(active.done, result).pipe(Effect.ignore)
+      // N1: evict the terminal run from the in-memory registry so the map does not
+      // grow unbounded for a long-lived instance, and so a dead run's heavy
+      // in-memory snapshot (full logs/agents/result) is no longer pinned ahead of
+      // its DB row by get()/readRuns() (a divergence once the row is later edited
+      // out-of-band, e.g. by a sweep). ORDER is critical (3e/N2): the eviction runs
+      // only AFTER (a) the terminal persist above committed the DB row — so get()
+      // after evict reads a real row through fromRow, never a hole — and AFTER (b)
+      // `Deferred.succeed`, so a waiter already holds the terminal snapshot from the
+      // resolved deferred even if it wakes exactly at the eviction; a subsequent
+      // get() then falls back to that committed DB row. Safe even when the terminal
+      // persist FAILED (the `Effect.exit` above): the startup orphan sweep heals a
+      // cut-short row, and an evicted-but-unpersisted run is simply no longer
+      // readable until then — strictly better than a forever-pinned stale snapshot.
+      const inst = yield* InstanceState.get(state)
+      yield* SynchronizedRef.update(inst.runs, (runs) => {
+        if (!runs.has(id)) return runs
+        const next = new Map(runs)
+        next.delete(id)
+        return next
+      })
       // Free the per-run scope now that the run is terminal so it does not linger
       // (one empty child scope per run) on the instance scope until teardown. By
       // the time finish runs the body fiber has exited and all dispatched agent
       // fibers have settled, so this interrupts nothing live; on the cancel/remove
       // path abortRun already closed it and a second close is a no-op. Forked so a
       // finalizer cannot delay the terminal return.
-      const inst = yield* InstanceState.get(state)
       yield* Scope.close(active.runScope, Exit.void).pipe(Effect.ignore, Effect.forkIn(inst.scope))
       return result
     })
