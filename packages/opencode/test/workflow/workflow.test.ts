@@ -8,6 +8,8 @@ import { eq } from "drizzle-orm"
 import { TestInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Layer } from "effect"
+import { Global } from "@opencode-ai/core/global"
+import fs from "fs/promises"
 import path from "path"
 
 // Database.defaultLayer is merged so the orphan-sweep tests can seed a row
@@ -39,12 +41,7 @@ function seedRunningRow(id: string) {
 function fetchRunRow(id: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const row = yield* db
-      .select()
-      .from(WorkflowRunTable)
-      .where(eq(WorkflowRunTable.id, id))
-      .get()
-      .pipe(Effect.orDie)
+    const row = yield* db.select().from(WorkflowRunTable).where(eq(WorkflowRunTable.id, id)).get().pipe(Effect.orDie)
     return row ?? (yield* Effect.fail(new Error(`row ${id} not found`)))
   })
 }
@@ -208,8 +205,7 @@ function structuredPromptOps(mode: "structured" | "undefined" | "error", cost = 
             name: "StructuredOutputError",
             data: { message: "Model did not produce structured output", retries: 0 },
           }
-        const parts =
-          mode === "undefined" || mode === "error" ? [{ type: "text", text: "here is some plaintext" }] : []
+        const parts = mode === "undefined" || mode === "error" ? [{ type: "text", text: "here is some plaintext" }] : []
         return { info: { ...info, id: "msg_test" }, parts } as unknown as SessionV1.WithParts
       }),
     cancel: () => Effect.void,
@@ -506,7 +502,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
       // Narrow the start() error union (InvalidError | NotFoundError) to the
       // precise InvalidError so its `path` is accessible and typed.
       const invalid =
-        failed instanceof Workflow.InvalidError ? failed : (yield* Effect.fail(new Error("expected InvalidError")))
+        failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
       expect(invalid.path).toContain("broken")
 
       // Die gültige Datei ist trotz broken.ts startbar (kein voller list()-Abbruch).
@@ -790,9 +786,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   it.instance("budgetRemaining reflects real spend during the run", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, BUDGET_REMAINING_FIXTURE, BUDGET_REMAINING_WORKFLOW),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_REMAINING_FIXTURE, BUDGET_REMAINING_WORKFLOW))
       const workflow = yield* Workflow.Service
       const run = yield* workflow.start({
         name: BUDGET_REMAINING_FIXTURE,
@@ -813,9 +807,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   it.instance("no budget set means unlimited (Infinity) — unchanged default", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, BUDGET_UNLIMITED_FIXTURE, BUDGET_UNLIMITED_WORKFLOW),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_UNLIMITED_FIXTURE, BUDGET_UNLIMITED_WORKFLOW))
       const workflow = yield* Workflow.Service
       const run = yield* workflow.start({
         name: BUDGET_UNLIMITED_FIXTURE,
@@ -891,6 +883,139 @@ export async function run() { return { value: "two" } }
       const secondDone = secondWaited.run ?? (yield* Effect.fail(new Error("second workflow did not finish")))
       expect(secondDone.definition?.meta.name).toBe("Reload Two")
       expect(secondDone.result).toEqual({ value: "two" })
+    }),
+  )
+
+  // Fund 2 (Symlink-Boundary): Ein Symlink in workflows/ -> externes Ziel darf
+  // NIE als Workflow erscheinen. Sonst sieht ein Reviewer nur den harmlosen
+  // Symlink, während start() das externe Ziel (z. B. /tmp/payload.ts) lädt.
+  it.instance("a symlink in workflows/ pointing outside the directory is not discovered", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      // Externes Ziel außerhalb des workflows-Verzeichnisses.
+      const external = path.join(os.tmpdir(), `workflow-symlink-payload-${Math.random().toString(16).slice(2)}.js`)
+      yield* Effect.promise(() =>
+        Bun.write(
+          external,
+          `export const meta = { name: "Payload" }
+export async function run() { return { ok: true } }
+`,
+        ),
+      )
+      // Reguläre Datei als Regressions-Guard: muss weiterhin gefunden werden.
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "regular",
+          `export const meta = { name: "Regular" }
+export async function run() { return { ok: true } }
+`,
+        ),
+      )
+      const workflowsDir = path.join(test.directory, ".opencode", "workflows")
+      const link = path.join(workflowsDir, "evil.js")
+      yield* Effect.promise(() => fs.symlink(external, link))
+
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      // Der Symlink-Eintrag darf NICHT als gültiger Workflow erscheinen.
+      const evil = list.find((item) => item.name === "evil")
+      expect(evil?.valid).not.toBe(true)
+      // Die reguläre Datei bleibt auffindbar (Regressions-Guard).
+      expect(list.some((item) => item.name === "regular" && item.valid === true)).toBe(true)
+
+      yield* Effect.promise(() => fs.rm(external, { force: true }))
+    }),
+  )
+
+  // Fund 40 (Temp-Cleanup): Eine verwaiste loadModule-Tempdatei (Namensmuster
+  // `.<base>.<ts>.<rand>.mts`) im workflows-Verzeichnis darf NIE als Workflow
+  // gelistet werden und wird beim Discovery-Lauf opportunistisch gelöscht, wenn
+  // sie alt ist (> ~1h).
+  it.instance("an orphaned loadModule temp file is never listed and old ones are swept", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "hello",
+          `export const meta = { name: "Hello" }
+export async function run() { return { ok: true } }
+`,
+        ),
+      )
+      const workflowsDir = path.join(test.directory, ".opencode", "workflows")
+      // Exaktes Namensmuster, das loadModule erzeugt: `.<base>.<ts>.<rand>.mts`.
+      const orphan = path.join(workflowsDir, `.hello.${Date.now()}.abc123.mts`)
+      yield* Effect.promise(() =>
+        Bun.write(
+          orphan,
+          `export const meta = { name: "Orphan" }
+export async function run() { return { ok: true } }
+`,
+        ),
+      )
+      // Alt machen (2h zurück), damit der Sweep sie löscht.
+      const old = new Date(Date.now() - 2 * 60 * 60 * 1000)
+      yield* Effect.promise(() => fs.utimes(orphan, old, old))
+
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      // Die Tempdatei darf in keiner Form als Workflow auftauchen.
+      expect(list.some((item) => item.name.includes("hello.") || item.meta.name === "Orphan")).toBe(false)
+      // Die echte Datei bleibt gelistet.
+      expect(list.some((item) => item.name === "hello" && item.valid === true)).toBe(true)
+      // Die alte verwaiste Tempdatei wurde beim Discovery-Lauf gelöscht.
+      expect(yield* Effect.promise(() => Bun.file(orphan).exists())).toBe(false)
+    }),
+  )
+
+  // N4 (Projekt-Vorrang): Ein gleichnamiger Workflow im Projekt- UND im
+  // Global-Config-Verzeichnis muss zur PROJEKT-Datei auflösen — sonst schattet
+  // die globale Datei die Projektdatei und start()/find() trifft die falsche.
+  it.instance("a project workflow takes precedence over a same-named global workflow", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      // Projekt-Datei.
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "shared",
+          `export const meta = { name: "ProjectShared" }
+export async function run() { return { from: "project" } }
+`,
+        ),
+      )
+      // Gleichnamige Datei im globalen Config-Verzeichnis (~/.config/opencode).
+      const globalWorkflows = path.join(Global.Path.config, "workflows")
+      const globalFile = path.join(globalWorkflows, "shared.js")
+      yield* Effect.promise(() => fs.mkdir(globalWorkflows, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          globalFile,
+          `export const meta = { name: "GlobalShared" }
+export async function run() { return { from: "global" } }
+`,
+        ),
+      )
+
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      const shared = list.filter((item) => item.name === "shared")
+      // Genau ein Eintrag (dedupliziert nach Name)...
+      expect(shared.length).toBe(1)
+      // ... und es ist die PROJEKT-Datei.
+      const projectWorkflows = path.join(test.directory, ".opencode", "workflows")
+      expect(shared[0]?.path.startsWith(projectWorkflows)).toBe(true)
+      expect(shared[0]?.meta.name).toBe("ProjectShared")
+
+      // start() löst denselben Namen ebenfalls zur Projekt-Datei auf.
+      const run = yield* workflow.start({ name: "shared" })
+      const done = (yield* workflow.wait({ id: run.id })).run
+      expect(done?.result).toEqual({ from: "project" })
+      expect(done?.definition?.path.startsWith(projectWorkflows)).toBe(true)
+
+      yield* Effect.promise(() => fs.rm(globalFile, { force: true }))
     }),
   )
 })

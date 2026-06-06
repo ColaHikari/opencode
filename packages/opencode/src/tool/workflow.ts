@@ -409,15 +409,26 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "start") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
+            // N15 (security, behavior change): the name reaching the permission
+            // pattern/`always` MUST be glob-metacharacter-free. A discovered
+            // workflow name is just a file basename (discover() does
+            // path.basename without any charset limit), so a file like `*.ts`
+            // would yield name `*`. The permission layer matches `always` rules
+            // via Wildcard.match, where `*` expands to `.*` — so an unsanitized
+            // `always: ["*"]` "allow" would silently grant EVERY future workflow.
+            // We reuse create's sanitizer so start accepts exactly the same name
+            // shape create writes; an illegal name fails here instead of becoming
+            // an over-broad rule.
+            const safeName = sanitizeWorkflowName(params.name)
             // Permission gate FIRST — before any discovery/list/load. The list()
             // pre-check below is now side-effect-free (static meta extraction), but
             // the ask still has to come first so an untrusted workspace can never
             // drive any workflow work ahead of the user's consent.
             yield* ctx.ask({
               permission: "workflow",
-              patterns: [params.name],
-              always: [params.name],
-              metadata: { name: params.name, args: params.args ?? {}, background: params.background === true },
+              patterns: [safeName],
+              always: [safeName],
+              metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
             })
             // Existence pre-check via the static list so an unknown name fails with
             // a clear "not found" rather than surfacing deep inside start().
