@@ -171,17 +171,25 @@ export async function run(args, ctx) {
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
 // forget) — der hängende ctx.agent-Promise settelt nie vor Body-Ende — und
-// returnt sofort. Die kurze Pause gibt dem dispatchten Agent-Fiber Zeit, seine
+// returnt sofort. Die Pause gibt dem dispatchten Agent-Fiber Zeit, seine
 // Child-Session zu erzeugen/registrieren und am hängenden Prompt zu blockieren,
 // BEVOR der Body zurückkehrt und der Run als `completed` finished. So bleibt ein
 // Agent-Node beim Terminal-Übergang noch `running` OHNE Autor-Fehlverhalten.
+//
+// Die Session-Erzeugung läuft als geforkter Fiber im run-Scope (asynchron, NACH
+// dem synchronen Node-Push). Unter Last (volle Suite parallel) kann ein zu
+// kurzes Fenster diesen Fiber verhungern lassen, bevor node.session_id gesetzt
+// ist — dann fände finish() den Node zwar noch `running`, aber ohne Session zum
+// Abbrechen, und die Session-Assertion des Tests flackerte. 400ms gibt dem Fork
+// auch unter Contention zuverlässig Zeit; der hängende Prompt (30s-Race im Fake)
+// stellt sicher, dass der Node beim Body-Ende dennoch `running` ist.
 const DETACHED_AGENT_FIXTURE = "detached-agent"
 const DETACHED_AGENT_WORKFLOW = `export const meta = { name: "${DETACHED_AGENT_FIXTURE}", phases: ["run"] }
 export async function run(args, ctx) {
   ctx.setPhase("run")
   // Bewusst NICHT awaiten: der Promise hängt am Prompt, der Body returnt davor.
   void ctx.agent({ prompt: "hang" }).catch(() => {})
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await new Promise((resolve) => setTimeout(resolve, 400))
   return { ok: true }
 }
 `
