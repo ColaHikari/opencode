@@ -139,6 +139,11 @@ function seedCompletedRow(id: string, directory: string) {
             phase: "run",
             prompt: "do the thing",
             output: "did the thing",
+            // Fund 51: per-agent telemetry (cost USD + tokens incl. `total`) must
+            // survive the DB→fromRow roundtrip, not just status/output. Seeded with
+            // non-zero values so a roundtrip that drops them would be observable.
+            cost: 0.42,
+            tokens: { total: 99, input: 11, output: 22, reasoning: 33, cache: { read: 44, write: 55 } },
           },
         ],
         // The `result` column is plain text and the engine owns its JSON codec
@@ -269,6 +274,143 @@ export async function run(args, ctx) { ctx.setPhase("run"); const r = { a: 1 }; 
 function assistantReply(): SessionV1.WithParts {
   return { info: { role: "assistant" }, parts: [] } as unknown as SessionV1.WithParts
 }
+
+// Deterministic concurrency barrier shared with a workflow module's body.
+// `loadModule` imports the workflow into the SAME process, and Bun shares
+// `globalThis` across dynamically imported modules (verified), so a barrier
+// registered here under a unique token is reachable from the workflow body via
+// `globalThis.__workflowTestBarriers[token]`. Every task entering the barrier
+// bumps a live `active` counter (tracking `peak`) and then parks on a single
+// shared gate Promise until the test releases it. This replaces wall-clock
+// `setTimeout` windows (Fund 48): a task's overlap is observed by polling the
+// `active` counter for a CONDITION (e.g. "20 tasks parked"), never by sleeping a
+// fixed duration and hoping the tasks happened to overlap. The gate keeps every
+// in-flight task suspended until the test has observed the peak, so the measured
+// concurrency is exactly the engine's scheduling decision, not a timing artifact.
+type TestBarrier = {
+  active: number
+  peak: number
+  /** Resolves when the test releases the gate; tasks await this before exiting. */
+  gate: Promise<void>
+  release: () => void
+  /** Per-key ordered markers a task can push (used by the no-barrier pipeline proof). */
+  order: string[]
+}
+
+declare global {
+  // `var` (not `const`) is required for a writable global so the body and the
+  // test can assign `globalThis.__workflowTestBarriers`.
+  var __workflowTestBarriers: Record<string, TestBarrier> | undefined
+}
+
+// Installs a fresh barrier under a unique token and returns the token plus an
+// Effect that polls until at least `count` tasks are simultaneously parked on the
+// gate (the deterministic "tasks have overlapped" condition) and reports the peak.
+function installBarrier() {
+  const token = `barrier_${Math.random().toString(16).slice(2)}`
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const barrier: TestBarrier = { active: 0, peak: 0, gate, release, order: [] }
+  ;(globalThis.__workflowTestBarriers ??= {})[token] = barrier
+  return {
+    token,
+    barrier,
+    // Waits until `peak` has reached `count` (i.e. that many tasks have been
+    // simultaneously parked at the gate at some point), then yields the barrier.
+    awaitPeak: (count: number) =>
+      pollWithTimeout(
+        Effect.sync(() => (barrier.peak >= count ? barrier : undefined)),
+        `barrier never reached peak ${count}`,
+      ),
+    // Waits until an exact ordered marker has been recorded by a task.
+    awaitOrder: (marker: string) =>
+      pollWithTimeout(
+        Effect.sync(() => (barrier.order.includes(marker) ? barrier : undefined)),
+        `barrier never recorded order marker ${marker}`,
+      ),
+  }
+}
+
+// The body-side latch helper, inlined as source text into every barrier fixture
+// (the workflow module runs in its own import; it cannot import test helpers).
+// A task: bumps active/peak, parks on the gate, then decrements active on the way
+// out. `enter`/`leave` are split so a pipeline stage can record order between them.
+const BARRIER_PRELUDE = `
+  const __b = globalThis.__workflowTestBarriers[args.__barrier]
+  const __enter = () => { __b.active++; __b.peak = Math.max(__b.peak, __b.active) }
+  const __leave = () => { __b.active-- }
+  const __park = async () => { await __b.gate }
+`
+
+// Parallel barrier fixture: N tasks (count from args), each parks on the shared
+// gate so the test can observe the true peak concurrency deterministically. The
+// concurrencyLimit is passed through from args (omitted ⇒ engine default).
+const PARALLEL_BARRIER_FIXTURE = "parallel-barrier"
+const PARALLEL_BARRIER_WORKFLOW = `export const meta = { name: "${PARALLEL_BARRIER_FIXTURE}", phases: ["parallel"] }
+export async function run(args, ctx) {
+  ctx.setPhase("parallel")${BARRIER_PRELUDE}
+  const tasks = Array.from({ length: args.count }, (_, i) => async () => {
+    __enter()
+    await __park()
+    __leave()
+    return i
+  })
+  const options = args.concurrencyLimit === undefined ? undefined : { concurrencyLimit: args.concurrencyLimit }
+  const result = await ctx.parallel(tasks, options)
+  return { peak: __b.peak, result }
+}
+`
+
+// Pipeline barrier fixture: N items, ONE stage that parks every item on the gate,
+// so the test can observe how many items run that stage concurrently (the
+// pipeline concurrency default / clamp).
+const PIPELINE_BARRIER_FIXTURE = "pipeline-barrier"
+const PIPELINE_BARRIER_WORKFLOW = `export const meta = { name: "${PIPELINE_BARRIER_FIXTURE}", phases: ["pipeline"] }
+export async function run(args, ctx) {
+  ctx.setPhase("pipeline")${BARRIER_PRELUDE}
+  const items = Array.from({ length: args.count }, (_, i) => i)
+  const stage = async (item) => { __enter(); await __park(); __leave(); return item }
+  // Pass the options object ONLY when a limit is set: the engine treats a trailing
+  // object as { concurrencyLimit }, so a trailing undefined would be parsed as a
+  // (missing) stage. No-options ⇒ pipeline runs items unbounded.
+  const result = args.concurrencyLimit === undefined
+    ? await ctx.pipeline(items, stage)
+    : await ctx.pipeline(items, stage, { concurrencyLimit: args.concurrencyLimit })
+  return { peak: __b.peak, result }
+}
+`
+
+// No-barrier pipeline ordering fixture (deterministic replacement for the
+// setTimeout-based PIPELINE_WORKFLOW ordering proof, Fund 48): item "A" parks in
+// stage 1 on the shared gate; item "B" passes stage 1 unparked and records that it
+// REACHED stage 2 while A is still held in stage 1. Stage 2 also changes the type
+// (string -> { a, b }), proving heterogeneous stages. The test waits for B's
+// stage-2 marker (a condition, no wall clock) BEFORE releasing A, so the ordering
+// claim "B reaches stage 2 before A leaves stage 1" is guaranteed, not timed.
+const PIPELINE_ORDER_FIXTURE = "pipeline-order"
+const PIPELINE_ORDER_WORKFLOW = `export const meta = { name: "${PIPELINE_ORDER_FIXTURE}", phases: ["pipeline"] }
+export async function run(args, ctx) {
+  ctx.setPhase("pipeline")${BARRIER_PRELUDE}
+  const result = await ctx.pipeline(
+    ["A", "B"],
+    async (item) => {
+      __b.order.push(item + ":stage1:start")
+      // Item A is held in stage 1 on the gate until the test releases it; item B
+      // proceeds immediately, so B can reach stage 2 before A leaves stage 1.
+      if (item === "A") await __park()
+      __b.order.push(item + ":stage1:done")
+      return { item, n: item === "A" ? 1 : 2 }
+    },
+    async (prev, item) => {
+      __b.order.push(item + ":stage2")
+      return { a: prev.n, b: prev.item === "A" ? "x" : "y" }
+    },
+  )
+  return { order: __b.order, result }
+}
+`
 
 // Telemetry shape of a single assistant turn — exactly the fields the engine reads
 // off a persisted assistant message when it sums per-agent cost/tokens.
@@ -560,6 +702,64 @@ function multiTurnPromptOps(db: Database.Interface["db"], turns: AssistantTurn[]
   return ops
 }
 
+// Fund 23 (budget soft-cap under parallelism): prompt-ops that hold EVERY agent
+// prompt at a shared latch until `expected` prompts have arrived, then resolve all
+// of them with the given per-step `cost`. The engine checks the budget gate at the
+// TOP of `ctx.agent`, BEFORE calling the prompt — so by the time a prompt arrives
+// here its step has already passed the gate. Gating the resolution until all
+// `expected` prompts have arrived therefore GUARANTEES, deterministically (a
+// Deferred barrier, not a timing window), that all parallel in-flight steps passed
+// the gate while the budget was still positive. They then all settle and charge,
+// documenting the best-effort overspend. Returns the latch arrival promise so the
+// test can also await the barrier shape if needed.
+function budgetBarrierPromptOps(db: Database.Interface["db"], cost: number, expected: number) {
+  const gates: Deferred.Deferred<void>[] = []
+  let arrived = 0
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        // Park until all `expected` parallel prompts have arrived: each opens its
+        // own gate, and the LAST arrival releases every gate at once.
+        const gate = yield* Deferred.make<void>()
+        gates.push(gate)
+        arrived += 1
+        if (arrived >= expected) for (const g of gates) yield* Deferred.succeed(g, undefined)
+        yield* Deferred.await(gate)
+        return yield* persistTurns(db, input.sessionID, [
+          { cost, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+        ])
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
+// Fund 23: N parallel agent steps, then a SEQUENTIAL step after the batch. With a
+// budget that each parallel step's cost overshoots in aggregate, all N parallel
+// steps pass the gate (budget still positive when each is checked) and all are
+// charged — the documented soft-cap overspend. The follow-up sequential step then
+// hits an exhausted budget and fails. The workflow catches that failure and reports
+// how far the budget was overspent and that the post-batch step did NOT run.
+const BUDGET_PARALLEL_FIXTURE = "budget-parallel"
+const BUDGET_PARALLEL_WORKFLOW = `export const meta = { name: "${BUDGET_PARALLEL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const tasks = Array.from({ length: args.count }, (_, i) => () => ctx.agent({ prompt: "parallel " + i }))
+  await ctx.parallel(tasks)
+  const overspent = ctx.budgetRemaining
+  let nextStarted = false
+  let nextFailed = false
+  try {
+    nextStarted = true
+    await ctx.agent({ prompt: "after the batch" })
+  } catch (e) {
+    nextFailed = true
+  }
+  return { overspent, nextStarted, nextFailed }
+}
+`
+
 // Zwei sequentielle ctx.agent-Aufrufe; bei kleinem Budget muss der zweite
 // Aufruf am Budget-Gate scheitern (Restbudget <= 0 nach dem ersten Step).
 const BUDGET_FIXTURE = "budget-two-steps"
@@ -611,61 +811,6 @@ export async function run(args, ctx) {
     failed = true
   }
   return { failed, remaining: ctx.budgetRemaining }
-}
-`
-
-// Pipeline-Fixture: zwei Items ("A","B"), zwei Stages. Stage 2 ändert den Typ
-// (string -> { a, b }). Item A wird in Stage 1 künstlich verlangsamt, damit Item
-// B Stage 2 erreichen kann, BEVOR Item A Stage 1 verlässt — der Nachweis, dass
-// es KEINE Barriere zwischen den Stages gibt (Items laufen unabhängig durch die
-// Stage-Sequenz). Reihenfolge-Marker und Ergebnis werden über ctx.log bzw. das
-// Workflow-Resultat beobachtbar gemacht; das Resultat enthält die Marker-Folge
-// und das Stage-2-Resultat in Item-Reihenfolge.
-const PIPELINE_FIXTURE = "pipeline"
-const PIPELINE_WORKFLOW = `export const meta = { name: "${PIPELINE_FIXTURE}", phases: ["pipeline"] }
-export async function run(args, ctx) {
-  ctx.setPhase("pipeline")
-  const order = []
-  const slow = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-  const result = await ctx.pipeline(
-    ["A", "B"],
-    async (item) => {
-      order.push(item + ":stage1:start")
-      // Item A trödelt in Stage 1, damit B in Stage 2 vorrückt.
-      if (item === "A") await slow(80)
-      order.push(item + ":stage1:done")
-      return { item, n: item === "A" ? 1 : 2 }
-    },
-    async (prev, item) => {
-      order.push(item + ":stage2")
-      return { a: prev.n, b: prev.item === "A" ? "x" : "y" }
-    },
-  )
-  for (const marker of order) ctx.log(marker)
-  return { order, result }
-}
-`
-
-// Parallel-Fixture: sechs Tasks à ~40ms, concurrencyLimit aus den args. Jede
-// Task meldet Start/Ende über zwei globale Zähler (auf globalThis, weil das
-// Workflow-Modul in seinem eigenen ESM-Realm läuft); der Workflow gibt die
-// beobachtete Spitzen-Parallelität und die Task-Resultate zurück.
-const PARALLEL_FIXTURE = "parallel-limit"
-const PARALLEL_WORKFLOW = `export const meta = { name: "${PARALLEL_FIXTURE}", phases: ["parallel"] }
-export async function run(args, ctx) {
-  ctx.setPhase("parallel")
-  let active = 0
-  let peak = 0
-  const slow = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-  const tasks = Array.from({ length: 6 }, (_, i) => async () => {
-    active++
-    peak = Math.max(peak, active)
-    await slow(40)
-    active--
-    return i
-  })
-  const result = await ctx.parallel(tasks, { concurrencyLimit: args.concurrencyLimit })
-  return { peak, result }
 }
 `
 
@@ -747,41 +892,187 @@ export async function run(args, ctx) {
 `
 
 describe("Workflow", () => {
+  // Fund 48 (deterministic ordering): the pipeline runs each item's stage SEQUENCE
+  // independently — there is NO barrier between stages, so item B can be in stage 2
+  // while item A is still in stage 1. Previously proven by sleeping item A 80ms in
+  // stage 1 (wall-clock flake); now item A parks on a shared gate in stage 1 and
+  // the test waits for B's stage-2 marker (a CONDITION) before releasing A, so the
+  // ordering is guaranteed regardless of scheduling speed. Stage 2 also changes the
+  // type (string -> { a, b }), proving heterogeneous stages.
   it.instance("pipeline runs stages per item without a barrier and supports heterogeneous types", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_FIXTURE, PIPELINE_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_ORDER_FIXTURE, PIPELINE_ORDER_WORKFLOW))
       const workflow = yield* Workflow.Service
-      const run = yield* workflow.start({ name: PIPELINE_FIXTURE, args: {} })
+      const sync = installBarrier()
+      const run = yield* workflow.start({ name: PIPELINE_ORDER_FIXTURE, args: { __barrier: sync.token } })
+      // Deterministic proof: wait until B has REACHED stage 2 (while A is still
+      // parked in stage 1), then release A so the run can finish.
+      yield* sync.awaitOrder("B:stage2")
+      sync.barrier.release()
       const waited = yield* workflow.wait({ id: run.id })
       const done = waited.run ?? (yield* Effect.fail(new Error("pipeline did not finish")))
       expect(done.status).toBe("completed")
       const result = done.result as { order: string[]; result: Array<{ a: number; b: string }> }
-      // Kein Barrier: Item B erreicht Stage 2, bevor Item A Stage 1 verlässt.
+      // No barrier between stages: B reached stage 2 before A left stage 1.
       expect(result.order.indexOf("B:stage2")).toBeLessThan(result.order.indexOf("A:stage1:done"))
-      // Stage 2 ändert den Typ; Ergebnis in Item-Reihenfolge.
+      // Stage 2 changes the type; results stay in item order.
       expect(result.result).toEqual([
         { a: 1, b: "x" },
         { a: 2, b: "y" },
       ])
+      delete globalThis.__workflowTestBarriers![sync.token]
     }),
   )
 
+  // Fund 48/49 (deterministic peak): an explicit concurrencyLimit caps the number
+  // of simultaneously-running parallel tasks. Previously proven by 6 tasks à ~40ms
+  // hoping they overlap; now every task parks on a shared gate and the test polls
+  // the live `active` counter, so the measured peak is the engine's real scheduling
+  // decision, not a timing window. With limit 2 and 6 tasks exactly 2 tasks are
+  // ever parked at once (peak === 2): a lower peak would mean over-clamping, a
+  // higher one would mean the limit was ignored.
   it.instance("parallel respects concurrencyLimit", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_FIXTURE, PARALLEL_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_BARRIER_FIXTURE, PARALLEL_BARRIER_WORKFLOW))
       const workflow = yield* Workflow.Service
-      const run = yield* workflow.start({ name: PARALLEL_FIXTURE, args: { concurrencyLimit: 2 } })
+      const sync = installBarrier()
+      const run = yield* workflow.start({
+        name: PARALLEL_BARRIER_FIXTURE,
+        args: { __barrier: sync.token, count: 6, concurrencyLimit: 2 },
+      })
+      // Wait until the limit (2) tasks are simultaneously parked, then release the
+      // gate so the whole batch can drain.
+      yield* sync.awaitPeak(2)
+      sync.barrier.release()
       const waited = yield* workflow.wait({ id: run.id })
       const done = waited.run ?? (yield* Effect.fail(new Error("parallel did not finish")))
       expect(done.status).toBe("completed")
       const result = done.result as { peak: number; result: number[] }
       expect(result.result).toHaveLength(6)
-      expect(result.peak).toBeLessThanOrEqual(2)
-      // Untergrenze: 6 Tasks à ~40ms bei Limit 2 erreichen zuverlässig peak 2 —
-      // schützt gegen versehentliches Über-Clamping des Limits auf 1.
-      expect(result.peak).toBeGreaterThanOrEqual(2)
+      // Exactly the limit: never above (limit honored) and never below 2 (no
+      // accidental over-clamp to 1).
+      expect(result.peak).toBe(2)
+      delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // Fund 49 (default parallel concurrency): `ctx.parallel` WITHOUT an explicit
+  // concurrencyLimit clamps to the documented default of 20
+  // (`Math.max(1, options?.concurrencyLimit ?? 20)` in createContext). With 25
+  // tasks all parked on the gate, exactly 20 run at once — peak === 20, never 25
+  // (would mean unbounded) and never 1 (would mean over-clamped). Deterministic via
+  // the parked-task counter, no timing window.
+  it.instance("parallel without an explicit limit defaults to a peak concurrency of 20", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_BARRIER_FIXTURE, PARALLEL_BARRIER_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sync = installBarrier()
+      // 25 tasks, NO concurrencyLimit ⇒ engine default 20.
+      const run = yield* workflow.start({
+        name: PARALLEL_BARRIER_FIXTURE,
+        args: { __barrier: sync.token, count: 25 },
+      })
+      // Exactly the default (20) tasks become parked simultaneously; the remaining
+      // 5 wait for a slot. Wait for that peak, then drain.
+      yield* sync.awaitPeak(20)
+      // The peak must not climb past the default even given a moment to settle: a
+      // 21st parked task would mean the default cap was not applied.
+      expect(sync.barrier.active).toBe(20)
+      sync.barrier.release()
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("parallel did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { peak: number; result: number[] }
+      expect(result.result).toHaveLength(25)
+      expect(result.peak).toBe(20)
+      delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // Fund 49 (parallel limit floor): an explicit concurrencyLimit of 0 (and any
+  // negative value) is floored to 1 — `Math.max(1, …)` — so the batch runs strictly
+  // sequentially (peak === 1) rather than degenerating into "no tasks run" or
+  // unbounded. Consistency guard for the clamp.
+  it.instance("parallel concurrencyLimit 0 and negative are clamped to a peak of 1", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_BARRIER_FIXTURE, PARALLEL_BARRIER_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      for (const limit of [0, -5]) {
+        const sync = installBarrier()
+        const run = yield* workflow.start({
+          name: PARALLEL_BARRIER_FIXTURE,
+          args: { __barrier: sync.token, count: 4, concurrencyLimit: limit },
+        })
+        // Only ONE task is ever parked at a time; release it so the next can run.
+        yield* sync.awaitPeak(1)
+        expect(sync.barrier.active).toBe(1)
+        sync.barrier.release()
+        const waited = yield* workflow.wait({ id: run.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error(`parallel(${limit}) did not finish`)))
+        expect(done.status).toBe("completed")
+        const result = done.result as { peak: number; result: number[] }
+        expect(result.result).toHaveLength(4)
+        expect(result.peak).toBe(1)
+        delete globalThis.__workflowTestBarriers![sync.token]
+      }
+    }),
+  )
+
+  // Fund 49 (default pipeline concurrency): `ctx.pipeline` WITHOUT options runs its
+  // items UNBOUNDED (the pipeline default differs from parallel's 20 — see
+  // createContext: `options?.concurrencyLimit === undefined ? "unbounded" : …`). With
+  // 25 items all parked in the single stage, ALL 25 run concurrently — peak === 25.
+  it.instance("pipeline without options runs items unbounded", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_BARRIER_FIXTURE, PIPELINE_BARRIER_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sync = installBarrier()
+      const run = yield* workflow.start({
+        name: PIPELINE_BARRIER_FIXTURE,
+        args: { __barrier: sync.token, count: 25 },
+      })
+      // Unbounded ⇒ every item parks at once; the peak equals the item count.
+      yield* sync.awaitPeak(25)
+      expect(sync.barrier.active).toBe(25)
+      sync.barrier.release()
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("pipeline did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { peak: number; result: number[] }
+      expect(result.result).toHaveLength(25)
+      expect(result.peak).toBe(25)
+      delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // Fund 49 (pipeline limit floor): a pipeline concurrencyLimit of 0 is floored to 1
+  // (same `Math.max(1, …)` clamp as parallel), so items run strictly one at a time
+  // (peak === 1) instead of unbounded — only an UNSET limit means unbounded.
+  it.instance("pipeline concurrencyLimit 0 is clamped to a peak of 1", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_BARRIER_FIXTURE, PIPELINE_BARRIER_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sync = installBarrier()
+      const run = yield* workflow.start({
+        name: PIPELINE_BARRIER_FIXTURE,
+        args: { __barrier: sync.token, count: 4, concurrencyLimit: 0 },
+      })
+      yield* sync.awaitPeak(1)
+      expect(sync.barrier.active).toBe(1)
+      sync.barrier.release()
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("pipeline did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { peak: number; result: number[] }
+      expect(result.result).toHaveLength(4)
+      expect(result.peak).toBe(1)
+      delete globalThis.__workflowTestBarriers![sync.token]
     }),
   )
 
@@ -1410,6 +1701,16 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(persisted.logs.map((item) => item.message)).toContain("running")
       expect(persisted.agents.length).toBeGreaterThan(0)
       expect(persisted.agents[0]?.output).toBe("did the thing")
+      // Fund 51: per-agent cost/tokens (incl. the optional `total`) survive the
+      // DB→fromRow roundtrip intact — not just output/status.
+      expect(persisted.agents[0]?.cost).toBe(0.42)
+      expect(persisted.agents[0]?.tokens).toEqual({
+        total: 99,
+        input: 11,
+        output: 22,
+        reasoning: 33,
+        cache: { read: 44, write: 55 },
+      })
       // N20: das geseedete result überlebt den Roundtrip (wurde bisher nie asserted).
       expect(persisted.result).toEqual({ ok: true })
     }),
@@ -1789,6 +2090,74 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // Fund 25 (a): wait() on a still-RUNNING run with a small timeout times out
+  // honestly — `timedOut: true`, the snapshot status stays `running`, and the run
+  // is NOT mutated by the timeout. Deterministic: the run is parked on a barrier
+  // (genuinely live in the registry, never released until after the assertion), so
+  // the timeout is the ONLY thing that ends the wait — no race with the body
+  // completing. The barrier is released afterwards so the run can drain.
+  it.instance("wait with a small timeout on a hanging run returns timedOut with status still running", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_BARRIER_FIXTURE, PARALLEL_BARRIER_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sync = installBarrier()
+      const run = yield* workflow.start({ name: PARALLEL_BARRIER_FIXTURE, args: { __barrier: sync.token, count: 1 } })
+      // Ensure the run is genuinely live and parked (the single task is at the gate)
+      // before testing the timeout, so wait() cannot resolve via completion.
+      yield* sync.awaitPeak(1)
+
+      const res = yield* workflow.wait({ id: run.id, timeout: 50 })
+      expect(res.timedOut).toBe(true)
+      // The snapshot reports the live status (still running); the timeout did not
+      // flip or finish the run.
+      expect(res.run?.status).toBe("running")
+      // The run is still live and running afterwards (the timeout is observation-only).
+      const stillLive = yield* workflow.get(run.id)
+      expect(stillLive?.status).toBe("running")
+
+      // Release the gate so the run finishes, then drain it.
+      sync.barrier.release()
+      const waited = yield* workflow.wait({ id: run.id })
+      expect(waited.timedOut).toBe(false)
+      expect(waited.run?.status).toBe("completed")
+      delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // Fund 25 (b): wait() with timeout <= 0 returns an IMMEDIATE snapshot
+  // (`timedOut: true`) without ever suspending on the run's done deferred — a
+  // zero/negative timeout must not hang on a still-running run. Proven by parking
+  // the run on a barrier (so it is genuinely running) and asserting wait({timeout:0})
+  // returns at once with the running snapshot; a hung implementation would never
+  // return because the gate is still closed.
+  it.instance("wait with timeout <= 0 returns an immediate running snapshot without hanging", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_BARRIER_FIXTURE, PARALLEL_BARRIER_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sync = installBarrier()
+      const run = yield* workflow.start({ name: PARALLEL_BARRIER_FIXTURE, args: { __barrier: sync.token, count: 1 } })
+      yield* sync.awaitPeak(1)
+
+      for (const timeout of [0, -10]) {
+        // awaitWithTimeout proves the call RETURNS promptly (no hang on the closed
+        // gate); a non-short-circuiting implementation would block here forever.
+        const res = yield* awaitWithTimeout(
+          workflow.wait({ id: run.id, timeout }),
+          `wait({timeout:${timeout}}) hung on a still-running run`,
+          "2 seconds",
+        )
+        expect(res.timedOut).toBe(true)
+        expect(res.run?.status).toBe("running")
+      }
+
+      sync.barrier.release()
+      yield* workflow.wait({ id: run.id })
+      delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
   it.instance("schema agent failure is recorded as failed, never silently completed", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -1876,6 +2245,49 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // Fund 23 (best-effort soft cap under parallelism): the budget is enforced PER
+  // STEP, checked BEFORE each ctx.agent and settled AFTER it. Steps launched
+  // together via ctx.parallel all pass the gate while the budget is still positive,
+  // so a run can OVERSPEND by the combined cost of the steps already in flight when
+  // the budget runs out — documented soft-cap behavior, not a hard mid-step limit.
+  // Deterministic proof: a Deferred barrier holds all 3 parallel prompts until ALL
+  // have passed the gate, then releases them so they all charge. With budget 1.0 and
+  // 3 parallel steps à 0.5 (total 1.5), the budget overspends to -0.5; the NEXT
+  // (sequential) step then fails the exhausted-budget gate.
+  it.instance("parallel steps all pass the gate and overspend; the next step fails (soft cap)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_PARALLEL_FIXTURE, BUDGET_PARALLEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      // 3 parallel agents à 0.5 USD, budget 1.0. All 3 pass the gate while the
+      // budget is positive (the barrier holds them until all 3 have arrived), so
+      // all 3 charge ⇒ overspend to -0.5.
+      const run = yield* workflow.start({
+        name: BUDGET_PARALLEL_FIXTURE,
+        args: { count: 3 },
+        prompt: budgetBarrierPromptOps(db, 0.5, 3),
+        budget: 1,
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      // The run COMPLETES — the workflow body catches the post-batch budget failure.
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { overspent: number; nextStarted: boolean; nextFailed: boolean }
+      // Soft-cap overspend: all 3 parallel steps charged, driving the budget below 0.
+      expect(result.overspent).toBeCloseTo(-0.5, 10)
+      // All 3 parallel steps were charged (completed) — the documented overspend.
+      const completed = done.run?.agents.filter((a) => a.status === "completed") ?? []
+      expect(completed.length).toBe(3)
+      const totalCost = completed.reduce((sum, a) => sum + (a.cost ?? 0), 0)
+      expect(totalCost).toBeCloseTo(1.5, 10)
+      // The NEXT (sequential) step after exhaustion hits the gate and fails.
+      expect(result.nextStarted).toBe(true)
+      expect(result.nextFailed).toBe(true)
+      // The blocked 4th step never created a node (refused before dispatch).
+      expect(done.run?.agents.length).toBe(3)
+    }),
+  )
+
   it.instance("budgetRemaining reflects real spend during the run", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -1932,6 +2344,36 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const result = done.run?.result as { before: number; after: number }
       expect(result.before).toBe(1)
       expect(result.after).toBeCloseTo(0.94, 10)
+    }),
+  )
+
+  // Fund 51 (telemetry populated from the assistant message): an agent step whose
+  // session returns NON-null cost/tokens (including the optional `tokens.total`)
+  // must have that telemetry copied onto the agent node — `run.agents[0].cost` and
+  // `run.agents[0].tokens` (with `total`) reflect exactly what the assistant message
+  // carried. A single-turn session yields exactly one assistant message, so the
+  // node equals that message's telemetry verbatim (no summing artifact).
+  it.instance("agent telemetry (cost + tokens incl. total) is populated from the assistant message", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const run = yield* workflow.start({
+        name: SINGLE_AGENT_FIXTURE,
+        args: {},
+        // A single turn with non-null cost AND a non-null tokens.total so a dropped
+        // field would be observable.
+        prompt: multiTurnPromptOps(db, [
+          { cost: 0.17, tokens: { total: 60, input: 10, output: 20, reasoning: 30, cache: { read: 5, write: 7 } } },
+        ]),
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const node = done.run!.agents[0]!
+      expect(node.cost).toBeCloseTo(0.17, 10)
+      // The whole tokens shape, including the summed-but-single `total`, is carried.
+      expect(node.tokens).toEqual({ total: 60, input: 10, output: 20, reasoning: 30, cache: { read: 5, write: 7 } })
     }),
   )
 
