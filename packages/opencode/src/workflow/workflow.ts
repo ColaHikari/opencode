@@ -507,9 +507,23 @@ function persistInScope(active: Active, bridge: EffectBridge.Shape, db: Database
 
 /**
  * Rewrites every `running` row whose id is not in `liveIds` to `interrupted`
- * with a completion timestamp in a single bulk UPDATE. Used by the startup sweep
- * (liveIds empty) and the exposed `sweep()` method (liveIds = currently active
- * runs); genuinely-running rows owned by a live fiber are left untouched.
+ * with a completion timestamp, AND normalizes any still-`running` agent node in
+ * those rows to `failed` (Fund 15). Used by the startup sweep (liveIds empty) and
+ * the exposed `sweep()` method (liveIds = currently active runs); genuinely-
+ * running rows owned by a live fiber are left untouched.
+ *
+ * Fund 15: a swept orphan has no live registry entry, so the only node-closeout
+ * (in finish()) never runs for it — the row used to keep agents with status
+ * `running`, no completed_at, no error, and the TUI then rendered a live agent
+ * icon forever on a terminal run. The sweep now patches the agents JSON too: each
+ * `running` node becomes `failed` with the sweep time and an explanatory error.
+ *
+ * The run-level flip is no longer a single bulk UPDATE because the agents JSON is
+ * per-row (each row's array is patched in JS), so the bulk write degrades to a
+ * select + per-row update. Both the read and the writes run inside ONE
+ * transaction so the orphan set the sweep acts on cannot change underneath it
+ * (a row flipping to running/terminal between the read and the write) and the
+ * whole heal commits atomically.
  *
  * `directory` scopes the sweep to the calling workspace (Fund 17): the DB is
  * process-global but every per-directory registry only knows its OWN runs, so a
@@ -520,17 +534,40 @@ function persistInScope(active: Active, bridge: EffectBridge.Shape, db: Database
  * executing in A) to `interrupted`.
  */
 function sweepOrphans(db: Database.Interface["db"], liveIds: ReadonlySet<string>, now: number, directory: string) {
+  const where = and(
+    eq(WorkflowRunTable.status, "running"),
+    eq(WorkflowRunTable.directory, directory),
+    liveIds.size ? notInArray(WorkflowRunTable.id, [...liveIds]) : undefined,
+  )
   return db
-    .update(WorkflowRunTable)
-    .set({ status: "interrupted", completed_at: now, time_updated: now })
-    .where(
-      and(
-        eq(WorkflowRunTable.status, "running"),
-        eq(WorkflowRunTable.directory, directory),
-        liveIds.size ? notInArray(WorkflowRunTable.id, [...liveIds]) : undefined,
-      ),
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        const orphans = yield* tx
+          .select({ id: WorkflowRunTable.id, agents: WorkflowRunTable.agents })
+          .from(WorkflowRunTable)
+          .where(where)
+          .all()
+        yield* Effect.forEach(
+          orphans,
+          (orphan) =>
+            tx
+              .update(WorkflowRunTable)
+              .set({
+                status: "interrupted",
+                completed_at: now,
+                time_updated: now,
+                agents: orphan.agents.map((node) =>
+                  node.status === "running"
+                    ? { ...node, status: "failed", completed_at: now, error: "interrupted: process restarted" }
+                    : node,
+                ),
+              })
+              .where(eq(WorkflowRunTable.id, orphan.id))
+              .run(),
+          { discard: true },
+        )
+      }),
     )
-    .run()
     .pipe(Effect.orDie, Effect.asVoid)
 }
 
