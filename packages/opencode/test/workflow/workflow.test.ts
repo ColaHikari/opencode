@@ -17,6 +17,7 @@ import { Deferred, Effect, Fiber, Layer } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import fs from "fs/promises"
 import path from "path"
+import { pathToFileURL } from "url"
 
 // Database.defaultLayer is merged so the orphan-sweep tests can seed a row
 // directly through the same in-memory SQLite connection the engine uses.
@@ -3049,6 +3050,115 @@ export async function run() { return { ok: true } }
       // Keine NaN/Infinity-String-Variante mehr.
       expect(line).not.toContain('"NaN"')
       expect(line).not.toContain('"Infinity"')
+    }
+  })
+
+  // Track C: Builtin-Workflows als niedrigste Präzedenz-Wurzel (Projekt > Global >
+  // Builtin). Ohne gleichnamige Projekt-/Global-Datei MUSS der gebündelte
+  // deep-research-Workflow auftauchen, statisch lesbare Meta tragen und als
+  // `source_kind: "builtin"` markiert sein. Sein `path` ist ein synthetischer
+  // Marker (`builtin:deep-research`), kein echter Dateipfad.
+  it.instance("the bundled deep-research workflow is discovered as a builtin with static meta", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      const info = list.find((item) => item.name === "deep-research")
+      if (!info) return yield* Effect.fail(new Error("deep-research builtin not discovered"))
+      expect(info.valid).toBe(true)
+      expect(info.source_kind).toBe("builtin")
+      expect(info.path).toBe("builtin:deep-research")
+      // Meta wurde rein statisch (ohne Modul-Ausführung) gelesen.
+      expect(info.meta.name).toBe("deep-research")
+      expect(info.meta.phases).toEqual(["plan", "research", "verify", "synthesize"])
+      expect(info.meta.arguments?.question?.type).toBe("string")
+    }),
+  )
+
+  // Track C: first-wins-Präzedenz — eine gleichnamige Projektdatei beschattet den
+  // gleichnamigen Builtin vollständig (genau EIN Eintrag, und es ist die Datei,
+  // KEIN Builtin).
+  it.instance("a project workflow takes precedence over a same-named builtin", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "deep-research",
+          `export const meta = { name: "ProjectDeepResearch" }
+export async function run() { return { from: "project" } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      const matches = list.filter((item) => item.name === "deep-research")
+      expect(matches.length).toBe(1)
+      // Es ist die Projektdatei (kein Builtin-Marker, kein source_kind).
+      const projectWorkflows = path.join(test.directory, ".opencode", "workflows")
+      expect(matches[0]?.path.startsWith(projectWorkflows)).toBe(true)
+      expect(matches[0]?.source_kind).toBeUndefined()
+      expect(matches[0]?.meta.name).toBe("ProjectDeepResearch")
+      // start() löst denselben Namen ebenfalls zur Projektdatei auf.
+      const run = yield* workflow.start({ name: "deep-research" })
+      const done = (yield* workflow.wait({ id: run.id })).run
+      expect(done?.result).toEqual({ from: "project" })
+    }),
+  )
+
+  // Track C: ein gleichnamiger GLOBALER Workflow beschattet den Builtin ebenfalls
+  // (Global > Builtin). Genau ein Eintrag, und es ist die globale Datei.
+  it.instance("a global workflow takes precedence over a same-named builtin", () =>
+    Effect.gen(function* () {
+      const globalWorkflows = path.join(Global.Path.config, "workflows")
+      const globalFile = path.join(globalWorkflows, "deep-research.js")
+      yield* Effect.promise(() => fs.mkdir(globalWorkflows, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          globalFile,
+          `export const meta = { name: "GlobalDeepResearch" }
+export async function run() { return { from: "global" } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const list = yield* workflow.list()
+      const matches = list.filter((item) => item.name === "deep-research")
+      expect(matches.length).toBe(1)
+      expect(matches[0]?.path.startsWith(globalWorkflows)).toBe(true)
+      expect(matches[0]?.source_kind).toBeUndefined()
+      expect(matches[0]?.meta.name).toBe("GlobalDeepResearch")
+      yield* Effect.promise(() => fs.rm(globalFile, { force: true }))
+    }),
+  )
+
+  // Track C: der Builtin-Source kompiliert real und lädt über denselben
+  // loadModule-Pfad — `run` ist eine Funktion und die Meta ist nach dem echten
+  // Import konsistent. KEIN Live-Lauf (deep-research braucht Web-Tools); nur die
+  // Lade-Integrität wird geprüft, indem ein gleichnamiger Wrapper-Builtin im
+  // Projektverzeichnis NICHT existiert und der Builtin-Source via Datei real
+  // importiert wird (identische loadModule-Mechanik wie zur Laufzeit).
+  test("the deep-research builtin source compiles and exports a real run() via loadModule", async () => {
+    const { BUILTIN_WORKFLOWS } = await import("@/workflow/builtin")
+    const source = BUILTIN_WORKFLOWS["deep-research"]
+    expect(typeof source).toBe("string")
+    // Realer Import: in eine Temp-Datei schreiben und dynamisch laden (identisch
+    // zur loadModule-Mechanik). Das Modul-Top-Level wird ausgeführt, also deckt
+    // dies Syntax-/Compile-Fehler im Source-Literal auf. Die Datei MUSS im
+    // Paketbaum liegen (nicht in os.tmpdir()), weil der Source
+    // `import { workflow } from "@opencode-ai/plugin"` macht und dieser bare
+    // specifier nur von innerhalb des Pakets auflöst — exakt der Grund, warum die
+    // Engine den Builtin-Temp-Copy neben ihr eigenes Modul schreibt.
+    const file = path.join(import.meta.dir, `.deep-research-${Math.random().toString(16).slice(2)}.mts`)
+    await Bun.write(file, source)
+    try {
+      const imported = (await import(pathToFileURL(file).href)) as {
+        default?: { meta?: { name?: string }; run?: unknown }
+      }
+      const mod = imported.default ?? (imported as never)
+      expect(mod.meta?.name).toBe("deep-research")
+      expect(typeof mod.run).toBe("function")
+    } finally {
+      await Bun.file(file).delete().catch(() => {})
     }
   })
 })
