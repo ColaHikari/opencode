@@ -39,22 +39,85 @@ export function workflowAutocompleteTriggerIndex(input: string, cursorOffset: nu
   if (arg) return workflowAutocompleteIndex(arg, cursorOffset)
 }
 
+// Quote-aware, single-pass tokenizer. Splits on unquoted whitespace but keeps a
+// quoted segment (`"a b"` / `'a b'`) attached to its token, so `msg="a b"` is one
+// token rather than two. Linear in the input length — no backtracking — so it is
+// immune to the catastrophic backtracking that the previous monolithic regex was
+// prone to on pathological input (N14). `incomplete` flags a token whose closing
+// quote the user has not typed yet (relevant only mid-edit).
+function tokenizeWorkflowArgs(input: string) {
+  const tokens: { text: string; incomplete: boolean }[] = []
+  let current = ""
+  let quote: '"' | "'" | undefined
+  let escaped = false
+  let incomplete = false
+  const flush = () => {
+    if (current === "" && !incomplete) return
+    tokens.push({ text: current, incomplete })
+    current = ""
+    incomplete = false
+  }
+  for (const char of input) {
+    if (escaped) {
+      current += char
+      escaped = false
+      continue
+    }
+    if (char === "\\" && quote) {
+      current += char
+      escaped = true
+      continue
+    }
+    if (quote) {
+      current += char
+      if (char === quote) quote = undefined
+      else incomplete = true
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      incomplete = true
+      current += char
+      continue
+    }
+    if (/\s/.test(char)) {
+      flush()
+      continue
+    }
+    current += char
+  }
+  flush()
+  return tokens
+}
+
+// Extracts the declared arg name from a token, supporting `name=`, `--name=`, and
+// bare `--flag` / `flag` forms. Returns undefined for a token that has no name yet.
+function workflowArgName(token: string) {
+  return token.match(/^-{0,2}([^=\s]+)=/)?.[1] ?? token.match(/^-{0,2}([^=\s]+)$/)?.[1]
+}
+
 export function workflowArgContext(input: string, cursorOffset: number): WorkflowArgContext | undefined {
   const beforeCursor = input.slice(0, cursorOffset)
   const match = beforeCursor.match(WORKFLOW_ARG_PATTERN)
   if (!match || match[2] === undefined) return
 
-  const tokens = match[2].split(/\s+/).filter(Boolean)
-  const current = beforeCursor.endsWith(" ") ? "" : (tokens.at(-1) ?? "")
-  if (!current || current.includes("=")) return
+  const trailingSpace = /\s$/.test(beforeCursor)
+  const tokens = tokenizeWorkflowArgs(match[2])
+  // On a trailing space the user is about to start a fresh arg, so the query is
+  // empty and every typed token counts as used. Otherwise the last token is the
+  // one being edited (the query) and the rest are used.
+  const current = trailingSpace ? "" : (tokens.at(-1)?.text ?? "")
+  // A token that already contains `=` is a value being typed, not an arg name, so
+  // there is nothing to complete.
+  if (current.includes("=")) return
 
   return {
     workflow: match[1],
     query: current,
     used: new Set(
       tokens
-        .slice(0, beforeCursor.endsWith(" ") ? tokens.length : -1)
-        .map((token) => token.match(/^--?([^=]+)=/)?.[1] ?? token.match(/^([^=]+)=/)?.[1])
+        .slice(0, trailingSpace ? tokens.length : -1)
+        .map((token) => workflowArgName(token.text))
         .filter((name): name is string => Boolean(name)),
     ),
   }
@@ -168,20 +231,25 @@ export type WorkflowArgDeclaration = Record<string, { type?: string }>
 //     "true"; the parser has never produced real booleans, and this change does
 //     not introduce them.
 export function parseWorkflowArgs(input: string, declaration: WorkflowArgDeclaration = {}) {
+  // N14: tokenizing in a single linear pass and splitting each token on its first
+  // `=` replaces the previous monolithic regex, whose nested quote/`\S*`
+  // alternations could backtrack catastrophically on pathological input
+  // (e.g. many repeated `="`). Token boundaries are quote-aware so a quoted value
+  // with spaces survives intact (Fund 60).
   return Object.fromEntries(
-    // Matches: [--]key[="quoted value" | 'quoted value' | unquoted_value]
-    Array.from(input.matchAll(/(?:^|\s)(?:--)?([^=\s]+)(?:=("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S*))?/g)).map(
-      (match) => {
-        const name = match[1]
-        const raw = match[2] ?? "true"
-        const value =
-          (raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))
-            ? raw.slice(1, -1).replace(/\\(["'\\])/g, "$1")
-            : raw
-        if (declaration[name]?.type !== "number") return [name, value]
-        const numeric = Number(value)
-        return [name, Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]
-      },
-    ),
+    tokenizeWorkflowArgs(input).flatMap((token) => {
+      const eq = token.text.indexOf("=")
+      const name = (eq === -1 ? token.text : token.text.slice(0, eq)).replace(/^--?/, "")
+      if (!name) return []
+      const raw = eq === -1 ? "true" : token.text.slice(eq + 1)
+      const value =
+        (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) ||
+        (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2)
+          ? raw.slice(1, -1).replace(/\\(["'\\])/g, "$1")
+          : raw
+      if (declaration[name]?.type !== "number") return [[name, value]]
+      const numeric = Number(value)
+      return [[name, Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]]
+    }),
   )
 }
