@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  capLogs,
   formatPhase,
   formatShortElapsed,
   parseWorkflowCommand,
@@ -170,6 +171,38 @@ describe("reanchorSelection (Fund 10 — selection follows run.id across re-sort
 
   test("returns 0 when no previous id is anchored", () => {
     expect(reanchorSelection(undefined, rows)).toBe(0)
+  })
+})
+
+describe("capLogs (IMPORTANT — bound the non-scrolling logs section)", () => {
+  const makeLog = (time: number) => ({ time, message: `m${time}` })
+
+  test("returns every entry unchanged when within the cap (no hidden count)", () => {
+    const entries = [makeLog(1), makeLog(2), makeLog(3)]
+    const result = capLogs(entries, 5)
+    expect(result.entries).toEqual(entries)
+    expect(result.hidden).toBe(0)
+  })
+
+  test("keeps only the last N entries and reports how many were dropped", () => {
+    const entries = Array.from({ length: 25 }, (_, i) => makeLog(i))
+    const result = capLogs(entries, 20)
+    expect(result.entries).toHaveLength(20)
+    // The last 20 are kept; the oldest 5 are hidden.
+    expect(result.entries[0]).toEqual(makeLog(5))
+    expect(result.entries.at(-1)).toEqual(makeLog(24))
+    expect(result.hidden).toBe(5)
+  })
+
+  test("an exactly-full list keeps everything with no hidden count", () => {
+    const entries = Array.from({ length: 20 }, (_, i) => makeLog(i))
+    const result = capLogs(entries, 20)
+    expect(result.entries).toHaveLength(20)
+    expect(result.hidden).toBe(0)
+  })
+
+  test("an empty list is empty with no hidden count", () => {
+    expect(capLogs([], 20)).toEqual({ entries: [], hidden: 0 })
   })
 })
 

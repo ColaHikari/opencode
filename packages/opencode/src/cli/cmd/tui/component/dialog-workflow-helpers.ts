@@ -105,6 +105,18 @@ export function reanchorSelection(prevId: string | undefined, rows: readonly Wor
   return rows.length - 1
 }
 
+// IMPORTANT: the Logs section renders into a non-scrolling, flexShrink={0} box, so
+// an unbounded `<For>` over every persisted log entry lets a chatty run push the
+// other detail panels off-screen. Keep only the last `max` entries and report how
+// many older ones were dropped, so the view can show a "… N earlier entries" hint
+// instead of silently truncating. Generic over the element type (it only slices,
+// never inspects the fields) so the SDK's widened LogEntry passes through intact.
+// Pure + deterministic so it is unit-testable.
+export function capLogs<T>(entries: readonly T[], max: number) {
+  if (entries.length <= max) return { entries: entries.slice(), hidden: 0 }
+  return { entries: entries.slice(-max), hidden: entries.length - max }
+}
+
 export type WorkflowCommand = { type: "dashboard" } | { type: "start"; name: string; args: string }
 
 // Fund 59: dispatch `/workflows ...` to the dashboard and `/workflow <name> ...`
