@@ -64,6 +64,24 @@ function agentIcon(status: WorkflowRun["agents"][number]["status"]) {
   return "✖"
 }
 
+// Fund 34 (TUI defensive): the engine now closes every agent node at a terminal
+// transition (N11) and the orphan sweep normalizes zombies (Fund 15), so a
+// terminal run should not carry a `running` agent. Still, render defensively: if
+// a terminal run ever shows a lingering `running` agent, treat it as terminal so
+// no perpetual live `●` icon appears, and clamp its elapsed time to the run's
+// completion instead of `formatShortElapsed`'s `Date.now()` fallback (which made
+// the duration grow on every open). Live runs are unchanged.
+export function agentEffectiveStatus(run: WorkflowRun, agent: WorkflowRun["agents"][number]) {
+  if (run.status !== "running" && agent.status === "running") return "failed"
+  return agent.status
+}
+
+export function agentEffectiveEnd(run: WorkflowRun, agent: WorkflowRun["agents"][number]) {
+  // A real node end always wins. Otherwise, on a terminal run, clamp to the run's
+  // completion so the duration is frozen rather than ticking up from Date.now().
+  return agent.completed_at ?? (run.status !== "running" ? run.completed_at : undefined)
+}
+
 function formatPhase(run: WorkflowRun, workflow?: WorkflowInfo) {
   if (run.status !== "running") return "[---] complete"
   const phases = workflow?.meta.phases ?? []
@@ -85,7 +103,15 @@ function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
   return phases.length ? phases : [run.status === "completed" ? "complete" : (run.current_phase ?? "pending")]
 }
 
-function phaseStatus(run: WorkflowRun, phases: readonly string[], phase: string) {
+// N5: the engine never advances/clears `current_phase` at completion (only
+// `setPhase` writes it), so a run that finished on a non-last declared phase
+// (common: meta.phases declares more phases than the body walks) left every
+// later phase rendering as `pending` forever on a terminal run. A terminal run
+// will NEVER reach those phases, so they are reported `skipped` (a distinct,
+// non-live rendering) rather than the misleading `pending`. This is purely a
+// derived TUI view — the engine row is untouched, so the persisted lifecycle
+// stays honest (no synthetic "current_phase = last" lie).
+export function phaseStatus(run: WorkflowRun, phases: readonly string[], phase: string) {
   const current = run.current_phase ? phases.indexOf(run.current_phase) : -1
   const index = phases.indexOf(phase)
   if (run.status === "running") {
@@ -95,7 +121,8 @@ function phaseStatus(run: WorkflowRun, phases: readonly string[], phase: string)
   }
   if (index < current || (run.status === "completed" && (current === -1 || index <= current))) return "completed"
   if (index === current) return run.status
-  return "pending"
+  // A phase after the one the terminal run stopped on was never reached.
+  return "skipped"
 }
 
 function phaseIcon(status: ReturnType<typeof phaseStatus>) {
@@ -103,6 +130,8 @@ function phaseIcon(status: ReturnType<typeof phaseStatus>) {
   if (status === "running") return "●"
   if (status === "failed") return "✖"
   if (status === "interrupted") return "⊘"
+  // `skipped` (never-reached phase on a terminal run) and `pending` both read as
+  // the hollow marker — neither is live; `skipped` simply will never advance.
   return "◌"
 }
 
@@ -184,11 +213,13 @@ function modelLabel(agent: WorkflowRun["agents"][number]) {
   return model.replace(/^claude-/, "Claude ").replace(/-/g, " ")
 }
 
-function agentMetrics(agent: WorkflowRun["agents"][number]) {
+function agentMetrics(run: WorkflowRun, agent: WorkflowRun["agents"][number]) {
   return [
     agentTokens(agent) > 0 ? `${formatShortTokens(agentTokens(agent))} tok` : undefined,
     agent.cost && agent.cost > 0 ? formatCost(agent.cost) : undefined,
-    formatShortElapsed(agent.started_at, agent.completed_at),
+    // Fund 34: clamp the end to the run's completion on a terminal run so a
+    // lingering node's duration is frozen instead of ticking up from Date.now().
+    formatShortElapsed(agent.started_at, agentEffectiveEnd(run, agent)),
   ]
     .filter((item) => item !== undefined)
     .join(" · ")
@@ -206,12 +237,14 @@ function phaseRowModel(row: WorkflowPhaseRow) {
 
 function phaseRowMetrics(run: WorkflowRun, row: WorkflowPhaseRow) {
   if (row.type === "result") return `0 tok · ${formatShortDuration(run)}`
-  return agentMetrics(row.agent)
+  return agentMetrics(run, row.agent)
 }
 
-function phaseRowIcon(row: WorkflowPhaseRow) {
+function phaseRowIcon(run: WorkflowRun, row: WorkflowPhaseRow) {
   if (row.type === "result") return "✔"
-  return agentIcon(row.agent.status)
+  // Fund 34: a lingering `running` agent on a terminal run renders terminal
+  // (never the live `●`), so a finished run never shows a perpetually-live agent.
+  return agentIcon(agentEffectiveStatus(run, row.agent))
 }
 
 function phaseRowTitle(phase: string | undefined, rows: readonly WorkflowPhaseRow[]) {
@@ -804,7 +837,7 @@ function DialogWorkflowRun(props: {
     const labelWidth = createMemo(() => Math.min(30, Math.max(14, Math.floor(agentPanelWidth() * 0.32))))
     const rowText = createMemo(() =>
       fitColumns(
-        `${active() ? "›" : phaseRowIcon(props.row)} ${Locale.truncate(phaseRowLabel(props.row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(props.row)}`,
+        `${active() ? "›" : phaseRowIcon(current(), props.row)} ${Locale.truncate(phaseRowLabel(props.row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(props.row)}`,
         phaseRowMetrics(current(), props.row),
         agentPanelWidth() - 2,
       ),
