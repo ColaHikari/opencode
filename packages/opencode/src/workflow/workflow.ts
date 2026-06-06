@@ -79,7 +79,12 @@ export const Status = Schema.Literals(["running", "completed", "failed", "cancel
 export type Status = Schema.Schema.Type<typeof Status>
 
 export const LogEntry = Schema.Struct({
-  time: Schema.Number,
+  // Epoch millis — always a finite number. `Schema.Finite` (not `Schema.Number`)
+  // so the generated SDK wire type is a plain `number`, not the dishonest
+  // `number | "NaN" | "Infinity" | …` union the OpenAPI generator emits for an
+  // unbounded `Schema.Number` (Fund 18). Same JS Type (`number`) as before, so
+  // the core row-type SSoT assertions stay valid.
+  time: Schema.Finite,
   phase: Schema.optional(Schema.String),
   message: Schema.String,
 }).annotate({ identifier: "WorkflowLogEntry" })
@@ -88,8 +93,10 @@ export type LogEntry = DeepMutable<Schema.Schema.Type<typeof LogEntry>>
 export const AgentRun = Schema.Struct({
   id: Schema.String,
   status: Schema.Literals(["running", "completed", "failed"]),
-  started_at: Schema.Number,
-  completed_at: Schema.optional(Schema.Number),
+  // Epoch millis — always finite. `Schema.Finite` keeps the SDK wire type a
+  // plain `number` instead of the NaN/Infinity-string union (Fund 18).
+  started_at: Schema.Finite,
+  completed_at: Schema.optional(Schema.Finite),
   phase: Schema.optional(Schema.String),
   agent: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
@@ -640,6 +647,69 @@ function isAbortedMessage(message: SessionV1.WithParts): boolean {
   return name === "MessageAbortedError" || name === "AbortError"
 }
 
+// Enforces the workflow's DECLARED argument contract (meta.arguments) at the
+// single engine entry point — `start()`, before `module.run` — so every start
+// path (HTTP JSON args, the workflow tool, the TUI) gets identical, authoritative
+// behavior regardless of what the UI did upstream. Two concerns, in order:
+//
+//   1. Defaults: a declared `default` fills in any argument the caller omitted.
+//      An explicitly supplied value always wins over the default (it is then
+//      coerced like any other supplied value below).
+//   2. Coercion to the declared `type`:
+//      - number: a numeric string ("42") becomes the number 42; the result must
+//        be finite, so "abc"/"" (NaN) and "Infinity" fail with InvalidError.
+//        A value that is already a number is kept as-is.
+//      - boolean: only the strings "true"/"false" (or an actual boolean) are
+//        accepted; anything else fails with InvalidError.
+//      - string: a primitive non-string (number/boolean) is coerced via
+//        String(...). A non-primitive (object/array) is left UNCHANGED — there is
+//        no honest String() for it and forcing "[object Object]" would hide a
+//        caller mistake.
+//
+// An argument with NO declared type, or one not declared in meta.arguments at
+// all, is passed through verbatim. Returns the coerced map (or undefined when
+// the caller passed none and there are no defaults to apply), or an InvalidError
+// naming the offending argument.
+function coerceArgs(
+  args: Record<string, unknown> | undefined,
+  declared: Meta["arguments"],
+  path: string,
+): Record<string, unknown> | undefined | InvalidError {
+  if (!declared) return args
+  const supplied = args ?? {}
+  const result: Record<string, unknown> = { ...supplied }
+  for (const [name, argument] of Object.entries(declared)) {
+    const hasValue = name in supplied
+    if (!hasValue) {
+      if (argument.default !== undefined) result[name] = argument.default
+      continue
+    }
+    const value = supplied[name]
+    if (argument.type === "number") {
+      const coerced = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN
+      if (!Number.isFinite(coerced))
+        return new InvalidError({ path, message: `argument "${name}" must be a finite number, got ${JSON.stringify(value)}` })
+      result[name] = coerced
+      continue
+    }
+    if (argument.type === "boolean") {
+      const coerced = typeof value === "boolean" ? value : value === "true" ? true : value === "false" ? false : undefined
+      if (coerced === undefined)
+        return new InvalidError({ path, message: `argument "${name}" must be a boolean ("true"/"false"), got ${JSON.stringify(value)}` })
+      result[name] = coerced
+      continue
+    }
+    if (argument.type === "string" && typeof value !== "string") {
+      // Only primitive non-strings get a String() coercion; objects/arrays are
+      // left untouched (no honest string form — see the doc comment above).
+      if (typeof value === "number" || typeof value === "boolean") result[name] = String(value)
+      continue
+    }
+    // No declared type, or value already matches it: pass through unchanged.
+  }
+  return result
+}
+
 function mutableMeta(meta: Meta): Definition["meta"] {
   return {
     name: meta.name,
@@ -1168,6 +1238,13 @@ export const layer = Layer.effect(
         catch: (error) =>
           isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
       })
+      // Enforce the declared argument contract HERE — the single engine boundary
+      // before the body runs — so coercion + defaults apply identically on every
+      // start path (HTTP/Tool/TUI). A non-coercible value fails the start as an
+      // InvalidError; nothing reaches `module.run` until the args are authoritative.
+      const coerced = coerceArgs(input.args, module.meta.arguments, workflow.path)
+      if (coerced instanceof InvalidError) return yield* coerced
+      const args = coerced
       const inst = yield* InstanceState.get(state)
       // The workspace this run belongs to. Persisted to the `directory` column so
       // every later read/delete/sweep can be scoped to it (Fund 6/17).
@@ -1186,7 +1263,7 @@ export const layer = Layer.effect(
           id,
           session_id: session.id,
           workflow: workflow.name,
-          args: input.args ?? undefined,
+          args: args ?? undefined,
           definition: {
             name: workflow.name,
             path: workflow.path,
@@ -1426,7 +1503,7 @@ export const layer = Layer.effect(
       active.fiber = yield* Effect.promise((signal) => {
         runSignal = signal
         return module.run(
-          input.args ?? {},
+          args ?? {},
           createContext({
             active,
             agent,
