@@ -7,13 +7,14 @@ import { useSDK } from "@tui/context/sdk"
 import { selectedForeground, useTheme } from "@tui/context/theme"
 import { useDialog } from "@tui/ui/dialog"
 import { useToast } from "@tui/ui/toast"
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useBindings } from "../keymap"
 import { DialogConfirm } from "../ui/dialog-confirm"
 import * as Clipboard from "../util/clipboard"
 import { getScrollAcceleration } from "../util/scroll"
 import {
+  capLogs,
   formatPhase,
   formatShortElapsed,
   phaseIcon,
@@ -27,13 +28,16 @@ import {
 // Re-exported so existing pure derivations keep a single import surface.
 export { phaseStatus } from "./dialog-workflow-helpers"
 
+// Upper bound on log rows rendered in the non-scrolling Logs section (see capLogs).
+const MAX_VISIBLE_LOGS = 20
+
 function formatShortDuration(run: WorkflowRun) {
   return formatShortElapsed(run.started_at, run.completed_at)
 }
 
 function formatStartedShort(value: unknown) {
   const time = timestamp(value)
-  if (!time) return "--"
+  if (time === undefined) return "--"
   const date = new Date(time)
   return `${(date.getMonth() + 1).toString().padStart(2, "0")}-${date.getDate().toString().padStart(2, "0")} ${date
     .getHours()
@@ -467,7 +471,14 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     }
     sdk.client.workflow
       .delete({ id: run.id })
-      .then(() => toast.show({ message: `Deleted workflow ${run.id}`, variant: "info" }))
+      // The endpoint returns a boolean: `false` means the row was already gone
+      // (e.g. a concurrent delete), so the toast must not claim a deletion that
+      // did not happen here.
+      .then((result) =>
+        result.data === false
+          ? toast.show({ message: `Workflow ${run.id} already gone`, variant: "info" })
+          : toast.show({ message: `Deleted workflow ${run.id}`, variant: "info" }),
+      )
       .catch(toast.error)
       .finally(() => {
         reopen()
@@ -627,6 +638,13 @@ function DialogWorkflowRun(props: {
   const phaseLogs = createMemo(() =>
     current().logs.filter((entry) => !entry.phase || entry.phase === selectedPhase()),
   )
+  // IMPORTANT: the Logs box does not scroll and never shrinks, so an unbounded
+  // render lets a chatty run starve the other panels. Cap to the most recent
+  // entries (newest live at the bottom) and surface the dropped count as a hint.
+  // `<Index>` keys by position rather than object reference, so the 1s refetch —
+  // which rebuilds `logs` into fresh objects every tick — only re-renders rows
+  // whose text actually changed instead of tearing down every line each tick.
+  const cappedLogs = createMemo(() => capLogs(phaseLogs(), MAX_VISIBLE_LOGS))
   const selectedRow = createMemo(() => selectedPhaseRows()[store.selectedAgent])
   const selectedResult = createMemo(() => selectedRow()?.type === "result" && current().result !== undefined)
   const phasePanelWidth = createMemo(() => Math.min(44, Math.max(28, Math.floor((dimensions().width - 6) * 0.28))))
@@ -1005,19 +1023,24 @@ function DialogWorkflowRun(props: {
               </Show>
             </box>
           </Show>
-          <Show when={phaseLogs().length}>
+          <Show when={cappedLogs().entries.length}>
             <box height={1} flexShrink={0} border={["top"]} borderColor={theme.border} />
             <box flexShrink={0} paddingLeft={1}>
               <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
                 {sectionTitle("Logs", agentPanelWidth() - 4)}
               </text>
-              <For each={phaseLogs()}>
+              <Show when={cappedLogs().hidden}>
+                <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+                  … {cappedLogs().hidden} earlier entries
+                </text>
+              </Show>
+              <Index each={cappedLogs().entries}>
                 {(entry) => (
                   <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-                    {formatLogTime(entry.time)} {entry.message}
+                    {formatLogTime(entry().time)} {entry().message}
                   </text>
                 )}
-              </For>
+              </Index>
             </box>
           </Show>
         </box>

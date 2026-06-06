@@ -44,7 +44,10 @@ export function workflowAutocompleteTriggerIndex(input: string, cursorOffset: nu
 // token rather than two. Linear in the input length — no backtracking — so it is
 // immune to the catastrophic backtracking that the previous monolithic regex was
 // prone to on pathological input (N14). `incomplete` flags a token whose closing
-// quote the user has not typed yet (relevant only mid-edit).
+// quote the user has not typed yet (relevant only mid-edit); note this is a
+// deliberate behavior change from the old regex — an unbalanced-quote token like
+// `b="x y` is now kept whole (the open quote suppresses the whitespace split)
+// instead of being split at the space into `b="x` and `y`.
 function tokenizeWorkflowArgs(input: string) {
   const tokens: { text: string; incomplete: boolean }[] = []
   let current = ""
