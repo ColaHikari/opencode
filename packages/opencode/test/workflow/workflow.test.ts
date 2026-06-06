@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
 import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -577,6 +577,60 @@ export async function run(args, ctx) {
   })
   const result = await ctx.parallel(tasks, { concurrencyLimit: args.concurrencyLimit })
   return { peak, result }
+}
+`
+
+// Fund 18/19/20 (Argument-Koerzierung & Defaults): ein Workflow, der die
+// deklarierten args UND deren JS-Laufzeittypen 1:1 ins Resultat zurückgibt.
+// Über `typeof` kann der Test beweisen, dass die Engine String-eingehende args
+// (z. B. JSON-args über HTTP) gemäß dem deklarierten `type` koerziert hat, bevor
+// `run` sie sieht — und dass nicht deklarierte args unverändert durchgereicht
+// werden.
+const COERCE_FIXTURE = "coerce-args"
+const COERCE_WORKFLOW = `export const meta = {
+  name: "${COERCE_FIXTURE}",
+  arguments: {
+    count: { type: "number" },
+    flag: { type: "boolean" },
+    label: { type: "string" },
+    bare: {},
+  },
+}
+export async function run(args, ctx) {
+  return {
+    count: args.count,
+    countType: typeof args.count,
+    flag: args.flag,
+    flagType: typeof args.flag,
+    label: args.label,
+    labelType: typeof args.label,
+    bare: args.bare,
+    bareType: typeof args.bare,
+  }
+}
+`
+
+// Fund 20 (Defaults): deklarierte Defaults für jeden Typ. Werden die args nicht
+// übergeben, MUSS run() den (typ-korrekten) Default sehen; ein explizit
+// übergebener Wert gewinnt über den Default.
+const DEFAULT_FIXTURE = "default-args"
+const DEFAULT_WORKFLOW = `export const meta = {
+  name: "${DEFAULT_FIXTURE}",
+  arguments: {
+    name: { type: "string", default: "x" },
+    count: { type: "number", default: 7 },
+    flag: { type: "boolean", default: true },
+  },
+}
+export async function run(args, ctx) {
+  return {
+    name: args.name,
+    nameType: typeof args.name,
+    count: args.count,
+    countType: typeof args.count,
+    flag: args.flag,
+    flagType: typeof args.flag,
+  }
 }
 `
 
@@ -2098,4 +2152,146 @@ export async function run() { return { ok: true } }
       }),
     { git: true },
   )
+
+  // Fund 19 (medium): deklarierte Argument-Typen werden an der Engine-Grenze
+  // erzwungen, VOR module.run. Ein String-Wert "42" für ein als `number`
+  // deklariertes Argument erreicht run() als die Zahl 42; "true" für ein als
+  // `boolean` deklariertes Argument als der Boolean true. Das deckt ALLE
+  // Start-Pfade ab (HTTP-JSON-args, Tool, TUI), weil die Koerzierung zentral in
+  // start() sitzt. Nicht deklarierte args (`bare`) bleiben unverändert.
+  it.instance("declared number/boolean argument types are coerced from strings before run()", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({
+        name: COERCE_FIXTURE,
+        // String-eingehende args, wie sie über HTTP-JSON oder die TUI ankommen.
+        args: { count: "42", flag: "true", label: 99, bare: { keep: 1 } },
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as Record<string, unknown>
+      // number-Deklaration: "42" -> 42 (echte Zahl).
+      expect(result.count).toBe(42)
+      expect(result.countType).toBe("number")
+      // boolean-Deklaration: "true" -> true (echter Boolean).
+      expect(result.flag).toBe(true)
+      expect(result.flagType).toBe("boolean")
+      // string-Deklaration: ein primitiver Nicht-String (99) wird via String(...)
+      // zu "99" koerziert.
+      expect(result.label).toBe("99")
+      expect(result.labelType).toBe("string")
+      // Nicht deklariertes Argument bleibt unverändert durchgereicht.
+      expect(result.bare).toEqual({ keep: 1 })
+      expect(result.bareType).toBe("object")
+    }),
+  )
+
+  // Fund 19 (medium): ein als `number` deklariertes Argument mit einem nicht
+  // konvertierbaren String ("abc") scheitert mit einem InvalidError an der
+  // Engine-Grenze — der Run startet NICHT (kein verwirrender NaN, der erst im
+  // Workflow-Body auffliegt).
+  it.instance("an unconvertible value for a declared number argument fails with InvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const failed = yield* workflow
+        .start({ name: COERCE_FIXTURE, args: { count: "abc" } })
+        .pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+      const invalid =
+        failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
+      expect(invalid.message).toMatch(/count/)
+    }),
+  )
+
+  // Fund 19 (medium): ein als `boolean` deklariertes Argument akzeptiert nur
+  // "true"/"false"; alles andere scheitert mit InvalidError.
+  it.instance("an unconvertible value for a declared boolean argument fails with InvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const failed = yield* workflow
+        .start({ name: COERCE_FIXTURE, args: { flag: "maybe" } })
+        .pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+    }),
+  )
+
+  // Fund 20 (medium): deklarierte Defaults greifen, wenn ein Argument NICHT
+  // übergeben wird — run() sieht den typ-korrekten Default.
+  it.instance("declared defaults are applied when an argument is not supplied", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, DEFAULT_FIXTURE, DEFAULT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      // Gar keine args übergeben: alle drei Defaults müssen einspringen.
+      const run = yield* workflow.start({ name: DEFAULT_FIXTURE, args: {} })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as Record<string, unknown>
+      expect(result.name).toBe("x")
+      expect(result.nameType).toBe("string")
+      expect(result.count).toBe(7)
+      expect(result.countType).toBe("number")
+      expect(result.flag).toBe(true)
+      expect(result.flagType).toBe("boolean")
+    }),
+  )
+
+  // Fund 20 (medium): ein explizit übergebener Wert gewinnt über den Default und
+  // wird dabei dennoch gemäß dem deklarierten Typ koerziert.
+  it.instance("an explicitly supplied argument wins over its declared default (and is still coerced)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, DEFAULT_FIXTURE, DEFAULT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      // count explizit als String "3" übergeben: gewinnt über default 7 und wird
+      // zu 3 koerziert. name/flag fallen auf ihre Defaults zurück.
+      const run = yield* workflow.start({ name: DEFAULT_FIXTURE, args: { count: "3" } })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as Record<string, unknown>
+      expect(result.count).toBe(3)
+      expect(result.countType).toBe("number")
+      // Die nicht übergebenen behalten ihre Defaults.
+      expect(result.name).toBe("x")
+      expect(result.flag).toBe(true)
+    }),
+  )
+
+  // Fund 18 (medium): die drei Workflow-Zeitfelder (LogEntry.time,
+  // AgentRun.started_at/completed_at) sind Epoch-Millis und damit IMMER endlich.
+  // Als `Schema.Number` erzeugte der SDK-Generator für sie eine NaN/Infinity-
+  // String-Union (`number | "NaN" | "Infinity" | ...`), ein unehrlicher
+  // Wire-Typ. Nach der Umstellung auf `Schema.Finite` dürfen die generierten
+  // SDK-Typen für diese Felder KEINE String-Varianten mehr tragen — sie sind
+  // schlicht `number`. Wir greppen die erzeugte types.gen.ts (statisch, kein
+  // Laufzeit-Roundtrip nötig).
+  test("generated SDK types for workflow time fields are plain numbers, no NaN-string variants", async () => {
+    const source = await Bun.file(
+      path.join(import.meta.dir, "..", "..", "..", "sdk", "js", "src", "v2", "gen", "types.gen.ts"),
+    ).text()
+    // Hilfsextraktor: die Zeile, die ein Feld innerhalb eines benannten Typs
+    // deklariert, anhand des Typ-Headers + Feldnamens.
+    const fieldLine = (typeName: string, field: string) => {
+      const block = source.slice(source.indexOf(`export type ${typeName} = {`))
+      const line = block.split("\n").find((l) => l.trimStart().startsWith(`${field}:`) || l.trimStart().startsWith(`${field}?:`))
+      return line ?? ""
+    }
+    for (const [typeName, field] of [
+      ["WorkflowLogEntry", "time"],
+      ["WorkflowAgentRun", "started_at"],
+      ["WorkflowAgentRun", "completed_at"],
+    ] as const) {
+      const line = fieldLine(typeName, field)
+      expect(line).toContain("number")
+      // Keine NaN/Infinity-String-Variante mehr.
+      expect(line).not.toContain('"NaN"')
+      expect(line).not.toContain('"Infinity"')
+    }
+  })
 })

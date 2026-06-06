@@ -2759,7 +2759,7 @@ export type WorkflowDefinition = {
 }
 
 export type WorkflowLogEntry = {
-  time: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  time: number
   phase?: string
   message: string
 }
@@ -2767,8 +2767,8 @@ export type WorkflowLogEntry = {
 export type WorkflowAgentRun = {
   id: string
   status: "running" | "completed" | "failed"
-  started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  started_at: number
+  completed_at?: number
   phase?: string
   agent?: string
   model?: string
