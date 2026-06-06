@@ -6,8 +6,8 @@ import { Database } from "@opencode-ai/core/database/database"
 import { WorkflowRunTable } from "@opencode-ai/core/workflow/sql"
 import { eq } from "drizzle-orm"
 import { TestInstance } from "../fixture/fixture"
-import { pollWithTimeout, testEffect } from "../lib/effect"
-import { Deferred, Effect, Layer } from "effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import fs from "fs/promises"
 import path from "path"
@@ -119,6 +119,41 @@ function assistantReply(): SessionV1.WithParts {
   return { info: { role: "assistant" }, parts: [] } as unknown as SessionV1.WithParts
 }
 
+// Startup-Fenster-Fixture: schreibt eine Marker-Datei, SOBALD der Body läuft.
+// Wird der Run im Startup-Fenster (vor dem Body-Fork) gecancelt, darf dieser
+// Marker NIE erscheinen — der Body läuft dann nie.
+const STARTUP_FIXTURE = "startup-window"
+function startupWorkflow(markerPath: string) {
+  return `export const meta = { name: "${STARTUP_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  await Bun.write(${JSON.stringify(markerPath)}, "body-ran")
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hang" })
+  return { ok: true }
+}
+`
+}
+
+// Parallel-Hang-Fixture: drei parallele Agent-Tasks, jede startet einen Agenten
+// (eigene Child-Session). Ein vierter, SEQUENTIELLER Step nach dem Batch
+// schreibt einen Marker, der bei korrektem Cancel nie laufen darf.
+const PARALLEL_HANG_FIXTURE = "parallel-hang"
+const PARALLEL_HANG_MARKER = "parallel-after-reached"
+const PARALLEL_HANG_WORKFLOW = `export const meta = { name: "${PARALLEL_HANG_FIXTURE}", phases: ["fan-out", "after"] }
+export async function run(args, ctx) {
+  ctx.setPhase("fan-out")
+  ctx.log("fan-out-started")
+  await ctx.parallel([
+    () => ctx.agent({ prompt: "task A" }),
+    () => ctx.agent({ prompt: "task B" }),
+    () => ctx.agent({ prompt: "task C" }),
+  ])
+  ctx.setPhase("after")
+  ctx.log("${PARALLEL_HANG_MARKER}")
+  return { ok: true }
+}
+`
+
 // Test-Prompt-Ops, die das echte Session-Abort-Verhalten nachbilden:
 // - die initiale "Workflow started"-Nachricht (noReply) wird sofort beantwortet,
 //   damit start() zurückkehrt;
@@ -143,6 +178,51 @@ function hangingPromptOps() {
           Deferred.await(gate).pipe(Effect.flatMap(() => Effect.interrupt)),
         )
         return assistantReply()
+      }),
+    cancel: (sessionID) =>
+      Effect.gen(function* () {
+        aborted.add(sessionID)
+        const gate = gates.get(sessionID)
+        if (gate) yield* Deferred.succeed(gate, undefined)
+      }),
+  }
+  return { ops, aborted, started }
+}
+
+// Resolve-on-abort-Prompt-Ops: bilden den ECHTEN Produktions-Runner nach.
+// Wird eine laufende Agent-Session abgebrochen (cancel -> Abort), RESOLVED der
+// Prompt mit dem letzten Assistant-Stand (eine WithParts, deren info.error ein
+// abgebrochenes Ergebnis markiert) — er REJECTED NICHT. Genau dieses Verhalten
+// (session/prompt.ts: Effect.onInterrupt -> lastAssistant) ist der Kern mehrerer
+// Cancel-Bugs: die Erfolgsverzweigung der Settlement-Callbacks lief sonst und
+// flippte cancelled->completed.
+//
+// `delayMs` verzögert die Beantwortung der initialen noReply-Nachricht, damit
+// Tests im Startup-Fenster (vor dem Body-Fork) cancellen können.
+function resolveOnAbortPromptOps(options?: { delayMs?: number }) {
+  const aborted = new Set<string>()
+  const started = new Set<string>()
+  const gates = new Map<string, Deferred.Deferred<void>>()
+  const abortedReply = (): SessionV1.WithParts =>
+    ({ info: { role: "assistant", error: { name: "MessageAbortedError", data: {} } }, parts: [] }) as unknown as SessionV1.WithParts
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) {
+          if (options?.delayMs) yield* Effect.sleep(options.delayMs)
+          return assistantReply()
+        }
+        const gate = yield* Deferred.make<void>()
+        gates.set(input.sessionID, gate)
+        started.add(input.sessionID)
+        // Race: entweder der lange Lauf endet, oder cancel() öffnet das Gate ->
+        // der Prompt RESOLVED (nicht interrupt!) mit dem abort-Assistant-Stand,
+        // wie der echte Runner. Der Timer hält die Suspension unterbrechbar, so
+        // dass ein Scope-Close die Session-Fiber dennoch hart interrupten kann.
+        return yield* Effect.race(
+          Effect.sleep("30 seconds").pipe(Effect.map(() => assistantReply())),
+          Deferred.await(gate).pipe(Effect.map(() => abortedReply())),
+        )
       }),
     cancel: (sessionID) =>
       Effect.gen(function* () {
@@ -621,6 +701,91 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // Fund 4 (HIGH): Mit dem REALEN resolve-on-abort-Runner RESOLVED der Agent-
+  // Prompt bei Abort (statt zu rejecten). Die Settlement-Erfolgsverzweigung darf
+  // den abort-resolved Step NICHT auf `completed` flippen, keinen Write nach dem
+  // Terminal-Write absetzen und das Budget nicht fälschlich belasten.
+  it.instance("cancel with a resolve-on-abort runner never flips the agent node to completed", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SLOW_FIXTURE, SLOW_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, aborted, started } = resolveOnAbortPromptOps()
+
+      const run = yield* workflow.start({ name: SLOW_FIXTURE, args: {}, prompt: ops, budget: 5 })
+
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
+        }),
+        "agent never started",
+      )
+      const childSession = live.agents[0]?.session_id
+      expect(childSession).toBeDefined()
+
+      yield* workflow.cancel(run.id)
+
+      const after = yield* workflow.get(run.id)
+      const done = after ?? (yield* Effect.fail(new Error("run vanished")))
+      expect(done.status).toBe("cancelled")
+      // Der abort-resolved Agent darf NICHT als completed verbucht sein.
+      expect(done.agents.every((a) => a.status !== "completed")).toBe(true)
+      expect(done.agents.every((a) => a.status !== "running")).toBe(true)
+      // Folge-Step lief nie.
+      expect(done.logs.some((l) => l.message?.includes(STEP2_MARKER))).toBe(false)
+      expect(started.has(childSession!)).toBe(true)
+      expect(aborted.has(childSession!)).toBe(true)
+
+      // KEIN Write nach dem Terminal-Write: ein kalter DB-Read (umgeht den
+      // In-Memory-Snapshot) muss cancelled zeigen, nicht completed.
+      const row = yield* fetchRunRow(run.id)
+      expect(row.status).toBe("cancelled")
+      expect(row.agents.every((a) => a.status !== "completed")).toBe(true)
+    }),
+  )
+
+  // Fund 5 (HIGH): Cancel im Startup-Fenster — start() registriert den Run,
+  // beantwortet aber die Initial-Phase verzögert; ein Cancel landet, BEVOR der
+  // Body geforkt wird. Der Body darf NIE laufen (kein Marker) und der Run muss
+  // als cancelled enden (nicht voll durchlaufen).
+  it.instance("cancel during the startup window prevents the body from ever running", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const marker = path.join(os.tmpdir(), `workflow-startup-${Math.random().toString(16).slice(2)}`)
+      yield* Effect.promise(() => writeWorkflow(test.directory, STARTUP_FIXTURE, startupWorkflow(marker)))
+      const workflow = yield* Workflow.Service
+      // Die Initial-noReply-Antwort wird ~150ms verzögert: start() hängt im
+      // Initial-Prompt, der Run ist aber bereits registriert (status running).
+      const { ops } = resolveOnAbortPromptOps({ delayMs: 150 })
+
+      // start() forken, damit wir parallel im Startup-Fenster cancellen können.
+      const startFiber = yield* Effect.forkScoped(workflow.start({ name: STARTUP_FIXTURE, args: {}, prompt: ops }))
+
+      // Warten bis der Run registriert ist (running, noch kein Body).
+      const id = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const all = yield* workflow.runs()
+          const found = all.find((r) => r.workflow === STARTUP_FIXTURE)
+          return found?.id
+        }),
+        "run never registered",
+      )
+
+      // Cancel im Fenster vor dem Body-Fork.
+      yield* workflow.cancel(id)
+      yield* Fiber.await(startFiber).pipe(Effect.ignore)
+      // Settle-Zeit: falls der Body fälschlich geforkt würde, hätte er hier
+      // längst Zeit gehabt, den Marker zu schreiben (Bug-Modell läuft voll durch).
+      yield* Effect.sleep("300 millis")
+
+      const done = yield* workflow.get(id)
+      expect(done?.status).toBe("cancelled")
+      // Der Body lief NIE: kein Marker.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    }),
+  )
+
   it.instance("remove on a running run cancels it first, then deletes", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -647,6 +812,121 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(gone).toBeUndefined()
       // Und die Child-Session wurde vor dem Löschen abgebrochen.
       expect(aborted.has(childSession!)).toBe(true)
+    }),
+  )
+
+  // Fund 3 (HIGH): Mit dem resolve-on-abort-Runner laufen die detached Agent-
+  // Fibers über bridge.promise NACH dem db.delete weiter und re-INSERTen die
+  // gelöschte Row (Zombie). Nach Settlement muss die Row GELÖSCHT bleiben.
+  it.instance("remove keeps the row deleted even when the agent settles after delete", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SLOW_FIXTURE, SLOW_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops } = resolveOnAbortPromptOps()
+
+      const run = yield* workflow.start({ name: SLOW_FIXTURE, args: {}, prompt: ops })
+
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
+        }),
+        "agent never started",
+      )
+
+      yield* workflow.remove(run.id)
+
+      // Ein paar Ticks für ggf. nachlaufende detached Settlement-Fibers.
+      yield* Effect.sleep("200 millis")
+
+      // Kalt-Read: kein Re-INSERT, die Row bleibt weg.
+      const { db } = yield* Database.Service
+      const row = yield* db
+        .select()
+        .from(WorkflowRunTable)
+        .where(eq(WorkflowRunTable.id, run.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(row).toBeUndefined()
+      expect(yield* workflow.get(run.id)).toBeUndefined()
+    }),
+  )
+
+  // Fund 24/16 (parallel): ein parallel-Batch mit drei hängenden Agenten +
+  // Cancel mitten drin. ALLE registrierten Child-Sessions müssen abgebrochen
+  // werden; der sequentielle Folge-Step darf nie laufen; Status cancelled.
+  it.instance("cancel during a parallel batch aborts every started child session", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_HANG_FIXTURE, PARALLEL_HANG_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, aborted, started } = resolveOnAbortPromptOps()
+
+      const run = yield* workflow.start({ name: PARALLEL_HANG_FIXTURE, args: {}, prompt: ops })
+
+      // Warten bis alle drei parallelen Agenten ihre Child-Session registriert haben.
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          const running = current?.agents.filter((a) => a.status === "running" && a.session_id) ?? []
+          return running.length >= 3 ? current : undefined
+        }),
+        "parallel agents never all started",
+      )
+      const sessions = live!.agents.map((a) => a.session_id!).filter(Boolean)
+      expect(sessions.length).toBeGreaterThanOrEqual(3)
+
+      yield* workflow.cancel(run.id)
+
+      const done = yield* workflow.get(run.id)
+      expect(done?.status).toBe("cancelled")
+      // Jede gestartete Child-Session wurde echt abgebrochen.
+      for (const s of started) expect(aborted.has(s)).toBe(true)
+      // Der Folge-Step lief nie.
+      expect(done?.logs.some((l) => l.message?.includes(PARALLEL_HANG_MARKER))).toBe(false)
+      // Kein Agent bleibt running, keiner wird als completed verbucht.
+      expect(done?.agents.every((a) => a.status !== "running")).toBe(true)
+      expect(done?.agents.every((a) => a.status !== "completed")).toBe(true)
+    }),
+  )
+
+  // Fund 50 (low): PromptOps OHNE cancel-Vektor. cancel() muss den Run trotzdem
+  // als cancelled markieren und den Folge-Step gaten. Dokumentierter Gap: die
+  // in-flight Child-Session wird NICHT abgebrochen (sie läuft aus) — nur die
+  // Run-Fiber/der Run-Scope wird beendet.
+  it.instance("cancel without a PromptOps.cancel vector still ends the run as cancelled", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SLOW_FIXTURE, SLOW_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      // PromptOps OHNE cancel: der Agent-Prompt hängt (resolved nie von selbst).
+      const ops: { prompt: SessionPrompt.Interface["prompt"] } = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            // Hängt unterbrechbar; nur ein Scope-Close (Run-Scope) kann sie beenden.
+            yield* Effect.never
+            return assistantReply()
+          }),
+      }
+
+      const run = yield* workflow.start({ name: SLOW_FIXTURE, args: {}, prompt: ops })
+
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running") ? current : undefined
+        }),
+        "agent never started",
+      )
+
+      yield* workflow.cancel(run.id)
+
+      const done = yield* workflow.get(run.id)
+      expect(done?.status).toBe("cancelled")
+      // Folge-Step lief nie.
+      expect(done?.logs.some((l) => l.message?.includes(STEP2_MARKER))).toBe(false)
     }),
   )
 
@@ -844,6 +1124,39 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(result.remaining).toBe(0.7)
       // Und der Agent-Node ist als failed verbucht.
       expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
+    }),
+  )
+
+  // N2 (medium): finish() persistet (orDie) den Terminalzustand. Schlägt dieser
+  // Terminal-Write fehl, darf das done-Deferred NICHT verloren gehen — sonst
+  // hängt jedes wait() ohne Timeout ewig. Wir injizieren genau eine fehlschlagende
+  // Terminal-Persistenz über einen minimalen, klar dokumentierten Test-Seam und
+  // verlangen, dass wait() trotzdem mit dem Terminalzustand resolved.
+  it.instance("finish resolves waiters even when the terminal persist fails", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "hello",
+          `export const meta = { name: "Hello" }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      // Seam: der NÄCHSTE Terminal-Persist (in finish) wirft einmalig.
+      Workflow.__testHooks.failNextTerminalPersist()
+      const run = yield* workflow.start({ name: "hello", args: { value: 1 } })
+      // wait() OHNE Timeout: darf nicht hängen, sondern muss den Terminalzustand
+      // liefern, obwohl der Terminal-DB-Write fehlgeschlagen ist.
+      const waited = yield* awaitWithTimeout(
+        workflow.wait({ id: run.id }),
+        "wait hung after a failing terminal persist",
+        "5 seconds",
+      )
+      expect(waited.run?.status).toBe("completed")
+      expect(waited.run?.result).toEqual({ value: 1 })
     }),
   )
 
