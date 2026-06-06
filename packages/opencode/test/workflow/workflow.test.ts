@@ -777,15 +777,17 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
   // snapshot showing the TRUE terminal status (completed), NOT undefined and NOT
   // rewritten to cancelled.
   //
-  // Deterministic coverage of the FIX SEMANTICS: complete the run first (await its
-  // terminal state via wait, which resolves once finish has persisted + evicted),
-  // THEN cancel. A cancel on an already-terminal-and-evicted run takes the exact
-  // same persisted-fallback branch the lost race produces — get() inside cancel
-  // misses the (evicted) registry and finish("cancelled") returns undefined, so
-  // the new fallback reads the DB row. The pre-fix code returned undefined here.
-  // The precise finish-undefined timing window (mid-cancel eviction) is exercised
-  // end-to-end by script/httpapi-exercise.ts (workflow.start), whose fixture
-  // completes synchronously fast; this unit test pins the observable contract.
+  // Deterministic coverage of the FIX SEMANTICS (the observable contract), not of
+  // the exact lost-race code line: complete the run first (await its terminal state
+  // via wait, which resolves at finish's Deferred — committed terminal row, but the
+  // subsequent N1-evict may or may not have run yet), THEN cancel. The cancel then
+  // takes one of the two non-undefined branches — `snapshot(active)` if still
+  // registered, or the persisted-DB fallback once evicted — both returning the TRUE
+  // terminal status. The pre-fix code returned undefined on the evicted branch.
+  // The precise finish-undefined window (cancel's OWN finish returning undefined
+  // mid-eviction, the named `finished ?? persisted()` line) is exercised end-to-end
+  // by script/httpapi-exercise.ts (workflow.start), whose fixture completes
+  // synchronously fast; this unit test pins the contract those branches must honor.
   it.instance("cancel of an already-completed (evicted) run returns the completed snapshot, never undefined", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
