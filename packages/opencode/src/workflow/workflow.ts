@@ -30,6 +30,7 @@ import type {
 } from "@opencode-ai/plugin/workflow"
 import { WorkflowRunTable } from "./workflow.sql"
 import { MetaReader } from "./meta-reader"
+import { Meta } from "./meta"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
 // / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a
@@ -46,20 +47,11 @@ export const RunID = Schema.String.check(Schema.isStartsWith("job")).pipe(
 )
 export type RunID = Schema.Schema.Type<typeof RunID>
 
-export const Argument = Schema.Struct({
-  type: Schema.optional(Schema.String),
-  default: Schema.optional(Schema.Unknown),
-  description: Schema.optional(Schema.String),
-}).annotate({ identifier: "WorkflowArgument" })
-export type Argument = Schema.Schema.Type<typeof Argument>
-
-export const Meta = Schema.Struct({
-  name: Schema.String,
-  description: Schema.optional(Schema.String),
-  phases: Schema.optional(Schema.Array(Schema.String)),
-  arguments: Schema.optional(Schema.Record(Schema.String, Argument)),
-}).annotate({ identifier: "WorkflowMeta" })
-export type Meta = Schema.Schema.Type<typeof Meta>
+// Meta/Argument schemas live in `./meta` (a Schema-only leaf module) so the
+// static meta reader can share them without forming an import cycle. Re-exported
+// here so the engine's public `Workflow.Meta` / `Workflow.Argument` API is
+// unchanged.
+export { Argument, Meta } from "./meta"
 
 export const Info = Schema.Struct({
   name: Schema.String,

@@ -1,6 +1,6 @@
 import ts from "typescript"
 import { Cause, Exit, Schema } from "effect"
-import { Meta } from "./workflow"
+import { Meta } from "./meta"
 
 // The single error text every non-literal meta value maps to. Workflow discovery
 // (list/read/autocomplete/HTTP) must never EXECUTE a workflow module just to read
@@ -13,6 +13,8 @@ import { Meta } from "./workflow"
 const NON_LITERAL_ERROR = "workflow meta must be statically analyzable (literal values only)"
 
 export type Result = { valid: true; meta: Meta } | { valid: false; error: string }
+
+const decodeMeta = Schema.decodeUnknownExit(Meta)
 
 /**
  * Statically extracts a workflow module's meta from its SOURCE TEXT, without ever
@@ -30,17 +32,26 @@ export type Result = { valid: true; meta: Meta } | { valid: false; error: string
  */
 export function read(source: string, filePath: string): Result {
   const file = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true)
+  // More than one `export default` is invalid TS and ambiguous to extract from —
+  // reject explicitly rather than silently picking the first one.
+  if (file.statements.filter((s) => ts.isExportAssignment(s) && !s.isExportEquals).length > 1)
+    return { valid: false, error: "Multiple default exports; cannot determine the workflow" }
   const node = findMetaObject(file)
   if (!node) return { valid: false, error: "Missing meta export (export const meta / export default)" }
   const extracted = extractValue(node)
   if (extracted.ok === false) return { valid: false, error: NON_LITERAL_ERROR }
-  // `Meta` is referenced lazily here (not at module init) because workflow.ts —
-  // which owns the schema — imports this module, so a top-level decoder would hit
-  // a temporal-dead-zone on `Meta` during that circular import. `read` only runs
-  // after both modules have fully initialized, so the reference is always sound.
-  const decoded = Schema.decodeUnknownExit(Meta)(extracted.value, { errors: "all", propertyOrder: "original" })
+  const decoded = decodeMeta(extracted.value, { errors: "all", propertyOrder: "original" })
   if (Exit.isFailure(decoded)) return { valid: false, error: Cause.pretty(decoded.cause) }
   return { valid: true, meta: decoded.value }
+}
+
+// Strips the syntactic wrappers that carry no runtime value — `(expr)`,
+// `expr as T` / `as const`, and `expr satisfies T` — so idiomatic TS like
+// `{ … } as const` or `phases: [...] as const` is seen as the literal it wraps.
+function unwrap(node: ts.Expression): ts.Expression {
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node))
+    return unwrap(node.expression)
+  return node
 }
 
 // Locates the object literal that carries the meta, matching the three accepted
@@ -48,16 +59,18 @@ export function read(source: string, filePath: string): Result {
 // and 3 flatten to the same shape: `{ name, description, phases, arguments }`).
 function findMetaObject(file: ts.SourceFile): ts.ObjectLiteralExpression | undefined {
   for (const statement of file.statements) {
-    // Form 1: `export const meta = { … }`
+    // Form 1: `export const meta = { … }` (initializer may be `… as const`).
     if (ts.isVariableStatement(statement) && hasExportModifier(statement)) {
       for (const decl of statement.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name) && decl.name.text === "meta" && decl.initializer)
-          return ts.isObjectLiteralExpression(decl.initializer) ? decl.initializer : undefined
+        if (ts.isIdentifier(decl.name) && decl.name.text === "meta" && decl.initializer) {
+          const initializer = unwrap(decl.initializer)
+          return ts.isObjectLiteralExpression(initializer) ? initializer : undefined
+        }
       }
     }
-    // Forms 2 & 3: `export default …`
+    // Forms 2 & 3: `export default …` (expression may be `(…)`/`… as const`).
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
-      const expr = statement.expression
+      const expr = unwrap(statement.expression)
       // Form 2: a default object literal — read its `meta` property's value.
       if (ts.isObjectLiteralExpression(expr)) return metaPropertyObject(expr)
       // Form 3: `workflow({ … })` — the call's first arg is the flat meta object
@@ -65,7 +78,8 @@ function findMetaObject(file: ts.SourceFile): ts.ObjectLiteralExpression | undef
       // the schema, which only reads the meta keys).
       if (ts.isCallExpression(expr)) {
         const arg = expr.arguments[0]
-        return arg && ts.isObjectLiteralExpression(arg) ? arg : undefined
+        const unwrapped = arg ? unwrap(arg) : undefined
+        return unwrapped && ts.isObjectLiteralExpression(unwrapped) ? unwrapped : undefined
       }
     }
   }
@@ -74,12 +88,10 @@ function findMetaObject(file: ts.SourceFile): ts.ObjectLiteralExpression | undef
 
 function metaPropertyObject(object: ts.ObjectLiteralExpression): ts.ObjectLiteralExpression | undefined {
   for (const property of object.properties) {
-    if (
-      ts.isPropertyAssignment(property) &&
-      propertyKey(property.name) === "meta" &&
-      ts.isObjectLiteralExpression(property.initializer)
-    )
-      return property.initializer
+    if (ts.isPropertyAssignment(property) && propertyKey(property.name) === "meta") {
+      const initializer = unwrap(property.initializer)
+      return ts.isObjectLiteralExpression(initializer) ? initializer : undefined
+    }
   }
   return undefined
 }
@@ -105,7 +117,9 @@ function isFunctionLike(node: ts.Expression) {
 // would require executing code to know its value (identifiers, calls, member
 // access, spreads, methods, computed keys, template substitutions) makes the
 // whole extraction fail — the caller turns that into the NON_LITERAL_ERROR.
-function extractValue(node: ts.Expression): Extracted {
+function extractValue(input: ts.Expression): Extracted {
+  // Transparent wrappers (`(expr)`, `as const`, `satisfies`) carry no value.
+  const node = unwrap(input)
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return { ok: true, value: node.text }
   if (ts.isNumericLiteral(node)) return { ok: true, value: Number(node.text) }
   if (node.kind === ts.SyntaxKind.TrueKeyword) return { ok: true, value: true }
@@ -137,7 +151,7 @@ function extractValue(node: ts.Expression): Extracted {
       const key = propertyKey(property.name)
       if (key === undefined) return FAIL
       // A `run:` value that is itself a function is likewise ignored, not literal.
-      if (key === "run" && isFunctionLike(property.initializer)) continue
+      if (key === "run" && isFunctionLike(unwrap(property.initializer))) continue
       const extracted = extractValue(property.initializer)
       if (extracted.ok === false) return FAIL
       result[key] = extracted.value
