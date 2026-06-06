@@ -1275,6 +1275,54 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     { git: true },
   )
 
+  // N13 (low): snapshot()/die öffentliche Run-Ausgabe darf KEINE internen
+  // Zusatzfelder (directory/done/runScope/fiber/budget …) tragen und KEINE
+  // Live-Referenzen aliasen — Mutieren des zurückgegebenen Objekts (inkl. der
+  // verschachtelten args/definition/result) darf den internen Zustand nicht
+  // verändern (defensive Projektion).
+  it.instance("public run output is a defensive projection with no internal fields or live aliases", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "hello",
+          `export const meta = { name: "Hello" }
+export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); return { nested: { ok: true } } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "hello", args: { nested: { value: 1 } } })
+
+      // Live-Snapshot (Run ist noch in der Registry): keine internen Felder.
+      const live = yield* workflow.get(run.id)
+      const liveAny = live as unknown as Record<string, unknown>
+      for (const internal of ["directory", "done", "runScope", "fiber", "sessions", "cancelSession", "cancelling", "removed", "budget", "budgetRemaining"]) {
+        expect(internal in liveAny).toBe(false)
+      }
+      // Exakt die deklarierten Run-Schlüssel (Teilmenge: optionale können fehlen).
+      const allowed = new Set([
+        "id", "session_id", "workflow", "args", "definition", "status",
+        "started_at", "completed_at", "current_phase", "logs", "agents", "result", "error",
+      ])
+      for (const key of Object.keys(liveAny)) expect(allowed.has(key)).toBe(true)
+
+      // Defensive Projektion: das verschachtelte args mutieren darf den internen
+      // Zustand NICHT beeinflussen.
+      ;(live!.args as { nested: { value: number } }).nested.value = 999
+      const again = yield* workflow.get(run.id)
+      expect((again!.args as { nested: { value: number } }).nested.value).toBe(1)
+
+      // Auch nach Abschluss: das result mutieren beeinflusst die DB-Row nicht.
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
+      ;(done.result as { nested: { ok: boolean } }).nested.ok = false
+      const persisted = yield* workflow.get(run.id)
+      expect((persisted!.result as { nested: { ok: boolean } }).nested.ok).toBe(true)
+    }),
+  )
+
   // Fund 42 / N20 (low): result === null darf im DB-Roundtrip NICHT zu undefined
   // ("No result recorded.") werden. Drei Fälle, end-to-end durch den echten
   // Engine-Persist getrieben: ein echtes result, result === null und nie gesetzt.

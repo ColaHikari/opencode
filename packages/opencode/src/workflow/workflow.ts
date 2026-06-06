@@ -387,9 +387,23 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Wo
 
 const decodeMeta = Schema.decodeUnknownExit(Meta)
 
+// N13: the public `Run` projection of a live run. The spread copies ONLY the
+// `Run` fields (`active.run` is exactly the `Run` shape — the engine-internal
+// fields like `directory`/`runScope`/`budget` live on `Active`, never on
+// `active.run`), so no internal state leaks. But a shallow spread still ALIASES
+// the live nested values, so a caller mutating `snapshot(active).args.x` /
+// `.definition` / `.result` / a `logs`/`agents` entry would mutate the running
+// engine's own state. Defensively deep-copy every nested value so the returned
+// run is a detached projection (matching `fromRow`, which already returns a
+// fresh DB-parsed run). `logs`/`agents` were already copied per-entry; `args`/
+// `definition`/`result` are deep-cloned (structuredClone) — they are plain JSON
+// values, so a structural clone is faithful and severs all aliasing.
 function snapshot(active: Active): Run {
   return {
     ...active.run,
+    args: active.run.args === undefined ? undefined : structuredClone(active.run.args),
+    definition: active.run.definition === undefined ? undefined : structuredClone(active.run.definition),
+    result: active.run.result === undefined ? undefined : structuredClone(active.run.result),
     logs: active.run.logs.map((item) => ({ ...item })),
     agents: active.run.agents.map((item) => ({ ...item })),
   }
