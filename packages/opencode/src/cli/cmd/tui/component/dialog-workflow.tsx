@@ -452,6 +452,37 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       .catch(toast.error)
   }
 
+  // Track B: `p` pauses a running run (keeping its journal) and resumes a
+  // paused/interrupted one (a fresh run that replays the journal via resume_of).
+  // No-op for completed/failed/cancelled runs — nothing to do.
+  function pauseOrResumeSelected() {
+    const run = selected()
+    if (!run) return
+    if (run.status === "running") {
+      void sdk.client.workflow
+        .pause({ id: run.id })
+        .then(() => {
+          toast.show({ message: `Paused workflow ${run.id}`, variant: "info" })
+          void refetch()
+        })
+        .catch(toast.error)
+      return
+    }
+    if (run.status === "paused" || run.status === "interrupted") {
+      void sdk.client.workflow
+        .start({ name: run.workflow, workflowStartPayload: { resume_of: run.id } })
+        .then((result) => {
+          if (!result.data) {
+            toast.show({ message: `Failed to resume workflow ${run.id}`, variant: "error" })
+            return
+          }
+          toast.show({ message: `Resumed workflow ${run.workflow}`, variant: "info" })
+          void refetch()
+        })
+        .catch(toast.error)
+    }
+  }
+
   // Fund 10 (behavior change): deleting a run from history is irreversible, so it
   // now asks for confirmation first. DialogConfirm.show replaces the dashboard, so
   // the dashboard is re-opened afterwards whichever way the prompt resolves.
@@ -493,6 +524,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       { key: "return", desc: "View workflow details", group: "Workflow", cmd: openSelected },
       { key: "r", desc: "Refresh workflows", group: "Workflow", cmd: () => void refetchWorkflows() },
       { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancelSelected },
+      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: pauseOrResumeSelected },
       { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => void deleteSelected() },
       { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => dialog.clear() },
     ],
@@ -748,6 +780,59 @@ function DialogWorkflowRun(props: {
       .catch(toast.error)
   }
 
+  // Track B: `p` pauses a running run (journal kept) and resumes a paused/
+  // interrupted one (fresh run replaying the journal via resume_of).
+  const pauseOrResume = () => {
+    const status = current().status
+    if (status === "running") {
+      void sdk.client.workflow
+        .pause({ id: current().id })
+        .then(() => {
+          toast.show({ message: `Paused workflow ${current().id}`, variant: "info" })
+          void refetch()
+        })
+        .catch(toast.error)
+      return
+    }
+    if (status === "paused" || status === "interrupted") resume()
+  }
+
+  // Starts a fresh run that replays this run's journal. `invalidate` lists
+  // source-agent indices (0-based) to force back to live; an empty list resumes
+  // every completed agent from the journal.
+  const resume = (invalidate?: number[]) => {
+    void sdk.client.workflow
+      .start({
+        name: current().workflow,
+        workflowStartPayload: { resume_of: current().id, invalidate_agents: invalidate },
+      })
+      .then((result) => {
+        if (!result.data) {
+          toast.show({ message: `Failed to resume workflow ${current().id}`, variant: "error" })
+          return
+        }
+        toast.show({ message: `Resumed workflow ${current().workflow}`, variant: "info" })
+        // Follow the new run into its own detail view so the resume is observable.
+        dialog.replace(
+          () => <DialogWorkflowRun id={result.data!.id} initial={result.data!} workflows={props.workflows} />,
+          undefined,
+          { notifyClose: false },
+        )
+      })
+      .catch(toast.error)
+  }
+
+  // `r` on the selected agent resumes the run while forcing JUST that agent back
+  // to a live re-run (its index passed in invalidate_agents); every other
+  // completed agent still replays from the journal.
+  const resumeInvalidatingSelectedAgent = () => {
+    const row = selectedRow()
+    if (row?.type === "result") return
+    const index = current().agents.findIndex((agent) => agent.id === row?.agent.id)
+    if (index < 0) return
+    resume([index])
+  }
+
   function openAgentSession() {
     const row = selectedRow()
     if (row?.type === "result") return
@@ -812,6 +897,8 @@ function DialogWorkflowRun(props: {
       { key: "return,o", desc: "Open selected subagent", group: "Workflow", cmd: openAgentSession },
       { key: "y", desc: "Copy selected response", group: "Workflow", cmd: copySelectedResponse },
       { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancel },
+      { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: pauseOrResume },
+      { key: "r", desc: "Resume, re-running the selected agent", group: "Workflow", cmd: resumeInvalidatingSelectedAgent },
       { key: "up,k", desc: "Previous phase", group: "Workflow", cmd: () => movePhase(-1) },
       { key: "down,j", desc: "Next phase", group: "Workflow", cmd: () => movePhase(1) },
       { key: "left,h", desc: "Previous phase agent", group: "Workflow", cmd: () => moveAgent(-1) },

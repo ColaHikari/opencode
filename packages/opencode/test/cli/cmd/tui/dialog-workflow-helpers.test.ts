@@ -28,7 +28,7 @@ function makeAgent(input: Partial<WorkflowRun["agents"][number]>): WorkflowRun["
   return { id: "1", status: "running", started_at: 1_000, prompt: "p", ...input } as WorkflowRun["agents"][number]
 }
 
-describe("statusIcon (Fund 32, 33 — all five status)", () => {
+describe("statusIcon (Fund 32, 33, Track B — all six status)", () => {
   test("each status maps to a distinct glyph", () => {
     const icons = new Set([
       statusIcon("running"),
@@ -36,14 +36,23 @@ describe("statusIcon (Fund 32, 33 — all five status)", () => {
       statusIcon("failed"),
       statusIcon("cancelled"),
       statusIcon("interrupted"),
+      statusIcon("paused"),
     ])
-    // Fund 32: cancelled gets its own glyph, so all five are distinct.
-    expect(icons.size).toBe(5)
+    // Fund 32 + Track B: cancelled and paused each get their own glyph, so all
+    // six are distinct.
+    expect(icons.size).toBe(6)
   })
 
   test("cancelled has a glyph different from interrupted and the hollow pending marker", () => {
     expect(statusIcon("cancelled")).not.toBe(statusIcon("interrupted"))
     expect(statusIcon("cancelled")).not.toBe("◌")
+  })
+
+  test("paused has its own pause glyph, distinct from the terminal markers and the hollow marker", () => {
+    expect(statusIcon("paused")).toBe("⏸")
+    expect(statusIcon("paused")).not.toBe(statusIcon("cancelled"))
+    expect(statusIcon("paused")).not.toBe(statusIcon("interrupted"))
+    expect(statusIcon("paused")).not.toBe("◌")
   })
 })
 
@@ -54,6 +63,7 @@ describe("phaseIcon", () => {
     expect(phaseIcon("failed")).toBe("✖")
     expect(phaseIcon("interrupted")).toBe("⊘")
     expect(phaseIcon("cancelled")).toBe(statusIcon("cancelled"))
+    expect(phaseIcon("paused")).toBe(statusIcon("paused"))
     expect(phaseIcon("pending")).toBe("◌")
     expect(phaseIcon("skipped")).toBe("◌")
   })
@@ -79,6 +89,13 @@ describe("phaseStatus (N5)", () => {
     const run = makeRun({ status: "cancelled", completed_at: 2_000, current_phase: "b" })
     expect(phaseStatus(run, phases, "a")).toBe("completed")
     expect(phaseStatus(run, phases, "b")).toBe("cancelled")
+    expect(phaseStatus(run, phases, "c")).toBe("skipped")
+  })
+
+  test("a paused run marks the stopped phase paused and later phases skipped", () => {
+    const run = makeRun({ status: "paused", current_phase: "b" })
+    expect(phaseStatus(run, phases, "a")).toBe("completed")
+    expect(phaseStatus(run, phases, "b")).toBe("paused")
     expect(phaseStatus(run, phases, "c")).toBe("skipped")
   })
 })

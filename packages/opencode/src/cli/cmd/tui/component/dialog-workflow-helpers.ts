@@ -19,6 +19,9 @@ export function statusIcon(status: WorkflowRun["status"]) {
   // `interrupted` is a failure-like terminal state (orphaned/zombie run), shown
   // with a distinct broken-circle marker so it reads apart from a clean cancel.
   if (status === "interrupted") return "⊘"
+  // `paused` is the only non-terminal state besides running: a user-suspended run
+  // that can be resumed. The pause glyph reads apart from every terminal marker.
+  if (status === "paused") return "⏸"
   return "◌"
 }
 
@@ -50,6 +53,8 @@ export function phaseIcon(status: ReturnType<typeof phaseStatus>) {
   if (status === "failed") return "✖"
   if (status === "cancelled") return statusIcon("cancelled")
   if (status === "interrupted") return "⊘"
+  // The phase a paused run stopped on reads with the pause glyph (it can resume).
+  if (status === "paused") return statusIcon("paused")
   // `skipped` (never-reached phase on a terminal run) and `pending` both read as
   // the hollow marker — neither is live; `skipped` simply will never advance.
   return "◌"
