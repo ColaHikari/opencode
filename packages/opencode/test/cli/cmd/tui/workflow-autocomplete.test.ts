@@ -7,6 +7,7 @@ import {
   parseWorkflowArgs,
   workflowArgContext,
   workflowAutocompleteTriggerIndex,
+  workflowCommandOptions,
 } from "../../../../src/cli/cmd/tui/component/prompt/workflow-autocomplete"
 
 describe("parseWorkflowArgs", () => {
@@ -148,5 +149,42 @@ describe("listWorkflowInfos", () => {
   test("invalid entries are filtered out", async () => {
     const result = await listWorkflowInfos({ list: async () => ({ data: [valid, broken] }) }, true)
     expect(result.map((info) => info.name)).toEqual(["a"])
+  })
+})
+
+describe("workflowCommandOptions (direct /<name> slash commands)", () => {
+  const info = (name: string, extra: Partial<WorkflowInfo> = {}) =>
+    ({ name, valid: true, path: `p/${name}`, meta: { name, description: `${name} desc` }, ...extra }) as WorkflowInfo
+
+  test("valid workflows become /<name> options carrying the name as value", () => {
+    const options = workflowCommandOptions([info("review"), info("deploy")], new Set())
+    expect(options.map((o) => o.display)).toEqual(["/review", "/deploy"])
+    expect(options.map((o) => o.value)).toEqual(["review", "deploy"])
+    expect(options.map((o) => o.description)).toEqual(["review desc", "deploy desc"])
+  })
+
+  test("falls back to meta.name when no description is present", () => {
+    const options = workflowCommandOptions(
+      [info("solo", { meta: { name: "Solo Flow" } } as Partial<WorkflowInfo>)],
+      new Set(),
+    )
+    expect(options[0]?.description).toBe("Solo Flow")
+  })
+
+  test("invalid workflows are filtered out", () => {
+    const options = workflowCommandOptions(
+      [info("good"), { name: "bad", valid: false, path: "p/bad", meta: { name: "bad" } } as WorkflowInfo],
+      new Set(),
+    )
+    expect(options.map((o) => o.display)).toEqual(["/good"])
+  })
+
+  test("a workflow whose name collides with an existing command is filtered out", () => {
+    const options = workflowCommandOptions([info("review"), info("deploy")], new Set(["review"]))
+    expect(options.map((o) => o.display)).toEqual(["/deploy"])
+  })
+
+  test("no infos yields no options", () => {
+    expect(workflowCommandOptions([], new Set())).toEqual([])
   })
 })

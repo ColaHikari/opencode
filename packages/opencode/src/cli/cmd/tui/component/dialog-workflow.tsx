@@ -1,7 +1,9 @@
-import { TextAttributes, type ScrollBoxRenderable } from "@opentui/core"
+import { TextAttributes, type ScrollBoxRenderable, type TextareaRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import { Locale } from "@/util/locale"
+import { Global } from "@opencode-ai/core/global"
+import { useProject } from "@tui/context/project"
 import { useRoute } from "@tui/context/route"
 import { useSDK } from "@tui/context/sdk"
 import { selectedForeground, useTheme } from "@tui/context/theme"
@@ -9,6 +11,8 @@ import { useDialog } from "@tui/ui/dialog"
 import { useToast } from "@tui/ui/toast"
 import { createEffect, createMemo, createResource, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
+import fs from "fs/promises"
+import path from "path"
 import { useBindings } from "../keymap"
 import { DialogConfirm } from "../ui/dialog-confirm"
 import * as Clipboard from "../util/clipboard"
@@ -20,6 +24,8 @@ import {
   phaseIcon,
   phaseStatus,
   reanchorSelection,
+  sanitizeWorkflowFilename,
+  saveTargets,
   spentThisMonth,
   statusIcon,
   timestamp,
@@ -597,6 +603,123 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
   )
 }
 
+// Save-as-command (dashboard `s` in the run detail): writes a run's persisted
+// `definition.source` to disk as a real workflow file so it becomes a
+// rediscoverable `/<name>` command. The name is prefilled from the run's
+// workflow; Tab toggles the destination between the project `.opencode/workflows`
+// dir and the global config workflows dir. A name colliding with an existing file
+// at the chosen destination is a hard warning — NEVER an overwrite. A run without
+// a captured source (older/temporary runs) cannot be saved.
+function DialogWorkflowSave(props: { run: WorkflowRun; onClose: () => void }) {
+  const dialog = useDialog()
+  const toast = useToast()
+  const project = useProject()
+  const { theme } = useTheme()
+  const [target, setTarget] = createSignal<"project" | "global">("project")
+  const [textareaTarget, setTextareaTarget] = createSignal<TextareaRenderable>()
+  let textarea: TextareaRenderable
+
+  const source = props.run.definition?.source
+  // The project root for `.opencode/workflows` is the worktree when set, else the
+  // instance directory (matches the engine's projectConfigDir resolution).
+  const projectDir = () => project.instance.path().worktree || project.instance.path().directory
+  const globalDir = () => project.instance.path().config || Global.Path.config
+
+  async function save() {
+    if (!source) {
+      toast.show({ message: "This run has no captured source to save", variant: "error" })
+      return
+    }
+    const name = sanitizeWorkflowFilename(textarea.plainText)
+    if (!name) {
+      toast.show({ message: "Invalid workflow name (no slashes, '..', or empty)", variant: "error" })
+      return
+    }
+    const targets = saveTargets(projectDir(), globalDir(), name)
+    const file = target() === "project" ? targets.project : targets.global
+    // Collision is a hard stop: never silently overwrite an existing file.
+    if (await Bun.file(file).exists()) {
+      toast.show({ message: `A workflow named ${name} already exists at this destination`, variant: "error" })
+      return
+    }
+    await fs.mkdir(path.dirname(file), { recursive: true }).catch(() => {})
+    const wrote = await Bun.write(file, source).then(
+      () => true,
+      () => false,
+    )
+    if (!wrote) {
+      toast.show({ message: `Failed to write ${file}`, variant: "error" })
+      return
+    }
+    toast.show({ message: `Saved workflow ${name} to ${target()}`, variant: "success" })
+    // Return to wherever the caller wants (the run detail) instead of clearing
+    // the whole stack, so the user lands back where they pressed `s`.
+    props.onClose()
+  }
+
+  useBindings(() => ({
+    target: textareaTarget,
+    enabled: textareaTarget() !== undefined,
+    priority: 1,
+    bindings: [
+      { key: "return", desc: "Save workflow command", group: "Dialog", cmd: () => void save() },
+      {
+        key: "tab",
+        desc: "Toggle save destination",
+        group: "Dialog",
+        cmd: () => setTarget(target() === "project" ? "global" : "project"),
+      },
+    ],
+  }))
+
+  onMount(() => {
+    dialog.setSize("medium")
+    setTimeout(() => {
+      if (!textarea || textarea.isDestroyed) return
+      textarea.focus()
+      textarea.gotoLineEnd()
+    }, 1)
+  })
+
+  return (
+    <box paddingLeft={2} paddingRight={2} gap={1}>
+      <box flexDirection="row" justifyContent="space-between">
+        <text attributes={TextAttributes.BOLD} fg={theme.text}>
+          Save workflow as command
+        </text>
+        <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
+          esc
+        </text>
+      </box>
+      <Show
+        when={source}
+        fallback={<text fg={theme.textMuted}>This run has no captured source, so it cannot be saved.</text>}
+      >
+        <box gap={1}>
+          <text fg={theme.textMuted}>Name (becomes /name); written to {target()}.</text>
+          <textarea
+            height={3}
+            ref={(val: TextareaRenderable) => {
+              textarea = val
+              setTextareaTarget(val)
+            }}
+            initialValue={props.run.workflow}
+            placeholder="workflow-name"
+            placeholderColor={theme.textMuted}
+            textColor={theme.text}
+            focusedTextColor={theme.text}
+            cursorColor={theme.text}
+          />
+          <text fg={theme.textMuted}>
+            Destination: [{target() === "project" ? "x" : " "}] project .opencode/workflows [
+            {target() === "global" ? "x" : " "}] global — [Tab] toggle, [Enter] save
+          </text>
+        </box>
+      </Show>
+    </box>
+  )
+}
+
 function DialogWorkflowRun(props: {
   id: string
   initial: WorkflowRun
@@ -805,12 +928,31 @@ function DialogWorkflowRun(props: {
       .catch(() => toast.show({ message: "Failed to copy workflow response", variant: "error" }))
   }
 
+  // Save-as-command: opens the save dialog for THIS run, prefilled with its
+  // workflow name. The save dialog replaces the detail view; on resolve (save via
+  // onClose, or esc/cancel via the close callback) the detail view is re-opened
+  // so the user lands back where they were. Returning `false` from the close
+  // callback suppresses the plain stack-pop — the replace already swapped in the
+  // detail view (same pattern as openSelected/deleteSelected).
+  const saveAsCommand = () => {
+    const reopen = () =>
+      dialog.replace(() => <DialogWorkflowRun {...props} initial={current()} />, undefined, { notifyClose: false })
+    dialog.replace(
+      () => <DialogWorkflowSave run={current()} onClose={reopen} />,
+      () => {
+        reopen()
+        return false
+      },
+    )
+  }
+
   useBindings(() => ({
     bindings: [
       { key: "b", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
       { key: "escape", desc: "Back to workflow dashboard", group: "Workflow", cmd: back },
       { key: "return,o", desc: "Open selected subagent", group: "Workflow", cmd: openAgentSession },
       { key: "y", desc: "Copy selected response", group: "Workflow", cmd: copySelectedResponse },
+      { key: "s", desc: "Save run as command", group: "Workflow", cmd: saveAsCommand },
       { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancel },
       { key: "up,k", desc: "Previous phase", group: "Workflow", cmd: () => movePhase(-1) },
       { key: "down,j", desc: "Next phase", group: "Workflow", cmd: () => movePhase(1) },
@@ -1048,7 +1190,7 @@ function DialogWorkflowRun(props: {
 
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme.textMuted}>
-          [↑/↓] Phase | [←/→] Agent/result | [Y] Copy response | [Enter/O] Open agent | [X] Kill run | [Esc/B] Back
+          [↑/↓] Phase | [←/→] Agent/result | [Y] Copy response | [S] Save as command | [Enter/O] Open agent | [X] Kill run | [Esc/B] Back
         </text>
         <Show when={current().status === "running"}>
           <text fg={theme.primary}>live</text>

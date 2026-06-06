@@ -144,6 +144,28 @@ export function workflowNameOptions(input: TextareaRenderable, workflows: Workfl
   }))
 }
 
+// Direct `/<name>` slash commands for every DISCOVERED workflow (Claude-Code
+// parity): a workflow named `review` surfaces in the `/` menu as `/review`,
+// routed exactly like `/workflow review` via the existing dispatch. Pure +
+// filtering-only so it is unit-testable; the caller attaches the `onSelect` that
+// inserts the routed text (it owns the live textarea). Filters:
+//   - invalid workflows (broken files) — they cannot be started;
+//   - a name that collides with an existing command (built-in slash, server, or
+//     MCP command) so a workflow never silently shadows / duplicates a real
+//     command. `value` carries the bare workflow name for the caller's onSelect.
+export function workflowCommandOptions(
+  workflows: WorkflowInfo[],
+  existingCommandNames: Set<string>,
+): AutocompleteOption[] {
+  return workflows
+    .filter((workflow) => workflow.valid !== false && !existingCommandNames.has(workflow.name))
+    .map((workflow) => ({
+      display: `/${workflow.name}`,
+      value: workflow.name,
+      description: workflow.meta.description ?? workflow.meta.name,
+    }))
+}
+
 export function workflowCommandOption(input: TextareaRenderable): AutocompleteOption {
   return {
     display: "/workflow",
