@@ -67,6 +67,12 @@ import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, u
 import { useTuiConfig } from "../../context/tui-config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
+import {
+  detectUltracodeKeyword,
+  stripUltracodeKeyword,
+  ULTRACODE_PROMPT_DIRECTIVE,
+  ULTRACODE_SESSION_DIRECTIVE,
+} from "./ultracode"
 
 export type PromptProps = {
   sessionID?: string
@@ -223,8 +229,33 @@ export function Prompt(props: PromptProps) {
   const fileStyleId = syntax().getStyleId("extmark.file")!
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
+  const ultracodeStyleId = syntax().getStyleId("extmark.ultracode")!
   let promptPartTypeId = 0
+  // Separate extmark type for the live ultracode keyword highlight so it never
+  // collides with the part-backed extmarks (file/agent/paste) tracked above.
+  let ultracodeKeywordTypeId = 0
   const event = useEvent()
+
+  // Session toggle (/ultracode): when on, every submit gets the session directive
+  // prepended. State lives on the session, not config, so it resets per session.
+  const [ultracodeSession, setUltracodeSession] = createSignal(false)
+  // The variant we switched away from when boosting reasoning, so we can restore
+  // it when the session toggle is turned off.
+  let ultracodeRestoreVariant: string | undefined | false = false
+
+  // Config gates only the keyword detection (default true). The SDK Config type is
+  // generated and does not yet carry the workflows block, so read it through a
+  // narrow optional shape rather than `any`.
+  const ultracodeKeywordEnabled = createMemo(() => {
+    const config = sync.data.config as { workflows?: { ultracode_keyword?: boolean } }
+    return config.workflows?.ultracode_keyword ?? true
+  })
+
+  const ultracodeKeyword = createMemo(() => {
+    if (!ultracodeKeywordEnabled()) return undefined
+    if (store.mode === "shell") return undefined
+    return detectUltracodeKeyword(store.prompt.input)
+  })
 
   event.on(TuiEvent.PromptAppend.type, (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
@@ -294,6 +325,10 @@ export function Prompt(props: PromptProps) {
       () => props.sessionID,
       () => {
         setStore("placeholder", randomIndex(list().length))
+        // Ultracode session mode is session-scoped state, so reset it (and any
+        // reasoning-variant boost) whenever the session changes.
+        if (ultracodeSession()) setUltracodeSession(false)
+        ultracodeRestoreVariant = false
       },
       { defer: true },
     ),
@@ -543,6 +578,17 @@ export function Prompt(props: PromptProps) {
           move.open()
         },
       },
+      {
+        title: ultracodeSession() ? "Ultracode: turn off" : "Ultracode: turn on",
+        desc: "Toggle workflow orchestration for this session",
+        name: "ultracode.toggle",
+        category: "Session",
+        slashName: "ultracode",
+        run: () => {
+          dialog.clear()
+          toggleUltracodeSession()
+        },
+      },
     ].map((entry) => ({
       namespace: "palette",
       ...entry,
@@ -642,6 +688,25 @@ export function Prompt(props: PromptProps) {
         autocompleteVisible: !!auto()?.visible,
       }),
     }
+  })
+
+  // Live ultracode keyword highlight: clear any previous keyword extmark, then
+  // create a non-virtual one over the detected span. Deleting the word naturally
+  // drops the highlight because the memo returns undefined.
+  createEffect(() => {
+    const hit = ultracodeKeyword()
+    if (!input || input.isDestroyed || ultracodeKeywordTypeId === 0) return
+    for (const extmark of input.extmarks.getAllForTypeId(ultracodeKeywordTypeId)) {
+      input.extmarks.delete(extmark.id)
+    }
+    if (!hit) return
+    input.extmarks.create({
+      start: hit.index,
+      end: hit.index + hit.length,
+      virtual: false,
+      styleId: ultracodeStyleId,
+      typeId: ultracodeKeywordTypeId,
+    })
   })
 
   function restoreExtmarksFromParts(parts: PromptInfo["parts"]) {
@@ -1054,6 +1119,22 @@ export function Prompt(props: PromptProps) {
 
     const workflowCommand = store.mode === "shell" ? undefined : parseWorkflowCommand(inputText)
 
+    // Ultracode opt-in (normal prompt path only). The session directive rides every
+    // substantial submit while the toggle is on; the keyword directive fires for the
+    // single turn that contains a standalone `ultracode` token, which is stripped from
+    // the visible text. Both are prepended as synthetic text parts so the agent sees
+    // the orchestration instruction before the user's words.
+    const keywordActive = ultracodeKeywordEnabled() && detectUltracodeKeyword(inputText) !== undefined
+    const promptText = keywordActive ? stripUltracodeKeyword(inputText) : inputText
+    const ultracodeParts = [
+      ...(ultracodeSession()
+        ? [{ id: PartID.ascending(), type: "text" as const, text: ULTRACODE_SESSION_DIRECTIVE, synthetic: true }]
+        : []),
+      ...(keywordActive
+        ? [{ id: PartID.ascending(), type: "text" as const, text: ULTRACODE_PROMPT_DIRECTIVE, synthetic: true }]
+        : []),
+    ]
+
     if (store.mode === "shell") {
       move.startSubmit()
       void sdk.client.session.shell({
@@ -1146,11 +1227,12 @@ export function Prompt(props: PromptProps) {
           model: selectedModel,
           variant,
           parts: [
+            ...ultracodeParts,
             ...editorParts,
             {
               id: PartID.ascending(),
               type: "text",
-              text: inputText,
+              text: promptText,
             },
             ...nonTextParts.map(assign),
           ],
@@ -1344,6 +1426,54 @@ export function Prompt(props: PromptProps) {
     setStore("extmarkToPartIndex", new Map())
   }
 
+  // Best-effort reasoning boost: variants are the TUI's effort/reasoning concept.
+  // Prefer a known high-effort name, otherwise the last variant (providers order
+  // them low → high). Returns undefined when the model has no variants.
+  function strongestReasoningVariant() {
+    const variants = local.model.variant.list()
+    if (variants.length === 0) return undefined
+    const preferred = ["max", "ultra", "high", "xhigh", "extra"]
+    for (const name of preferred) {
+      const match = variants.find((v) => v.toLowerCase() === name)
+      if (match) return match
+    }
+    return variants[variants.length - 1]
+  }
+
+  function toggleUltracodeSession() {
+    const next = !ultracodeSession()
+    setUltracodeSession(next)
+
+    const boost = strongestReasoningVariant()
+    if (next) {
+      if (boost && local.model.variant.current() !== boost) {
+        // Remember what to restore (current may be undefined = default variant).
+        ultracodeRestoreVariant = local.model.variant.current()
+        local.model.variant.set(boost)
+      } else {
+        ultracodeRestoreVariant = false
+      }
+      toast.show({
+        title: "Ultracode ON",
+        message: boost
+          ? `Workflow orchestration on (reasoning boosted to ${boost})`
+          : "Workflow orchestration on (orchestration only)",
+        variant: "info",
+      })
+      return
+    }
+
+    if (ultracodeRestoreVariant !== false) {
+      local.model.variant.set(ultracodeRestoreVariant)
+      ultracodeRestoreVariant = false
+    }
+    toast.show({
+      title: "Ultracode OFF",
+      message: "Workflow orchestration off",
+      variant: "info",
+    })
+  }
+
   const highlight = createMemo(() => {
     if (leader()) return theme.border
     if (store.mode === "shell") return theme.primary
@@ -1486,6 +1616,9 @@ export function Prompt(props: PromptProps) {
                 if (promptPartTypeId === 0) {
                   promptPartTypeId = input.extmarks.registerType("prompt-part")
                 }
+                if (ultracodeKeywordTypeId === 0) {
+                  ultracodeKeywordTypeId = input.extmarks.registerType("ultracode-keyword")
+                }
                 props.ref?.(ref)
                 setTimeout(() => {
                   // setTimeout is a workaround and needs to be addressed properly
@@ -1522,6 +1655,12 @@ export function Prompt(props: PromptProps) {
                               <span style={{ fg: fadeColor(theme.warning, variantMetaAlpha()), bold: true }}>
                                 {local.model.variant.current()}
                               </span>
+                            </text>
+                          </Show>
+                          <Show when={ultracodeSession()}>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
+                            <text>
+                              <span style={{ fg: theme.accent, bold: true }}>ULTRACODE</span>
                             </text>
                           </Show>
                         </box>

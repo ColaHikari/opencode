@@ -870,6 +870,14 @@ function getSyntaxRules(theme: Theme) {
       },
     },
     {
+      scope: ["extmark.ultracode"],
+      style: {
+        foreground: selectedForeground(theme, theme.accent),
+        background: theme.accent,
+        bold: true,
+      },
+    },
+    {
       scope: ["comment"],
       style: {
         foreground: theme.syntaxComment,

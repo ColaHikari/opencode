@@ -1,0 +1,46 @@
+// Ultracode opt-in: a standalone `ultracode` keyword (or the /ultracode session
+// toggle) tells the agent to orchestrate the task via the workflow tool instead
+// of working turn by turn. This module is pure so it can be unit tested without
+// the TUI runtime; the prompt component wires detection, highlighting, stripping,
+// and directive injection on top of it.
+
+// Word-boundary match: `\b` sits between an identifier char ([A-Za-z0-9_]) and a
+// non-identifier char, so "ultracodex", "xultracode", "ultracode2", and
+// "ultracode_mode" never match while "ultracode:", "(ultracode)", and
+// "foo-ultracode" do. The `i` flag makes detection case-insensitive.
+const KEYWORD = "ultracode"
+const KEYWORD_RE = new RegExp(`\\b${KEYWORD}\\b`, "i")
+
+export const ULTRACODE_PROMPT_DIRECTIVE =
+  "The user opted into workflow orchestration for this task (ultracode). " +
+  "Author a workflow for it with the workflow tool (action: create, then start) " +
+  "instead of working turn by turn. Use parallel/pipeline fan-out and adversarial " +
+  "verification where they fit. Only skip the workflow if the task is trivial or " +
+  "purely conversational."
+
+export const ULTRACODE_SESSION_DIRECTIVE =
+  "Ultracode session mode is ON: for every substantial task, plan and run workflows " +
+  "by default (workflow tool: create + start) — chain understand → change → verify " +
+  "runs when the task has phases. Skip only trivial or conversational turns. Treat " +
+  "explicit requests like 'use a workflow' as the same opt-in."
+
+// Returns the first standalone-keyword hit (index + length) for live highlighting,
+// or undefined when the keyword is absent. Length tracks the matched text so the
+// caller can style exactly the keyword span.
+export function detectUltracodeKeyword(input: string): { index: number; length: number } | undefined {
+  const match = KEYWORD_RE.exec(input)
+  if (!match) return undefined
+  return { index: match.index, length: match[0].length }
+}
+
+// Removes every standalone occurrence of the keyword and collapses the whitespace
+// it leaves behind: doubled spaces become single, a leading colon left dangling
+// (e.g. "ultracode: audit") is dropped, and the result is trimmed.
+export function stripUltracodeKeyword(input: string): string {
+  return input
+    .replace(new RegExp(`\\b${KEYWORD}\\b`, "gi"), "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([:;,.!?])/g, "$1")
+    .replace(/^[:\s]+/, "")
+    .trim()
+}
