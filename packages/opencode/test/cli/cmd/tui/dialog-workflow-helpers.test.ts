@@ -7,10 +7,13 @@ import {
   phaseIcon,
   phaseStatus,
   reanchorSelection,
+  sanitizeWorkflowFilename,
+  saveTargets,
   spentThisMonth,
   statusIcon,
 } from "../../../../src/cli/cmd/tui/component/dialog-workflow-helpers"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
+import path from "path"
 
 function makeRun(input: Partial<WorkflowRun>): WorkflowRun {
   return {
@@ -243,5 +246,43 @@ describe("parseWorkflowCommand (Fund 59 — dispatch, Fund 60 — raw remainder)
   test("non-workflow input is not a workflow command", () => {
     expect(parseWorkflowCommand("/help")).toBeUndefined()
     expect(parseWorkflowCommand("hello")).toBeUndefined()
+  })
+})
+
+describe("sanitizeWorkflowFilename (save-as-command guard)", () => {
+  test("a plain name is accepted unchanged", () => {
+    expect(sanitizeWorkflowFilename("deep-research")).toBe("deep-research")
+    expect(sanitizeWorkflowFilename("my_flow_2")).toBe("my_flow_2")
+  })
+
+  test("surrounding whitespace is trimmed", () => {
+    expect(sanitizeWorkflowFilename("  review  ")).toBe("review")
+  })
+
+  test("path traversal is rejected", () => {
+    expect(sanitizeWorkflowFilename("../evil")).toBeUndefined()
+    expect(sanitizeWorkflowFilename("..")).toBeUndefined()
+  })
+
+  test("slashes (forward and back) are rejected", () => {
+    expect(sanitizeWorkflowFilename("a/b")).toBeUndefined()
+    expect(sanitizeWorkflowFilename("a\\b")).toBeUndefined()
+  })
+
+  test("an empty or whitespace-only name is rejected", () => {
+    expect(sanitizeWorkflowFilename("")).toBeUndefined()
+    expect(sanitizeWorkflowFilename("   ")).toBeUndefined()
+  })
+
+  test("a name with a path separator embedded anywhere is rejected", () => {
+    expect(sanitizeWorkflowFilename("foo/../bar")).toBeUndefined()
+  })
+})
+
+describe("saveTargets (project vs global workflow file destinations)", () => {
+  test("builds the project and global .ts paths under the workflows dirs", () => {
+    const targets = saveTargets("/proj", "/home/.config/opencode", "review")
+    expect(targets.project).toBe(path.join("/proj", ".opencode", "workflows", "review.ts"))
+    expect(targets.global).toBe(path.join("/home/.config/opencode", "workflows", "review.ts"))
   })
 })
