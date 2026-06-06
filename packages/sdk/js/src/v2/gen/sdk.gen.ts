@@ -5046,7 +5046,7 @@ export class Workflow extends HeyApiClient {
   /**
    * List workflow runs
    *
-   * List in-memory workflow execution runs for this instance.
+   * List persisted workflow execution runs for this instance, with live in-memory state overlaid for active runs.
    */
   public runs<ThrowOnError extends boolean = false>(
     parameters?: {

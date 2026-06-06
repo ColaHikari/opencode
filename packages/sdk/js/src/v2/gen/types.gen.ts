@@ -2750,12 +2750,6 @@ export type WorkflowInfo = {
   error?: string
 }
 
-export type WorkflowApiError = {
-  _tag: "WorkflowApiError"
-  message: string
-  workflow?: string
-}
-
 export type WorkflowDefinition = {
   name: string
   path: string
@@ -2820,6 +2814,13 @@ export type WorkflowStartPayload = {
   }
   budget?: number
   permissionSessionID?: string
+}
+
+export type WorkflowApiError = {
+  _tag: "WorkflowApiError"
+  message: string
+  workflow?: string
+  path?: string
 }
 
 export type UnauthorizedError = {
@@ -9523,9 +9524,9 @@ export type WorkflowListData = {
 
 export type WorkflowListErrors = {
   /**
-   * WorkflowApiError | InvalidRequestError
+   * Bad request
    */
-  400: WorkflowApiError | InvalidRequestError
+  400: BadRequestError
 }
 
 export type WorkflowListError = WorkflowListErrors[keyof WorkflowListErrors]
@@ -9611,9 +9612,13 @@ export type WorkflowGetData = {
 
 export type WorkflowGetErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
 }
 
 export type WorkflowGetError = WorkflowGetErrors[keyof WorkflowGetErrors]
@@ -9644,6 +9649,10 @@ export type WorkflowStartErrors = {
    * WorkflowApiError | InvalidRequestError
    */
   400: WorkflowApiError | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
 }
 
 export type WorkflowStartError = WorkflowStartErrors[keyof WorkflowStartErrors]
@@ -9671,9 +9680,13 @@ export type WorkflowCancelData = {
 
 export type WorkflowCancelErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
 }
 
 export type WorkflowCancelError = WorkflowCancelErrors[keyof WorkflowCancelErrors]

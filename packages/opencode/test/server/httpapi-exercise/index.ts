@@ -33,7 +33,7 @@ import {
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
 import { runScenario } from "./runner"
-import { disposeApps } from "./backend"
+import { disposeApps, request } from "./backend"
 import { runtime } from "./runtime"
 import { type Scenario } from "./types"
 
@@ -57,6 +57,34 @@ function locationData(validate: (value: any) => void) {
     object(body.location.project)
     validate(body.data)
   }
+}
+
+// A minimal, runnable workflow fixture. It declares valid `meta` and a `run`
+// that returns synchronously WITHOUT calling `ctx.agent`, so a started run needs
+// no LLM and settles on its own. Seeded into the scenario project's
+// `.opencode/workflows/<name>.ts`, which is exactly where the engine's discovery
+// globs (`workflows/*.ts`) for the calling workspace.
+const WORKFLOW_FIXTURE_NAME = "httpapi-fixture"
+const workflowFixtureSource = [
+  `export const meta = { name: "${WORKFLOW_FIXTURE_NAME}", description: "httpapi exercise fixture" }`,
+  `export async function run(args) {`,
+  `  return { ok: true, args }`,
+  `}`,
+  ``,
+].join("\n")
+
+function seedWorkflow(ctx: { file: (name: string, content: string) => Effect.Effect<void> }) {
+  return ctx.file(`.opencode/workflows/${WORKFLOW_FIXTURE_NAME}.ts`, workflowFixtureSource)
+}
+
+function isWorkflowRun(value: any): { id: string; status: string } {
+  object(value)
+  check(typeof value.id === "string" && value.id.startsWith("job"), `run id should start with "job"`)
+  check(value.workflow === WORKFLOW_FIXTURE_NAME, "run should reference the fixture workflow")
+  check(typeof value.status === "string", "run should carry a status")
+  check(Array.isArray(value.agents), "run should carry an agents array")
+  check(Array.isArray(value.logs), "run should carry a logs array")
+  return { id: value.id, status: value.status }
 }
 
 const scenarios: Scenario[] = [
@@ -1475,9 +1503,14 @@ const scenarios: Scenario[] = [
     .status(400),
   http.protected
     .get("/workflow", "workflow.list")
+    .seeded((ctx) => seedWorkflow(ctx))
     .at((ctx) => ({ path: "/workflow", headers: ctx.headers() }))
     .json(200, (body) => {
       array(body)
+      check(
+        body.some((item) => isRecord(item) && item.name === WORKFLOW_FIXTURE_NAME && item.valid === true),
+        "seeded workflow should be listed as valid",
+      )
     }),
   http.protected
     .get("/workflow/run", "workflow.runs")
@@ -1485,15 +1518,65 @@ const scenarios: Scenario[] = [
     .json(200, (body) => {
       array(body)
     }),
+  // Real-run happy path keyed to the start route: seed a runnable workflow,
+  // start it over HTTP (200 + running Run), then drive get/cancel/remove for the
+  // SAME run id over HTTP so every handler success branch is exercised, plus the
+  // budget + permissionSessionID payload fields are forwarded without error.
   http.protected
-    .get("/workflow/run/{id}", "workflow.get.missing")
-    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "job_httpapi_missing" }), headers: ctx.headers() }))
-    .json(200, (body) => {
-      check(body === null, "missing workflow run should be null")
-    }),
+    .post("/workflow/{name}/start", "workflow.start")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        yield* seedWorkflow(ctx)
+        const session = yield* ctx.session({ title: "Workflow permission owner" })
+        return { session }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: { args: { topic: "coverage" }, budget: 1.5, permissionSessionID: ctx.state.session.id },
+    }))
+    .jsonEffect(
+      200,
+      (body, ctx) =>
+        Effect.gen(function* () {
+          const started = isWorkflowRun(body)
+          check(started.status === "running", "freshly started run should report running")
+          const id = started.id
+          const headers = ctx.headers()
+
+          const got = yield* request({ method: "GET", path: route("/workflow/run/{id}", { id }), headers })
+          check(got.status === 200, `get of a started run should be 200, got ${got.status}`)
+          isWorkflowRun(got.body)
+
+          const cancelled = yield* request({
+            method: "POST",
+            path: route("/workflow/run/{id}/cancel", { id }),
+            headers,
+            body: {},
+          })
+          check(cancelled.status === 200, `cancel of a started run should be 200, got ${cancelled.status}`)
+          isWorkflowRun(cancelled.body)
+
+          const removed = yield* request({
+            method: "DELETE",
+            path: route("/workflow/run/{id}", { id }),
+            headers,
+          })
+          check(removed.status === 200, `remove of a known run should be 200, got ${removed.status}`)
+          check(removed.body === true, "removing a known run should report true")
+        }),
+      "status",
+    ),
   http.protected
-    .get("/workflow/run/{id}", "workflow.get.invalid")
-    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "not-a-run-id" }), headers: ctx.headers() }))
+    .post("/workflow/{name}/start", "workflow.start.invalidBudget")
+    .seeded((ctx) => seedWorkflow(ctx))
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: { budget: -1 },
+    }))
     .status(400),
   http.protected
     .post("/workflow/{name}/start", "workflow.start.missing")
@@ -1502,6 +1585,14 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
       body: {},
     }))
+    .status(404),
+  http.protected
+    .get("/workflow/run/{id}", "workflow.get.missing")
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "job_httpapi_missing" }), headers: ctx.headers() }))
+    .status(404),
+  http.protected
+    .get("/workflow/run/{id}", "workflow.get.invalid")
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "not-a-run-id" }), headers: ctx.headers() }))
     .status(400),
   http.protected
     .post("/workflow/run/{id}/cancel", "workflow.cancel.missing")
@@ -1510,9 +1601,7 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
       body: {},
     }))
-    .json(200, (body) => {
-      check(body === null, "cancelling a missing run should be null")
-    }),
+    .status(404),
   http.protected
     .delete("/workflow/run/{id}", "workflow.remove.missing")
     .mutating()
