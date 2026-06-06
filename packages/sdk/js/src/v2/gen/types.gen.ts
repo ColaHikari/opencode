@@ -2794,6 +2794,7 @@ export type WorkflowAgentRun = {
     }
   }
   error?: string
+  cached?: boolean
 }
 
 export type WorkflowRun = {
@@ -2804,7 +2805,7 @@ export type WorkflowRun = {
     [key: string]: unknown
   }
   definition?: WorkflowDefinition
-  status: "running" | "completed" | "failed" | "cancelled" | "interrupted"
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
   started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   current_phase?: string
@@ -2812,6 +2813,7 @@ export type WorkflowRun = {
   agents: Array<WorkflowAgentRun>
   result?: unknown
   error?: string
+  resume_of?: string
 }
 
 export type WorkflowStartPayload = {
@@ -2820,6 +2822,8 @@ export type WorkflowStartPayload = {
   }
   budget?: number
   permissionSessionID?: string
+  resume_of?: string
+  invalidate_agents?: Array<number>
 }
 
 export type WorkflowApiError = {
@@ -9705,6 +9709,40 @@ export type WorkflowCancelResponses = {
 }
 
 export type WorkflowCancelResponse = WorkflowCancelResponses[keyof WorkflowCancelResponses]
+
+export type WorkflowPauseData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/pause"
+}
+
+export type WorkflowPauseErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowPauseError = WorkflowPauseErrors[keyof WorkflowPauseErrors]
+
+export type WorkflowPauseResponses = {
+  /**
+   * Workflow run paused
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowPauseResponse = WorkflowPauseResponses[keyof WorkflowPauseResponses]
 
 export type V2HealthGetData = {
   body?: never

@@ -326,6 +326,8 @@ import type {
   WorkflowGetResponses,
   WorkflowListErrors,
   WorkflowListResponses,
+  WorkflowPauseErrors,
+  WorkflowPauseResponses,
   WorkflowRunsErrors,
   WorkflowRunsResponses,
   WorkflowStartErrors,
@@ -5203,6 +5205,38 @@ export class Workflow extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<WorkflowCancelResponses, WorkflowCancelErrors, ThrowOnError>({
       url: "/workflow/run/{id}/cancel",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Pause workflow run
+   *
+   * Pause a running workflow execution run, keeping its journal so it can be resumed.
+   */
+  public pause<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowPauseResponses, WorkflowPauseErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/pause",
       ...options,
       ...params,
     })

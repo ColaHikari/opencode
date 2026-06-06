@@ -17,9 +17,23 @@ import { Glob } from "@opencode-ai/core/util/glob"
 import { and, desc, eq, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Scope, Schema, SynchronizedRef } from "effect"
+import {
+  Cause,
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Scope,
+  Schema,
+  Semaphore,
+  SynchronizedRef,
+} from "effect"
 import type {
   WorkflowContext,
   WorkflowParallelOptions,
@@ -84,7 +98,16 @@ export type Definition = DeepMutable<Schema.Schema.Type<typeof Definition>>
 // "interrupted" is a terminal status assigned to runs whose in-memory fiber was
 // lost (crash/process restart) while the DB row still said "running". The orphan
 // sweep on service start rewrites such zombie rows so the lifecycle stays honest.
-export const Status = Schema.Literals(["running", "completed", "failed", "cancelled", "interrupted"])
+//
+// "paused" is the only NON-terminal status besides "running": a run the user
+// explicitly suspended via pause() (sessions aborted, scope closed, fiber
+// interrupted — exactly like cancel), but whose persisted agent journal is kept
+// intact so a later resume can replay the completed agents instead of re-running
+// them. The orphan sweep deliberately ignores paused rows (they have no live
+// fiber by design, but they are parked, not lost); cancel() on a paused run moves
+// it to the terminal "cancelled"; wait() on a paused run returns its snapshot at
+// once (timedOut:false) because there is no live fiber to await.
+export const Status = Schema.Literals(["running", "completed", "failed", "cancelled", "interrupted", "paused"])
 export type Status = Schema.Schema.Type<typeof Status>
 
 export const LogEntry = Schema.Struct({
@@ -127,6 +150,11 @@ export const AgentRun = Schema.Struct({
     }),
   ),
   error: Schema.optional(Schema.String),
+  // `true` when this agent node was NOT executed live but replayed verbatim from
+  // a resumed run's persisted journal (output/structured/cost/tokens copied from
+  // the source run's matching completed agent). Omitted (⇒ undefined) for a live
+  // step. Lets the dashboard mark a cheap, re-used step apart from a fresh one.
+  cached: Schema.optional(Schema.Boolean),
 }).annotate({ identifier: "WorkflowAgentRun" })
 export type AgentRun = DeepMutable<Schema.Schema.Type<typeof AgentRun>>
 
@@ -168,6 +196,10 @@ export const Run = Schema.Struct({
   agents: Schema.Array(AgentRun),
   result: Schema.optional(Schema.Unknown),
   error: Schema.optional(Schema.String),
+  // Set when this run was started as a resume of a previous (paused/interrupted)
+  // run: the id of that source run, whose persisted journal was replayed.
+  // Omitted for an ordinary (non-resume) run.
+  resume_of: Schema.optional(RunID),
 }).annotate({ identifier: "WorkflowRun" })
 export type Run = DeepMutable<Schema.Schema.Type<typeof Run>>
 
@@ -213,6 +245,26 @@ export type StartOptions = StartInput & {
    * (no inherited ruleset) preserves the prior behavior.
    */
   caller?: { sessionID: SessionID; agent?: string }
+  /**
+   * Resume a previous (paused/interrupted) run by id. When set, start() loads the
+   * SOURCE run's persisted agent journal (directory-scoped, like get()) and builds
+   * a replay map keyed by the agent's call shape + occurrence index. As the new
+   * run re-executes the SAME workflow body, each `ctx.agent` call first looks up
+   * the journal: a matching COMPLETED source agent (whose index is not in
+   * `invalidate_agents`) is replayed verbatim (output/structured/cost/tokens,
+   * `cached: true`) with NO prompt, and the replayed cost is charged once via the
+   * shared `ensuring` (post-step), just like a live step; a miss runs live. The
+   * budget gate before the lookup still fails honestly when exhausted. The resume
+   * is cross-restart because the journal lives in the DB, not in memory.
+   */
+  resume_of?: RunID
+  /**
+   * Source-journal agent indices (0-based, in the source run's `agents[]` order)
+   * to FORCE live re-execution of during a resume, even if they completed. Only
+   * meaningful together with `resume_of`. An index here is excluded from journal
+   * replay, so its `ctx.agent` call runs live and re-prompts.
+   */
+  invalidate_agents?: number[]
 }
 
 export type WaitInput = {
@@ -272,6 +324,34 @@ export class BudgetExceededError extends Schema.TaggedErrorClass<BudgetExceededE
   budget: Schema.Finite,
   spent: Schema.Finite,
 }) {}
+
+/**
+ * Raised at the top of `ctx.agent` once the run has already STARTED its
+ * lifetime-cap many agents (default 1.000). The cap is a per-run safety ceiling
+ * on the TOTAL number of agent dispatches a single workflow run may launch, so a
+ * pathological or runaway workflow (e.g. an unbounded loop of `ctx.agent`) cannot
+ * spawn unbounded subagent sessions. Like BudgetExceededError it propagates
+ * through the SAME agent-failure path as any other agent error (node `failed`,
+ * run `failed` unless the workflow module catches it). The message names both the
+ * limit and the count already started so the failure is self-explanatory.
+ */
+export class AgentLimitError extends Schema.TaggedErrorClass<AgentLimitError>()("WorkflowAgentLimitError", {
+  message: Schema.String,
+  limit: Schema.Finite,
+  started: Schema.Finite,
+}) {}
+
+// The default lifetime cap: the maximum number of agent dispatches a single run
+// may start before `ctx.agent` refuses with AgentLimitError. Overridable per
+// process by the `__testHooks.agentLimit` seam (a small value keeps the lifetime
+// test fast); inert at the default in production.
+const DEFAULT_AGENT_LIMIT = 1_000
+
+// The run-wide concurrency cap: the maximum number of `ctx.agent` dispatches that
+// may run simultaneously within a single run, regardless of any (looser) per-call
+// `concurrencyLimit`. Derived from the host's CPU count, clamped to [2, 16] so a
+// tiny box never serializes to 1 and a huge box never fans out unbounded.
+const agentConcurrencyCap = () => Math.min(16, Math.max(2, os.cpus().length - 2))
 
 /**
  * Thrown by `checkpoint()` before the next `ctx.agent`/`ctx.parallel`/
@@ -384,6 +464,34 @@ type Active = {
    * Read by `ctx.budgetRemaining`; gated against in `ctx.agent`.
    */
   budgetRemaining: number
+  /**
+   * Run-wide concurrency gate over EVERY `ctx.agent` dispatch (agent/parallel/
+   * pipeline all funnel through ctx.agent). Sized to the host CPU count clamped
+   * to [2, 16] at run start. A per-call `concurrencyLimit` still applies on top
+   * (the narrower limit wins); this is the global ceiling for one run.
+   */
+  agentSemaphore: Semaphore.Semaphore
+  /**
+   * Count of agent dispatches STARTED by this run. Incremented at the top of
+   * `ctx.agent`; once it would exceed `agentLimit` the call fails with
+   * AgentLimitError so a runaway workflow cannot spawn unbounded subagents.
+   */
+  agentStarted: number
+  /** Per-run lifetime ceiling (DEFAULT_AGENT_LIMIT unless overridden by the test seam). */
+  agentLimit: number
+  /** Set once pause() has requested suspension so the run finishes as `paused`, not `cancelled`/`failed`. */
+  pausing?: boolean
+  /**
+   * Resume journal: when this run was started with `resume_of`, the source run's
+   * completed agents keyed by call shape. Each `ctx.agent` consumes the next
+   * unused entry for its key (occurrence order), so two identical calls resolve
+   * to distinct journal entries. Absent on a non-resume run.
+   */
+  journal?: Map<string, AgentRun[]>
+  /** Per-key consumption cursor into `journal`, advanced as each occurrence is replayed. */
+  journalCursor?: Map<string, number>
+  /** Id of the source run this run resumed from; mirrored onto `run.resume_of` and the row. */
+  resumeOf?: RunID
 }
 
 type State = {
@@ -400,12 +508,23 @@ export interface Interface {
   readonly start: (input: StartOptions) => Effect.Effect<Run, InvalidError | NotFoundError>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
   readonly cancel: (id: RunID) => Effect.Effect<Run | undefined>
+  /**
+   * Suspends a running run: aborts every tracked child agent session, closes the
+   * run scope, and interrupts the run fiber (exactly like cancel), but finishes
+   * the run with the non-terminal status `paused` instead of `cancelled` — the
+   * persisted agent journal is kept intact so the run can later be resumed. Like
+   * cancel, returns the run's snapshot, or `undefined` for a genuinely unknown id
+   * (which the HTTP handler maps to 404). A run that is already terminal/paused is
+   * returned as-is (idempotent); a non-live but persisted row is returned verbatim.
+   */
+  readonly pause: (id: RunID) => Effect.Effect<Run | undefined>
   readonly remove: (id: RunID) => Effect.Effect<boolean>
   /**
    * Marks every `running` DB row that has no live registry entry as
    * `interrupted`. Runs automatically when the per-instance registry is first
    * created (process start → registry empty → all `running` rows are zombies),
-   * and is exposed so callers/tests can trigger it explicitly.
+   * and is exposed so callers/tests can trigger it explicitly. Paused rows are
+   * deliberately left untouched (parked by design, not lost).
    */
   readonly sweep: () => Effect.Effect<void>
 }
@@ -478,6 +597,9 @@ function fromRow(row: Row): Run {
     // real `null` a workflow returned rather than being flattened to `undefined`.
     result: row.result === null ? undefined : JSON.parse(row.result),
     error: row.error ?? undefined,
+    // DB->engine brand boundary: the source-run id is an opaque `text` column in
+    // core; re-brand it here like the row id above. Nullable column → undefined.
+    resume_of: row.resume_of ? RunID.make(row.resume_of) : undefined,
   }
 }
 
@@ -488,9 +610,17 @@ function fromRow(row: Row): Run {
 // A module-level one-shot flag is the minimal seam that does not require
 // threading a fake DB through the whole layer graph; it is inert in production.
 let failNextTerminalPersist = false
+// Test seam: overrides the per-run agent lifetime cap (DEFAULT_AGENT_LIMIT) for
+// runs started AFTER this is called, so the lifetime test can prove the gate with
+// a tiny limit (e.g. 5) instead of dispatching 1.000 agents. `undefined` ⇒ the
+// default. Inert in production (never called). Captured per-run at start().
+let agentLimitOverride: number | undefined
 export const __testHooks = {
   failNextTerminalPersist: () => {
     failNextTerminalPersist = true
+  },
+  agentLimit: (limit: number) => {
+    agentLimitOverride = limit
   },
 }
 
@@ -541,6 +671,7 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
       // to JSON text (a `null` result becomes the text `"null"`, NOT SQL NULL).
       result: active.run.result === undefined ? null : JSON.stringify(active.run.result),
       error: active.run.error ?? null,
+      resume_of: active.run.resume_of ?? null,
     }
     return db
       .insert(WorkflowRunTable)
@@ -758,6 +889,27 @@ function mutableMeta(meta: Meta): Definition["meta"] {
   }
 }
 
+// Resume journal key: identifies a `ctx.agent` call by its dispatch shape so the
+// same call in a resumed run lands on the same source-run agent. A stable JSON
+// tuple with `null` for absent fields, so calls differing only in (say) phase get
+// distinct keys. Two IDENTICAL calls produce the SAME key; the occurrence cursor
+// (journalCursor) then keeps them separate in call order — the first such call
+// replays the first matching source agent, the second the next one.
+//
+// Built from the RESOLVED agent name (not the raw `AgentInput.agent`) on both
+// sides: a source agent's persisted `node.agent` is the engine-normalized
+// `selected.name`, so the lookup must resolve the live call the SAME way (default
+// agent → its name) to match. `model` and `schema` are deliberately NOT part of
+// the key: the persisted node normalizes `model` to the actually-used model id
+// (which a fresh resolve cannot reproduce) and never stores the requested
+// `schema` at all, so including either would make a default-model or structured
+// call fail to match and re-run live. The key therefore matches on the stable,
+// reconstructible fields [prompt, resolvedAgent, phase]; the lookup's own schema
+// presence still drives how the replayed output is interpreted at replay time.
+function journalKey(parts: { prompt: string; agent?: string; phase?: string }): string {
+  return JSON.stringify([parts.prompt, parts.agent ?? null, parts.phase ?? null])
+}
+
 // loadModule writes a transient import copy ALONGSIDE the source file (same
 // directory) on purpose: relative imports and the workflow module's
 // node_modules resolution are anchored on the source directory, so moving the
@@ -963,9 +1115,10 @@ function createContext(input: {
   dispatch: <A>(effect: Effect.Effect<A, unknown>) => Promise<A>
 }): ContextApi {
   const checkpoint = () => {
-    // Also treat a landed cancel as an abort even before the run fiber's signal
-    // has been observed, so a follow-up step is gated the moment cancel started.
-    if (input.signal()?.aborted || input.active.cancelling) throw new CancelledError()
+    // Also treat a landed cancel/pause as an abort even before the run fiber's
+    // signal has been observed, so a follow-up step is gated the moment cancel or
+    // pause started.
+    if (input.signal()?.aborted || input.active.cancelling || input.active.pausing) throw new CancelledError()
   }
   return {
     // Live remaining budget (USD), read on every access so a workflow can
@@ -1252,9 +1405,11 @@ export const layer = Layer.effect(
         node.error ??=
           status === "cancelled"
             ? "Cancelled"
-            : status === "completed"
-              ? "agent step never settled before the run completed"
-              : "Workflow failed"
+            : status === "paused"
+              ? "Paused"
+              : status === "completed"
+                ? "agent step never settled before the run completed"
+                : "Workflow failed"
       }
       // Abort the child session of every node that was still running, so a
       // detached agent does not keep spending after the run is terminal (N11).
@@ -1348,6 +1503,47 @@ export const layer = Layer.effect(
       // The workspace this run belongs to. Persisted to the `directory` column so
       // every later read/delete/sweep can be scoped to it (Fund 6/17).
       const directory = yield* InstanceState.directory
+      // Resume journal: when `resume_of` is supplied, load the SOURCE run's
+      // completed agents (directory-scoped, exactly like get()) and group them by
+      // call key in occurrence order. A `ctx.agent` call in the new run consumes
+      // the next unused entry for its key — replaying it verbatim instead of
+      // re-prompting. Indices listed in `invalidate_agents` are excluded so they
+      // re-run live. An unknown/foreign source id yields an empty journal (every
+      // call then runs live), so a stale resume id degrades to a normal run rather
+      // than failing the start.
+      const journal = new Map<string, AgentRun[]>()
+      if (input.resume_of) {
+        const sourceRow = yield* db
+          .select()
+          .from(WorkflowRunTable)
+          .where(and(eq(WorkflowRunTable.id, input.resume_of), eq(WorkflowRunTable.directory, directory)))
+          .get()
+          .pipe(Effect.orDie)
+        if (sourceRow) {
+          // Status guard: only a paused or interrupted run is a legitimate resume
+          // source. A completed/cancelled/failed/running source must fail the start
+          // honestly rather than silently degrade — resuming a terminal run would
+          // duplicate its work, and the cancel-of-a-paused-run race could otherwise
+          // be re-resumed via a direct DB UPDATE to `cancelled`. HTTP maps
+          // WorkflowInvalidError to 400. An unknown id leaves `sourceRow` undefined
+          // and still degrades to a normal run (every call runs live), unchanged.
+          if (sourceRow.status !== "paused" && sourceRow.status !== "interrupted") {
+            return yield* new InvalidError({
+              path: workflow.path,
+              message: `Cannot resume run ${input.resume_of}: status is ${sourceRow.status} (only paused or interrupted runs can be resumed)`,
+            })
+          }
+          const invalidate = new Set(input.invalidate_agents ?? [])
+          sourceRow.agents.forEach((node, index) => {
+            if (node.status !== "completed") return
+            if (invalidate.has(index)) return
+            const key = journalKey({ prompt: node.prompt, agent: node.agent, phase: node.phase })
+            const bucket = journal.get(key) ?? []
+            bucket.push({ ...node })
+            journal.set(key, bucket)
+          })
+        }
+      }
       const id = RunID.ascending()
       const started_at = yield* Clock.currentTimeMillis
       const session = yield* sessions.create({ title: `Workflow: ${module.meta.name}` })
@@ -1357,6 +1553,11 @@ export const layer = Layer.effect(
       // root fiber), so closing it on cancel/remove propagates Interrupt to the
       // in-flight agent graph; the instance teardown closes it transitively.
       const runScope = yield* Scope.fork(inst.scope)
+      // Run-wide concurrency gate over every ctx.agent dispatch. Created here (at
+      // run start) so it is shared by the whole run; a per-call concurrencyLimit
+      // still applies on top, the narrower limit winning. The override seam is
+      // captured per run so a test's tiny limit only affects runs started after it.
+      const agentSemaphore = yield* Semaphore.make(agentConcurrencyCap())
       const active: Active = {
         run: {
           id,
@@ -1374,6 +1575,7 @@ export const layer = Layer.effect(
           started_at,
           logs: [],
           agents: [],
+          resume_of: input.resume_of,
         },
         directory,
         done,
@@ -1384,6 +1586,12 @@ export const layer = Layer.effect(
         // no-op, preserving the previous unlimited behavior exactly.
         budget: input.budget ?? Number.POSITIVE_INFINITY,
         budgetRemaining: input.budget ?? Number.POSITIVE_INFINITY,
+        agentSemaphore,
+        agentStarted: 0,
+        agentLimit: agentLimitOverride ?? DEFAULT_AGENT_LIMIT,
+        journal: input.resume_of ? journal : undefined,
+        journalCursor: input.resume_of ? new Map<string, number>() : undefined,
+        resumeOf: input.resume_of,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, active)
@@ -1429,9 +1637,9 @@ export const layer = Layer.effect(
         )
 
       const agent = async (agentInput: AgentInput) => {
-        // Gate the step: a fired run signal OR a landed cancel both mean the run
-        // is unwinding, so refuse to start another agent step (Fund 5/4).
-        if (runSignal?.aborted || active.cancelling || active.removed) throw new CancelledError()
+        // Gate the step: a fired run signal OR a landed cancel/pause all mean the
+        // run is unwinding, so refuse to start another agent step (Fund 5/4).
+        if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
         // Budget gate — ordered right AFTER the abort-signal checkpoint so a
         // cancelled run still unwinds as `cancelled` (not `failed`) before any
         // budget verdict is reached. `Infinity` (no budget set) never trips.
@@ -1446,6 +1654,20 @@ export const layer = Layer.effect(
             spent,
           })
         }
+        // Lifetime gate — ordered after the abort + budget gates so a cancelled
+        // or over-budget run reports those first. A run may START at most
+        // `agentLimit` agent dispatches; the (limit+1)-th call refuses with a
+        // tagged AgentLimitError (same failure path as the budget gate: node
+        // `failed`, run `failed` unless caught). Counts every dispatch attempt
+        // (including journal replays) so a runaway loop cannot spin unbounded.
+        if (active.agentStarted >= active.agentLimit) {
+          throw new AgentLimitError({
+            message: `Workflow agent lifetime limit reached: ${active.agentStarted} of ${active.agentLimit} agents started; refusing to start another agent step`,
+            limit: active.agentLimit,
+            started: active.agentStarted,
+          })
+        }
+        active.agentStarted += 1
         const node: AgentRun = {
           id: `${active.run.agents.length + 1}`,
           status: "running",
@@ -1463,6 +1685,66 @@ export const layer = Layer.effect(
             Effect.gen(function* () {
               const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
               const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+              // Resume replay: when this run has a journal (started with
+              // resume_of), consume the next unused source agent for this call's
+              // key (occurrence order) and replay it verbatim — NO session, NO
+              // prompt. The node adopts the source output/cost/tokens, is marked
+              // `cached`, and the replayed cost is charged once via the shared
+              // `ensuring` (post-step) — the SAME decrement the live-step path uses;
+              // the budget gate before this lookup still fails honestly when
+              // exhausted. `structured` is re-parsed from the stored output when a
+              // schema was requested so `result.data` stays the parsed object,
+              // identical to a live structured step. A miss falls through to the
+              // live path below. The agent name is resolved (`selected.name`)
+              // exactly like the seed side, so a default-agent call still matches.
+              if (active.journal && active.journalCursor) {
+                const key = journalKey({ prompt: agentInput.prompt, agent: selected.name, phase: node.phase })
+                const bucket = active.journal.get(key)
+                const cursor = active.journalCursor.get(key) ?? 0
+                const cached = bucket?.[cursor]
+                if (cached) {
+                  // A schema was requested ⇒ the replayed output must parse as JSON
+                  // to satisfy `result.data`. The source node may be a PLAINTEXT
+                  // agent whose journal key happens to match this schema call (the
+                  // workflow FILE drifted between the original run and the resume:
+                  // same prompt/agent/phase, but the agent now asks for a schema).
+                  // `JSON.parse` on that plaintext would throw SYNCHRONOUSLY and
+                  // turn into a defect. Guard it with `Effect.try` captured as an
+                  // `Effect.exit` (engine style; no try/catch). On a parse FAILURE
+                  // we treat the lookup as a cache MISS — semantically correct: the
+                  // cache cannot serve this schema, so we DON'T consume the journal
+                  // entry, fall through, and let the agent run live (which yields a
+                  // real structured result). Only commit the cache hit once we know
+                  // the parse succeeded.
+                  const parsedExit =
+                    agentInput.schema && cached.output !== undefined
+                      ? yield* Effect.try({
+                          try: () => JSON.parse(cached.output!) as unknown,
+                          catch: (error) => (error instanceof Error ? error.message : String(error)),
+                        }).pipe(Effect.exit)
+                      : undefined
+                  const parseFailed = parsedExit !== undefined && Exit.isFailure(parsedExit)
+                  if (!parseFailed) {
+                    active.journalCursor.set(key, cursor + 1)
+                    node.agent = selected.name
+                    node.status = "completed"
+                    node.completed_at = Date.now()
+                    node.output = cached.output
+                    node.cost = cached.cost
+                    node.tokens = cached.tokens
+                    node.model = cached.model
+                    node.cached = true
+                    // The budget decrement is left to the shared `ensuring` below
+                    // (node.cost is set), so a cache hit is charged exactly once.
+                    yield* persistRun(db, active)
+                    const structured = parsedExit !== undefined ? parsedExit.value : undefined
+                    return {
+                      data: structured !== undefined ? structured : (cached.output ?? ""),
+                      text: cached.output ?? "",
+                    }
+                  }
+                }
+              }
               // Security (#26514 regression, Fund N9): a workflow subagent MUST
               // inherit the caller's deny/external_directory rules and the caller
               // agent's edit-class denies (Plan Mode lives on the agent ruleset,
@@ -1611,20 +1893,30 @@ export const layer = Layer.effect(
                   // a real result and must not be charged (Fund 4) — and any cost
                   // on an aborted message is the abort artifact, not real spend.
                   // A step with no cost leaves the budget untouched; unset stays Infinity.
-                  if (active.cancelling || active.removed) return
+                  // A pausing run is treated like a cancelling one: an interrupted
+                  // step did not really spend, so it must not be charged.
+                  if (active.cancelling || active.removed || active.pausing) return
                   active.budgetRemaining -= node.cost ?? 0
                 }),
               ),
+              // Run-wide concurrency cap (Spec §5.1): acquire one permit around
+              // the whole dispatch so at most `agentConcurrencyCap()` ctx.agent
+              // steps run at once across the entire run, no matter how generous a
+              // per-call `concurrencyLimit` is. The permit is released on success,
+              // failure, OR interruption (withPermits semantics), so a cancelled
+              // step never leaks a permit. A journal replay returns early and so
+              // holds the permit only momentarily.
+              active.agentSemaphore.withPermits(1),
             ),
           )
           .then(
             (result) => {
-              // Settlement guard (Fund 4): once the run is cancelling/removed or
-              // already terminal, the success branch is a NO-OP for the node and
-              // emits NO further write. Otherwise a resolve-on-abort step (the
-              // production runner resolves on abort) would flip a cancelled node
-              // to `completed` and re-persist after the awaited terminal write.
-              if (active.cancelling || active.removed || active.run.status !== "running") {
+              // Settlement guard (Fund 4): once the run is cancelling/pausing/
+              // removed or already terminal, the success branch is a NO-OP for the
+              // node and emits NO further write. Otherwise a resolve-on-abort step
+              // (the production runner resolves on abort) would flip a cancelled/
+              // paused node to `completed` and re-persist after the terminal write.
+              if (active.cancelling || active.pausing || active.removed || active.run.status !== "running") {
                 throw new CancelledError()
               }
               node.status = "completed"
@@ -1635,9 +1927,9 @@ export const layer = Layer.effect(
             },
             (error) => {
               // Same guard on the failure path: do not mutate/persist the node
-              // for a run that has already moved to (or is moving to) terminal —
-              // finish() owns the node's terminal state in that case.
-              if (active.cancelling || active.removed || active.run.status !== "running") {
+              // for a run that has already moved to (or is moving to) terminal/
+              // paused — finish() owns the node's terminal state in that case.
+              if (active.cancelling || active.pausing || active.removed || active.run.status !== "running") {
                 return Promise.reject(error)
               }
               node.status = "failed"
@@ -1679,13 +1971,22 @@ export const layer = Layer.effect(
           onFailure: (cause) =>
             // A workflow module throwing CancelledError surfaces as a failure or
             // a defect depending on the path; squash returns the representative
-            // error either way, so `isCancelled(squash)` catches both.
+            // error either way, so `isCancelled(squash)` catches both. A pausing
+            // run interrupts the body the SAME way a cancel does, so it would map
+            // to `cancelled` here — check `pausing` FIRST so a pause finishes as
+            // the non-terminal `paused` (the journal is then kept for resume),
+            // racing pause()'s own `finish(id, "paused")` idempotently.
             finish(
               id,
-              active.cancelling || active.removed || Cause.hasInterruptsOnly(cause) || isCancelled(Cause.squash(cause))
-                ? "cancelled"
-                : "failed",
-              { error: errorText(Cause.squash(cause)) },
+              active.pausing
+                ? "paused"
+                : active.cancelling ||
+                    active.removed ||
+                    Cause.hasInterruptsOnly(cause) ||
+                    isCancelled(Cause.squash(cause))
+                  ? "cancelled"
+                  : "failed",
+              active.pausing ? undefined : { error: errorText(Cause.squash(cause)) },
             ),
         }),
         Effect.asVoid,
@@ -1738,8 +2039,14 @@ export const layer = Layer.effect(
     //     yet session-registered (Fund 16) and ones that have no cancel vector
     //     (Fund 50, where the scope close is the only thing that stops them).
     // (3) Interrupt the run fiber so checkpoint() unwinds the body, then await it.
-    const abortRun = Effect.fn("Workflow.abortRun")(function* (active: Active) {
-      active.cancelling = true
+    //
+    // `mode` selects which suspension flag the gates key off: "cancel" sets
+    // `cancelling` (run will finish `cancelled`), "pause" sets `pausing` (run will
+    // finish the non-terminal `paused`, journal kept). The mechanics are identical
+    // — the only difference is the terminal status finish() assigns.
+    const abortRun = Effect.fn("Workflow.abortRun")(function* (active: Active, mode: "cancel" | "pause" = "cancel") {
+      if (mode === "pause") active.pausing = true
+      else active.cancelling = true
       const cancelSession = active.cancelSession
       if (cancelSession) {
         yield* Effect.forEach([...active.sessions], (sessionID) => cancelSession(SessionID.make(sessionID)), {
@@ -1787,7 +2094,25 @@ export const layer = Layer.effect(
           .pipe(Effect.orDie)
         return row ? fromRow(row) : undefined
       })
-      if (!active) return yield* persisted()
+      if (!active) {
+        // No live fiber. A paused run lives only in the DB (finish evicted it):
+        // cancelling it transitions the non-terminal `paused` row to the terminal
+        // `cancelled` directly (Spec §5.3). Any other persisted status (already
+        // terminal) is returned verbatim, and an unknown id stays undefined.
+        const row = yield* persisted()
+        if (row?.status === "paused") {
+          const completed_at = yield* Clock.currentTimeMillis
+          const directory = yield* InstanceState.directory
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "cancelled", completed_at, time_updated: completed_at })
+            .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
+            .run()
+            .pipe(Effect.orDie)
+          return yield* persisted()
+        }
+        return row
+      }
       if (active.run.status !== "running") return snapshot(active)
       yield* abortRun(active)
       // Lost-race fallback: `finish` returns undefined only when the run was already
@@ -1797,6 +2122,35 @@ export const layer = Layer.effect(
       // never undefined. remove() already tolerates the same idempotent `finish`
       // here via `Effect.ignore`; cancel must additionally surface the snapshot.
       const finished = yield* finish(id, "cancelled")
+      return finished ?? (yield* persisted())
+    })
+
+    const pause: Interface["pause"] = Effect.fn("Workflow.pause")(function* (id) {
+      const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
+      // Mirror cancel's directory-scoped DB fallback: a run not in the live
+      // registry is consulted in the DB (after a restart / N1 eviction), so pause
+      // never confuses "found-but-not-live" with "absent". undefined ⇒ genuinely
+      // unknown id (HTTP → 404).
+      const persisted = Effect.fn("Workflow.pause.persisted")(function* () {
+        const directory = yield* InstanceState.directory
+        const row = yield* db
+          .select()
+          .from(WorkflowRunTable)
+          .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
+          .get()
+          .pipe(Effect.orDie)
+        return row ? fromRow(row) : undefined
+      })
+      if (!active) return yield* persisted()
+      // Only a genuinely running run can be paused; an already-terminal/paused run
+      // is returned as-is (idempotent).
+      if (active.run.status !== "running") return snapshot(active)
+      yield* abortRun(active, "pause")
+      // finish maps to `paused` (the body's interrupt-driven finish also keys off
+      // `pausing`; both are idempotent). On the lost race against natural
+      // completion `finish` returns undefined — surface the persisted snapshot,
+      // whose TRUE status (completed) is reported, never rewritten.
+      const finished = yield* finish(id, "paused")
       return finished ?? (yield* persisted())
     })
 
@@ -1839,7 +2193,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, runs, get, start, wait, cancel, remove, sweep })
+    return Service.of({ list, runs, get, start, wait, cancel, pause, remove, sweep })
   }),
 )
 
