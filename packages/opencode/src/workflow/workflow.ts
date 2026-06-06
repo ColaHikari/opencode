@@ -1,5 +1,6 @@
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
+import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { Identifier } from "@/id/id"
@@ -193,6 +194,17 @@ export type StartOptions = StartInput & {
   source?: string
   temporary?: boolean
   permissionSessionID?: SessionID
+  /**
+   * Identity of the caller that started this run (the tool/session that asked).
+   * Used to derive the inherited `permission` ruleset for every subagent session
+   * the run spawns (parent-session deny/external_directory rules + the caller
+   * agent's edit-class denies, i.e. Plan Mode — regression of #26514). This is
+   * distinct from `permissionSessionID`, which only controls WHERE interactive
+   * permission prompts surface, not WHICH rules apply. Absent on a purely
+   * programmatic/HTTP start with no session identity — the documented fallback
+   * (no inherited ruleset) preserves the prior behavior.
+   */
+  caller?: { sessionID: SessionID; agent?: string }
 }
 
 export type WaitInput = {
@@ -1381,11 +1393,35 @@ export const layer = Layer.effect(
             Effect.gen(function* () {
               const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
               const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+              // Security (#26514 regression, Fund N9): a workflow subagent MUST
+              // inherit the caller's deny/external_directory rules and the caller
+              // agent's edit-class denies (Plan Mode lives on the agent ruleset,
+              // not the session) — exactly like the task tool derives a subagent's
+              // ruleset. Without the caller's identity (a purely programmatic/HTTP
+              // start with no session) we fall back to the prior behavior: no
+              // inherited ruleset (the engine still defaults task/todowrite denies
+              // for any non-permitting subagent via the normal session permission
+              // path). `agents.get` on the caller agent uses the same catchCause
+              // fallback as task.ts so an unknown caller agent never fails the run.
+              const callerSession = input.caller
+                ? yield* sessions.get(input.caller.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+                : undefined
+              const callerAgent =
+                input.caller?.agent !== undefined
+                  ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+                  : undefined
               const session = yield* sessions.create({
                 parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
                 title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
                 agent: selected.name,
                 model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID } : undefined,
+                permission: callerSession
+                  ? deriveSubagentSessionPermission({
+                      parentSessionPermission: callerSession.permission ?? [],
+                      parentAgent: callerAgent,
+                      subagent: selected,
+                    })
+                  : undefined,
               })
               node.agent = selected.name
               if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
