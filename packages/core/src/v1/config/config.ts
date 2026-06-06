@@ -160,6 +160,14 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  workflows: Schema.optional(
+    Schema.Struct({
+      ultracode_keyword: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Detect the standalone `ultracode` keyword in the prompt and highlight it; on submit it opts the turn into workflow orchestration (default: true)",
+      }),
+    }),
+  ).annotate({ description: "Workflow orchestration options" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),
