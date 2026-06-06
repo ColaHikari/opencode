@@ -72,6 +72,15 @@ export const WorkflowRunTable = sqliteTable(
   {
     id: text().primaryKey(),
     session_id: text(),
+    // The workspace directory the run was started in (InstanceState.directory).
+    // The DB is process-global (one opencode.db under Global.Path.data) but the
+    // workflow endpoints are per-directory (WorkspaceRoutingMiddleware), so every
+    // read/delete/sweep is scoped to this column — a run started in directory A
+    // must never leak into / be deleted from directory B (Fund 6/17). Legacy rows
+    // written before this column existed get the `""` default and stay visible as
+    // "global/legacy" (no crash on old DBs); never NULL so the scoping equality
+    // comparison is total.
+    directory: text().notNull().default(""),
     workflow: text().notNull(),
     status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted">().notNull(),
     started_at: integer().notNull(),
