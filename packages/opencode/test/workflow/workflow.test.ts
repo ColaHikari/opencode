@@ -3143,12 +3143,31 @@ export async function run() { return { from: "global" } }
     expect(typeof source).toBe("string")
     // Realer Import: in eine Temp-Datei schreiben und dynamisch laden (identisch
     // zur loadModule-Mechanik). Das Modul-Top-Level wird ausgeführt, also deckt
-    // dies Syntax-/Compile-Fehler im Source-Literal auf. Die Datei MUSS im
-    // Paketbaum liegen (nicht in os.tmpdir()), weil der Source
-    // `import { workflow } from "@opencode-ai/plugin"` macht und dieser bare
-    // specifier nur von innerhalb des Pakets auflöst — exakt der Grund, warum die
-    // Engine den Builtin-Temp-Copy neben ihr eigenes Modul schreibt.
-    const file = path.join(import.meta.dir, `.deep-research-${Math.random().toString(16).slice(2)}.mts`)
+    // dies Syntax-/Compile-Fehler im Source-Literal auf. Die Datei MUSS in einem
+    // Baum liegen, in dem `@opencode-ai/plugin` installiert ist (NICHT in
+    // os.tmpdir()), weil der Source `import { workflow } from "@opencode-ai/plugin"`
+    // macht und dieser bare specifier nur per Walk-up auflöst. loadModule schreibt
+    // den Builtin-Temp-Copy genau deshalb ins GLOBALE workflows-Verzeichnis
+    // (`<Global.Path.config>/workflows`) — der binary-erprobte Pfad, der in der
+    // kompilierten Bun-Binary anders als `import.meta.dir` (/$bunfs/root, read-only)
+    // beschreibbar ist. Wir spiegeln exakt diesen Pfad: Verzeichnis sicherstellen,
+    // mit TEMP_FILE_RE-Namensschema schreiben, laden, danach löschen.
+    const workflowsDir = path.join(Global.Path.config, "workflows")
+    await fs.mkdir(workflowsDir, { recursive: true })
+    // Zur Laufzeit installiert config.ts `@opencode-ai/plugin` nach
+    // `<Global.Path.config>/node_modules`, sodass der Builtin den `workflow`-Export
+    // per Walk-up von `<config>/workflows` auflöst. Wir spiegeln genau diese
+    // Resolution, indem wir das Workspace-Plugin (das `workflow` exportiert) dorthin
+    // verlinken — der real publizierte Stand wird mit dem Binary mit-veröffentlicht.
+    const pluginRoot = path.dirname(Bun.resolveSync("@opencode-ai/plugin/package.json", process.cwd()))
+    const pluginLink = path.join(Global.Path.config, "node_modules", "@opencode-ai", "plugin")
+    await fs.mkdir(path.dirname(pluginLink), { recursive: true })
+    await fs.rm(pluginLink, { recursive: true, force: true }).catch(() => {})
+    await fs.symlink(pluginRoot, pluginLink, "dir").catch(() => {})
+    const file = path.join(
+      workflowsDir,
+      `.deep-research.${Date.now()}.${Math.random().toString(16).slice(2)}.mts`,
+    )
     await Bun.write(file, source)
     try {
       const imported = (await import(pathToFileURL(file).href)) as {
@@ -3160,5 +3179,8 @@ export async function run() { return { from: "global" } }
     } finally {
       await Bun.file(file).delete().catch(() => {})
     }
+    // Temp-Datei wurde im globalen workflows-Verzeichnis geladen und ist danach
+    // wieder weg (kein Orphan zurückgelassen).
+    expect(await Bun.file(file).exists()).toBe(false)
   })
 })
