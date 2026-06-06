@@ -768,6 +768,56 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
     }),
   )
 
+  // Race-regression: cancel() must never report a run as "not found" (undefined →
+  // HTTP 404) when it LOSES the race against the run's own natural completion. In
+  // the live engine the body fiber's finish("completed") persists the terminal row
+  // AND N1-evicts the run from the registry between cancel's registry read and its
+  // own finish("cancelled") — leaving that finish to return undefined for a run
+  // that exists and is terminal. cancel must then fall back to the persisted
+  // snapshot showing the TRUE terminal status (completed), NOT undefined and NOT
+  // rewritten to cancelled.
+  //
+  // Deterministic coverage of the FIX SEMANTICS: complete the run first (await its
+  // terminal state via wait, which resolves once finish has persisted + evicted),
+  // THEN cancel. A cancel on an already-terminal-and-evicted run takes the exact
+  // same persisted-fallback branch the lost race produces — get() inside cancel
+  // misses the (evicted) registry and finish("cancelled") returns undefined, so
+  // the new fallback reads the DB row. The pre-fix code returned undefined here.
+  // The precise finish-undefined timing window (mid-cancel eviction) is exercised
+  // end-to-end by script/httpapi-exercise.ts (workflow.start), whose fixture
+  // completes synchronously fast; this unit test pins the observable contract.
+  it.instance("cancel of an already-completed (evicted) run returns the completed snapshot, never undefined", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "instant",
+          `export const meta = { name: "Instant" }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "instant", args: { value: 7 } })
+      // Drive to terminal: wait resolves only after finish() committed the terminal
+      // row, and finish() then evicts the run from the live registry (N1).
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
+      expect(done.status).toBe("completed")
+      // Cancel after completion: the run is terminal and (being) evicted, so cancel
+      // either snapshots the still-registered terminal run or, once evicted, takes
+      // the new finish-undefined fallback to the persisted row. Both must return a
+      // non-undefined run whose status is the TRUE terminal status, never cancelled.
+      const cancelled = yield* workflow.cancel(run.id)
+      expect(cancelled).toBeDefined()
+      expect(cancelled?.status).toBe("completed")
+      expect(cancelled?.result).toEqual({ value: 7 })
+      // Reserved meaning preserved: a genuinely unknown id still reports undefined.
+      expect(yield* workflow.cancel(Workflow.RunID.make("job_unknown_id"))).toBeUndefined()
+    }),
+  )
+
   it.instance("preserves temporary workflow source in run definition", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
