@@ -392,20 +392,39 @@ const decodeMeta = Schema.decodeUnknownExit(Meta)
 // fields like `directory`/`runScope`/`budget` live on `Active`, never on
 // `active.run`), so no internal state leaks. But a shallow spread still ALIASES
 // the live nested values, so a caller mutating `snapshot(active).args.x` /
-// `.definition` / `.result` / a `logs`/`agents` entry would mutate the running
-// engine's own state. Defensively deep-copy every nested value so the returned
-// run is a detached projection (matching `fromRow`, which already returns a
-// fresh DB-parsed run). `logs`/`agents` were already copied per-entry; `args`/
-// `definition`/`result` are deep-cloned (structuredClone) — they are plain JSON
-// values, so a structural clone is faithful and severs all aliasing.
+// `.definition` / `.result` / a `logs`/`agents`/`agents[].tokens` entry would
+// mutate the running engine's own state. Defensively deep-copy every nested
+// value so the returned run is a detached projection (matching `fromRow`, which
+// already returns a fresh DB-parsed run).
+//
+// The clone goes through the JSON codec (`JSON.parse(JSON.stringify(x))`) — the
+// SAME serializability semantics as `persistRun`/`fromRow`, which round-trip the
+// JSON columns. structuredClone (the previous approach) was wrong: it THROWS on
+// functions/symbols/class instances (`DOMException: object can not be cloned`),
+// which a workflow can return via `result` (e.g. `return { cb: () => {} }`), so
+// it stranded every no-timeout `wait()` and blocked the terminal persist (N2
+// regression). The JSON codec instead drops those values silently, exactly as
+// the DB persist does, keeping the live snapshot and the DB row identical.
+//
+// This is total — it cannot throw — for every reachable engine state: `args`/
+// `definition` are `mode: "json"` columns (a non-JSON value would already have
+// died at the persist that ran on `start`), and `result` is JSON-normalized at
+// the single point it enters the engine (the `finish` boundary, see below), so
+// by the time it lands on `active.run.result` it is guaranteed JSON-safe. The
+// per-entry JSON clone of `agents` also severs the `tokens`/`cache` aliasing
+// (those are plain numbers, never throw).
+function jsonClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value))
+}
+
 function snapshot(active: Active): Run {
   return {
     ...active.run,
-    args: active.run.args === undefined ? undefined : structuredClone(active.run.args),
-    definition: active.run.definition === undefined ? undefined : structuredClone(active.run.definition),
-    result: active.run.result === undefined ? undefined : structuredClone(active.run.result),
+    args: active.run.args === undefined ? undefined : jsonClone(active.run.args),
+    definition: active.run.definition === undefined ? undefined : jsonClone(active.run.definition),
+    result: active.run.result === undefined ? undefined : jsonClone(active.run.result),
     logs: active.run.logs.map((item) => ({ ...item })),
-    agents: active.run.agents.map((item) => ({ ...item })),
+    agents: active.run.agents.map((item) => jsonClone(item)),
   }
 }
 
@@ -1029,7 +1048,26 @@ export const layer = Layer.effect(
       if (active.run.status !== "running") return snapshot(active)
       active.run.status = status
       active.run.completed_at = completed_at
-      active.run.result = data?.result
+      // N2/N13: a workflow's return value reaches `finish` 1:1 from `module.run`
+      // (`Promise<unknown>`) and is otherwise unvalidated. Normalize it ONCE here —
+      // the single point an untrusted result enters the engine — through the SAME
+      // JSON codec the persist uses (`JSON.stringify` then re-parse), so the value
+      // stored on `active.run.result` matches exactly what the DB round-trips:
+      // functions/symbols/class instances are dropped silently (as the persist's
+      // `JSON.stringify` already does), not left to crash `snapshot`/the persist.
+      // `JSON.stringify` itself can still throw on circular references or BigInt,
+      // so the normalization is guarded with `Effect.try` captured as an
+      // `Effect.exit` (no try/catch per the engine style; same fail-soft posture as
+      // the terminal persist's `Effect.exit` guard below — waiters always observe a
+      // terminal state). On failure the run still finishes honestly with a result of
+      // `{ $unserializable: "<message>" }` rather than hanging the run or losing the
+      // terminal transition.
+      const normalized = yield* Effect.try({
+        try: () => (data?.result === undefined ? undefined : (JSON.parse(JSON.stringify(data.result)) as unknown)),
+        catch: (error) => (error instanceof Error ? error.message : String(error)),
+      }).pipe(Effect.exit)
+      active.run.result =
+        normalized._tag === "Success" ? normalized.value : { $unserializable: String(Cause.squash(normalized.cause)) }
       active.run.error = data?.error
       active.fiber = undefined
       // Close out EVERY agent node still marked `running` at the terminal
