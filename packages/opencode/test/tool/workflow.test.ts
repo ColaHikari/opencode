@@ -176,10 +176,7 @@ export async function run(args, ctx) {
 
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
-        const result = yield* tool.execute(
-          { action: "start", name: "ask" },
-          recorder.ctx,
-        )
+        const result = yield* tool.execute({ action: "start", name: "ask" }, recorder.ctx)
 
         expect(result.output).toContain(`<workflow_run id="${result.metadata.runId}" state="completed">`)
         expect(recorder.prompts.some((prompt) => prompt.permissionSessionID === recorder.ctx.sessionID)).toBe(true)
@@ -332,6 +329,39 @@ export async function run() { return "done" }
         // prompt went out.
         expect(metadataCalls.length).toBe(0)
         expect(recorder.prompts.length).toBe(0)
+      }),
+    ),
+  )
+
+  // N15 (Security): Ein Workflow-Dateiname mit Glob-Metazeichen (z. B. "*")
+  // darf NIE als roher Permission-Pattern/`always`-Wert durchgereicht werden —
+  // sonst erzeugt ein "always allow" eine über-breite Regel (Wildcard.match
+  // behandelt "*" als ".*", also "alles erlauben").
+  it.live("a workflow name with glob metacharacters never produces an over-broad permission rule", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        // Datei mit Glob-Metazeichen im Basename (-> discovered name = "*").
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "*",
+            `export const meta = { name: "Star" }
+export async function run() { return "done" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+
+        const exit = yield* Effect.exit(tool.execute({ action: "start", name: "*" }, recorder.ctx))
+        // Der Start scheitert (Name ist kein gültiger Workflow-Name) ...
+        expect(Exit.isFailure(exit)).toBe(true)
+        // ... und es wurde KEINE über-breite Permission-Regel erzeugt: kein
+        // pattern/always darf ein wirksames "*"-Wildcard enthalten.
+        for (const req of recorder.requests) {
+          expect(req.patterns ?? []).not.toContain("*")
+          expect(req.always ?? []).not.toContain("*")
+        }
       }),
     ),
   )

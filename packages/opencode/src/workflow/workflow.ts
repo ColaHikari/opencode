@@ -10,14 +10,11 @@ import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
-import type {
-  WorkflowAgentRow,
-  WorkflowDefinitionRow,
-  WorkflowLogRow,
-} from "@opencode-ai/core/workflow/sql"
+import type { WorkflowAgentRow, WorkflowDefinitionRow, WorkflowLogRow } from "@opencode-ai/core/workflow/sql"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { and, desc, eq, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
+import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
 import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Scope, Schema, SynchronizedRef } from "effect"
@@ -243,14 +240,11 @@ export class StructuredOutputError extends Schema.TaggedErrorClass<StructuredOut
  * of the steps already in flight when the budget runs out. This is a soft cap,
  * not a hard mid-step limit.
  */
-export class BudgetExceededError extends Schema.TaggedErrorClass<BudgetExceededError>()(
-  "WorkflowBudgetExceededError",
-  {
-    message: Schema.String,
-    budget: Schema.Finite,
-    spent: Schema.Finite,
-  },
-) {}
+export class BudgetExceededError extends Schema.TaggedErrorClass<BudgetExceededError>()("WorkflowBudgetExceededError", {
+  message: Schema.String,
+  budget: Schema.Finite,
+  spent: Schema.Finite,
+}) {}
 
 /**
  * Thrown by `checkpoint()` before the next `ctx.agent`/`ctx.parallel`/
@@ -420,10 +414,14 @@ function persistRun(db: Database.Interface["db"], active: Active) {
       result: active.run.result ?? null,
       error: active.run.error ?? null,
     }
-    return db.insert(WorkflowRunTable).values(data).onConflictDoUpdate({
-      target: WorkflowRunTable.id,
-      set: { ...data, time_updated: Date.now() },
-    }).run()
+    return db
+      .insert(WorkflowRunTable)
+      .values(data)
+      .onConflictDoUpdate({
+        target: WorkflowRunTable.id,
+        set: { ...data, time_updated: Date.now() },
+      })
+      .run()
   }).pipe(Effect.orDie)
 }
 
@@ -435,12 +433,7 @@ function persistRun(db: Database.Interface["db"], active: Active) {
  * `finish` is awaited inline, and the startup orphan sweep heals any run whose
  * last progress snapshot was cut short.
  */
-function persistInScope(
-  scope: Scope.Scope,
-  bridge: EffectBridge.Shape,
-  db: Database.Interface["db"],
-  active: Active,
-) {
+function persistInScope(scope: Scope.Scope, bridge: EffectBridge.Shape, db: Database.Interface["db"], active: Active) {
   bridge.fork(persistRun(db, active).pipe(Effect.forkIn(scope)))
 }
 
@@ -496,6 +489,26 @@ function mutableMeta(meta: Meta): Definition["meta"] {
   }
 }
 
+// loadModule writes a transient import copy ALONGSIDE the source file (same
+// directory) on purpose: relative imports and the workflow module's
+// node_modules resolution are anchored on the source directory, so moving the
+// copy to os.tmpdir() would break module resolution. The trade-off is that a
+// process killed mid-import can leave the temp copy behind — hence the orphan
+// filter + sweep in discover() below, which keys off TEMP_FILE_RE.
+//
+// The name shape is `.<base>.<ts>.<rand>.<mts|mjs>`: a leading dot (hidden),
+// the original base name, a millisecond timestamp (used by the sweep to age the
+// file out), a random suffix (collision-free concurrent loads), and an .mts/.mjs
+// extension that is deliberately NOT one of the discovered globs (`*.ts`/`*.js`),
+// so a temp copy can never be picked up as a workflow even before the sweep runs.
+const TEMP_FILE_RE = /^\.(.+)\.(\d+)\.[0-9a-f]+\.(mts|mjs)$/
+const TEMP_FILE_MAX_AGE_MS = 60 * 60 * 1000
+
+function tempFileName(file: string): string {
+  const ext = path.extname(file)
+  return `.${path.basename(file, ext)}.${Date.now()}.${Math.random().toString(16).slice(2)}${ext === ".js" ? ".mjs" : ".mts"}`
+}
+
 // Each call imports the file fresh through a unique temp-file copy, so a
 // workflow edited between calls is always reloaded. We deliberately do NOT keep
 // a cross-call module cache, and we do not rely on a `?mtime=` query either:
@@ -506,16 +519,26 @@ function mutableMeta(meta: Meta): Definition["meta"] {
 // start() now loads only the target module instead of calling list().
 async function loadModule(file: string): Promise<Module> {
   const source = await Bun.file(file).text()
-  const ext = path.extname(file)
-  const cachePath = path.join(
-    path.dirname(file),
-    `.${path.basename(file, ext)}.${Date.now()}.${Math.random().toString(16).slice(2)}${ext === ".js" ? ".mjs" : ".mts"}`,
+  const dir = path.dirname(file)
+  const cachePath = path.join(dir, tempFileName(file))
+  // Fund 40 (b): the temp copy must live in the source directory so relative
+  // imports / node_modules resolution still work. If that directory is not
+  // writable (read-only or external mount), fall back to importing the original
+  // file directly instead of hard-failing. Caveat: a direct import is subject to
+  // the runtime's module cache, so an edit between two starts of a workflow in a
+  // read-only dir may serve a stale module — acceptable, since a read-only dir
+  // is not being edited in place anyway.
+  let importPath = cachePath
+  let cleanup = () => Bun.file(cachePath).delete()
+  const wrote = await Bun.write(cachePath, source).then(
+    () => true,
+    () => false,
   )
-  await Bun.write(cachePath, source)
-  const imported = (await import(pathToFileURL(cachePath).href).finally(() => Bun.file(cachePath).delete())) as Record<
-    string,
-    unknown
-  >
+  if (!wrote) {
+    importPath = file
+    cleanup = () => Promise.resolve()
+  }
+  const imported = (await import(pathToFileURL(importPath).href).finally(cleanup)) as Record<string, unknown>
   const module = (
     typeof imported.default === "object" && imported.default !== null ? imported.default : imported
   ) as Record<string, unknown>
@@ -535,26 +558,76 @@ function assistantText(message: SessionV1.WithParts) {
     .join("\n")
 }
 
-async function discover(directories: readonly string[]) {
-  const entries = await Promise.all(
-    directories.map(async (dir) =>
-      (
-        await Promise.all(
-          ["workflows/*.ts", "workflows/*.js"].map((pattern) =>
-            Glob.scan(pattern, { cwd: dir, absolute: true, dot: true, symlink: true }),
-          ),
-        )
-      )
-        .flat(),
-    ),
+// Fund 40: opportunistically remove orphaned loadModule temp copies (left
+// behind by a process killed mid-import) from a workflows directory, but only
+// when they are older than TEMP_FILE_MAX_AGE_MS so a temp copy of a CURRENTLY
+// loading workflow is never deleted out from under it. Best-effort: any error
+// (missing dir, race, permission) is swallowed — a stale temp file is harmless
+// since it is never discovered as a workflow (wrong extension + filter below).
+async function sweepTempFiles(workflowsDir: string) {
+  const names = await fs.readdir(workflowsDir).catch(() => [] as string[])
+  const cutoff = Date.now() - TEMP_FILE_MAX_AGE_MS
+  await Promise.all(
+    names
+      .filter((name) => TEMP_FILE_RE.test(name))
+      .map(async (name) => {
+        const full = path.join(workflowsDir, name)
+        const stat = await fs.stat(full).catch(() => undefined)
+        if (stat && stat.mtimeMs < cutoff) await fs.rm(full, { force: true }).catch(() => undefined)
+      }),
   )
-  return entries
-    .flat()
-    .map((file) => ({
-      name: path.basename(file, path.extname(file)),
-      path: file,
-    }))
-    .toSorted((a, b) => a.name.localeCompare(b.name))
+}
+
+// Fund 2: a discovered file must really live inside its workflows directory.
+// We glob WITHOUT following symlinks, but a symlinked file entry can still be
+// returned, so we additionally resolve the realpath of both the file and the
+// workflows directory and require the file to stay within it. A symlink that
+// escapes the directory (e.g. -> /tmp/payload.ts) is dropped, so it can never
+// be listed/started — a reviewer eyeballing the directory only sees the harmless
+// link, never the external target. Returns true when the file is safe to keep.
+async function withinWorkflowsDir(file: string, workflowsDir: string): Promise<boolean> {
+  const [realFile, realDir] = await Promise.all([
+    fs.realpath(file).catch(() => undefined),
+    fs.realpath(workflowsDir).catch(() => undefined),
+  ])
+  if (!realFile || !realDir) return false
+  const prefix = realDir.endsWith(path.sep) ? realDir : realDir + path.sep
+  return realFile.startsWith(prefix)
+}
+
+// `directories` is ordered by precedence (project before global, see
+// discoverWorkflows): the first directory that contributes a given workflow
+// NAME wins, so a project workflow shadows a same-named global one. Within a
+// directory the glob excludes temp copies by extension; TEMP_FILE_RE filters
+// any remaining match defensively, and the symlink boundary check drops escapes.
+async function discover(directories: readonly string[]) {
+  const seen = new Set<string>()
+  const result: { name: string; path: string }[] = []
+  for (const dir of directories) {
+    const workflowsDir = path.join(dir, "workflows")
+    // Fire-and-forget sweep of stale temp copies in this directory.
+    await sweepTempFiles(workflowsDir)
+    const files = (
+      await Promise.all(
+        ["workflows/*.ts", "workflows/*.js"].map((pattern) =>
+          Glob.scan(pattern, { cwd: dir, absolute: true, dot: true, symlink: false }),
+        ),
+      )
+    )
+      .flat()
+      .filter((file) => !TEMP_FILE_RE.test(path.basename(file)))
+    const kept = await Promise.all(
+      files.map(async (file) => ((await withinWorkflowsDir(file, workflowsDir)) ? file : undefined)),
+    )
+    for (const file of kept) {
+      if (!file) continue
+      const name = path.basename(file, path.extname(file))
+      if (seen.has(name)) continue
+      seen.add(name)
+      result.push({ name, path: file })
+    }
+  }
+  return result.toSorted((a, b) => a.name.localeCompare(b.name))
 }
 
 function projectConfigDir(ctx: { directory: string; worktree: string }) {
@@ -705,7 +778,12 @@ export const layer = Layer.effect(
 
     const readRuns = Effect.fn("Workflow.readRuns")(function* () {
       const active = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
-      const rows = yield* db.select().from(WorkflowRunTable).orderBy(desc(WorkflowRunTable.started_at)).all().pipe(Effect.orDie)
+      const rows = yield* db
+        .select()
+        .from(WorkflowRunTable)
+        .orderBy(desc(WorkflowRunTable.started_at))
+        .all()
+        .pipe(Effect.orDie)
       return rows
         .map(fromRow)
         .map((run) => {
@@ -719,9 +797,15 @@ export const layer = Layer.effect(
     // directories and globs them into a sorted `{ name, path }[]`. No module is
     // loaded here — loading is the caller's concern (list loads all per-file,
     // start loads only the target).
+    //
+    // N4 (precedence, behavior change): the project config dir is placed FIRST,
+    // ahead of config.directories() (which leads with the GLOBAL ~/.config
+    // dir). discover() dedups by NAME with first-wins, so a project workflow now
+    // shadows a same-named global one — previously the global file won, which
+    // meant create "validated" / start ran the wrong file when both existed.
     const discoverWorkflows = Effect.fn("Workflow.discover")(function* () {
       const ctx = yield* InstanceState.context
-      const directories = [...new Set([...(yield* config.directories()), projectConfigDir(ctx)])]
+      const directories = [...new Set([projectConfigDir(ctx), ...(yield* config.directories())])]
       return yield* Effect.promise(() => discover(directories))
     })
 
@@ -928,8 +1012,7 @@ export const layer = Layer.effect(
                 node.cost = message.info.cost
                 node.tokens = message.info.tokens
               }
-              const structured =
-                message.info.role === "assistant" ? message.info.structured : undefined
+              const structured = message.info.role === "assistant" ? message.info.structured : undefined
               // A schema was requested ⇒ a structured result is mandatory. When the
               // session produced none (it set a StructuredOutputError on the message
               // and/or `structured` came back undefined) we MUST fail the step rather
@@ -953,8 +1036,7 @@ export const layer = Layer.effect(
                     .join(" "),
                 })
               }
-              node.output =
-                structured !== undefined ? JSON.stringify(structured, null, 2) : assistantText(message)
+              node.output = structured !== undefined ? JSON.stringify(structured, null, 2) : assistantText(message)
               return {
                 data: structured !== undefined ? structured : node.output,
                 text: node.output,
