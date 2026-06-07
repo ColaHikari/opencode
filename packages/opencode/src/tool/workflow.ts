@@ -38,7 +38,7 @@ const Parameters = Schema.Struct({
   // (budgetRemaining <= 0) silently never trip — i.e. unlimited spend.
   budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))).annotate({
     description:
-      "Optional cost cap in USD for the whole run. Agent steps stop with a budget error once the cumulative cost reaches this cap. Omit for unlimited.",
+      "Optional cost cap in USD for the whole run. Checked before each agent step; once cumulative cost reaches the cap, the next step fails with a budget error. This is a soft cap — agent steps already running in parallel can push total spend past it. Omit for unlimited.",
   }),
   background: Schema.optional(Schema.Boolean).annotate({
     description: "Start the workflow asynchronously and notify this session when it finishes",
@@ -78,14 +78,14 @@ type Params = Schema.Schema.Type<typeof Parameters>
 type Metadata = Record<string, unknown>
 
 const DESCRIPTION = [
-  "Manage project-local workflows through one action-based tool.",
+  "Manage workflows (project .opencode/workflows, global config workflows, and built-in workflows) through one action-based tool.",
   "Do not use workflows by default. Use this only when the user explicitly asks for a workflow, asks to create one, or confirms workflow automation.",
   "Actions:",
   "- read: return workflow metadata, arguments, phases, and path; use before start if behavior is unclear.",
-  "- start: start an existing workflow. Foreground waits for completion by default; background=true returns immediately and injects a completion message later.",
+  "- start: start an existing workflow (project, global, or built-in). Foreground waits for completion (up to the timeout, default 1 hour) and then returns the running state; background=true returns immediately and injects a completion message later.",
   "- wait: wait for a running workflow by run_id.",
-  "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details.",
-  "- create: write a persistent .opencode/workflows/<name>.ts workflow file.",
+  "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
+  "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
 ].join("\n")
 
 function promptOps(ctx: Tool.Context) {
