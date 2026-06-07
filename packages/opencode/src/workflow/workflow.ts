@@ -1974,18 +1974,46 @@ export const layer = Layer.effect(
               input.caller?.agent !== undefined
                 ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
                 : undefined
+            // The inherited subagent ruleset (#26514): parent Plan-Mode edit denies,
+            // parent session denies/external_directory, default task/todowrite denies.
+            // Absent a caller identity there is nothing to inherit (prior fallback).
+            const derivedPermission = callerSession
+              ? deriveSubagentSessionPermission({
+                  parentSessionPermission: callerSession.permission ?? [],
+                  parentAgent: callerAgent,
+                  subagent: selected,
+                })
+              : undefined
+            // Security (compose, never override): per-step tool scoping must NEVER
+            // re-grant a tool the inherited ruleset denies. The Record→rules
+            // conversion mirrors the prompt loop's (PromptInput.tools handler):
+            // each entry → `{ permission, action: allow|deny, pattern: "*" }`.
+            // When an inherited ruleset exists we MUST NOT route `tools` through
+            // PromptInput.tools, whose handler does a FULL ASSIGNMENT
+            // (`session.permission = [tools→rules]`) that would clobber the derived
+            // denies for the step. Instead we COMPOSE: the per-step rules go FIRST,
+            // the derived ruleset LAST. The permission engine is last-match-wins
+            // (`evaluate` = `.flat().findLast(...)`), so an inherited deny always
+            // beats a per-step grant of the same permission, while a per-step DENY
+            // (scoping down) and grants of non-denied tools still take effect. When
+            // there is no inherited ruleset there is nothing to clobber, so we keep
+            // routing `tools` through PromptInput.tools below (createPermission stays
+            // undefined and `tools` is passed to prompt.prompt).
+            const toolRules = Object.entries(tools ?? {}).map(([t, enabled]) => ({
+              permission: t,
+              action: enabled ? ("allow" as const) : ("deny" as const),
+              pattern: "*" as const,
+            }))
+            const composeTools = derivedPermission !== undefined && toolRules.length > 0
+            const createPermission = composeTools
+              ? [...toolRules, ...derivedPermission!]
+              : derivedPermission
             const session = yield* sessions.create({
               parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
               title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
               agent: selected.name,
               model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID, variant } : undefined,
-              permission: callerSession
-                ? deriveSubagentSessionPermission({
-                    parentSessionPermission: callerSession.permission ?? [],
-                    parentAgent: callerAgent,
-                    subagent: selected,
-                  })
-                : undefined,
+              permission: createPermission,
             })
             node.agent = selected.name
             if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
@@ -2016,7 +2044,15 @@ export const layer = Layer.effect(
               // child session's tools for this step. `tools` already merges the
               // step's own scoping with the `skill: true` enablement that the
               // skills directive (above) requires.
-              tools,
+              //
+              // BUT the prompt loop's handler does a FULL ASSIGNMENT that would
+              // clobber an inherited subagent ruleset. So when we already composed
+              // the per-step rules INTO the child session's permission at creation
+              // (an inherited ruleset existed — `composeTools`), we must NOT pass
+              // `tools` here, or it would overwrite that composed ruleset and drop
+              // the inherited denies. Only route through PromptInput.tools when there
+              // was nothing to inherit/clobber.
+              tools: composeTools ? undefined : tools,
               format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
               // `promptText` is the author's prompt, optionally prefixed with the
               // per-step skill-load directive (see the `skills` resolution above).

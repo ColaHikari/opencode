@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
+import { Permission } from "@/permission"
 import { Agent } from "@/agent/agent"
 import { SessionID } from "@/session/schema"
 import type { SessionPrompt } from "@/session/prompt"
@@ -243,6 +244,19 @@ const TOOLS_WORKFLOW = `export const meta = { name: "${TOOLS_FIXTURE}", phases: 
 export async function run(args, ctx) {
   ctx.setPhase("run")
   await ctx.agent({ prompt: "hi", tools: { webfetch: false } })
+  return { ok: true }
+}
+`
+
+// Security-compose fixture: a single agent step that tries to RE-GRANT a tool
+// (\`edit\`) the inherited caller permission denies (Plan Mode). The per-step
+// grant must NOT override the inherited deny — the composed child-session
+// ruleset must still deny \`edit\`.
+const TOOLS_REGRANT_FIXTURE = "tools-regrant-step"
+const TOOLS_REGRANT_WORKFLOW = `export const meta = { name: "${TOOLS_REGRANT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", tools: { edit: true } })
   return { ok: true }
 }
 `
@@ -3461,6 +3475,77 @@ export async function run() { return { ok: true } }
       // present on the child (regression of #26514 would leave these absent).
       expect(rules).toContainEqual({ permission: "edit", pattern: "**", action: "deny" })
       expect(rules).toContainEqual({ permission: "external_directory", pattern: "/outside/**", action: "allow" })
+    }),
+  )
+
+  // Security (compose, never override): per-step tool scoping must NEVER re-grant
+  // a tool the inherited subagent permission denies. A caller in Plan Mode denies
+  // `edit`; the step passes `tools: { edit: true }`.
+  //
+  // Before the fix, per-step tools were routed ONLY through PromptInput.tools,
+  // whose prompt-loop handler does a FULL ASSIGNMENT `session.permission =
+  // [tools→rules]` — clobbering the derived ruleset and re-enabling `edit` for the
+  // step. After the fix, when a caller-derived permission exists the per-step
+  // tools are instead COMPOSED into the child session's `permission` at creation,
+  // placed BEFORE the derived denies so (under last-match-wins evaluation) an
+  // inherited deny always beats a per-step grant — and the tools are NO LONGER
+  // passed to prompt.prompt (so the clobbering assignment can't fire).
+  //
+  // Observability: the workflow tests inject fake prompt-ops, so the regression's
+  // runtime clobber can't be seen via the prompt loop. We instead assert the two
+  // fix-visible facts directly: (1) the composed child-session `permission`
+  // CONTAINS the per-step edit grant yet still evaluates `edit` to deny (the
+  // inherited deny wins by ordering); (2) the captured PromptInput carries NO
+  // `tools` for this step (the engine stopped routing through the clobber path).
+  // Both are FALSE before the fix: (1) the create permission never held the
+  // per-step rule, and (2) `tools` was passed straight to prompt.prompt.
+  it.instance("per-step tools cannot re-grant an inherited-denied tool (deny wins)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, TOOLS_REGRANT_FIXTURE, TOOLS_REGRANT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sessions = yield* Session.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      // A Plan-Mode-style caller: edit is denied on the parent session.
+      const caller = yield* sessions.create({
+        title: "Caller",
+        permission: [{ permission: "edit", pattern: "**", action: "deny" }],
+      })
+
+      const run = yield* workflow.start({
+        name: TOOLS_REGRANT_FIXTURE,
+        args: {},
+        prompt: ops,
+        caller: { sessionID: caller.id, agent: "build" },
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+
+      const childSessionID = done.agents[0]?.session_id
+      expect(childSessionID).toBeDefined()
+      const child = yield* pollWithTimeout(
+        sessions.get(SessionID.make(childSessionID!)).pipe(
+          Effect.map((s) => (s.permission ? s : undefined)),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        ),
+        "child session permission never populated",
+      )
+      const rules = child.permission ?? []
+      // The inherited edit deny is still present...
+      expect(rules).toContainEqual({ permission: "edit", pattern: "**", action: "deny" })
+      // ...the per-step grant was COMPOSED into the SAME ruleset (proving tools
+      // were folded into sessions.create, not routed to the clobbering prompt path)...
+      const grantIdx = rules.findIndex((r) => r.permission === "edit" && r.action === "allow")
+      const denyIdx = rules.findIndex((r) => r.permission === "edit" && r.action === "deny")
+      expect(grantIdx).toBeGreaterThanOrEqual(0)
+      // ...ordered BEFORE the inherited deny (last-match-wins ⇒ deny is later ⇒ deny wins)...
+      expect(grantIdx).toBeLessThan(denyIdx)
+      // ...so `edit` evaluates to deny despite the per-step `tools: { edit: true }`.
+      expect(Permission.evaluate("edit", "anything.ts", rules).action).toBe("deny")
+      // And the per-step tools were NOT routed to prompt.prompt (no clobber path).
+      expect(inputs.length).toBe(1)
+      expect(inputs[0]?.tools).toBeUndefined()
     }),
   )
 
