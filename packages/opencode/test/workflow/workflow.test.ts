@@ -1356,6 +1356,19 @@ export async function run(args, ctx) {
   return { answer: a.answer }
 }
 `
+// Question-then-agent: asks a question that times out (parks as paused), then
+// dispatches a real ctx.agent step that depends on the answer. The resume that
+// answer() triggers must thread the prompt-ops vector so this agent step can run
+// LIVE on the resumed run (the question is replayed from the journal).
+const QUESTION_AGENT_FIXTURE = "q-then-agent"
+const QUESTION_AGENT_WORKFLOW = `export const meta = { name: "${QUESTION_AGENT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "go?", timeout: 50 })
+  const r = await ctx.agent({ prompt: "after-" + a.answer })
+  return { answer: a.answer, agentText: r.text }
+}
+`
 
 // Prompt-Ops für den Drift-Test: zählt jeden GEFEUERTEN (live) Prompt und liefert,
 // wenn ein Schema angefordert wurde (input.format gesetzt), eine strukturierte
@@ -4569,6 +4582,49 @@ export async function run() { return { from: "global" } }
       const replayed = done.agents.find((a) => a.kind === "question")
       expect(replayed?.answer).toBe("no")
       expect(replayed?.status).toBe("completed")
+    }),
+  )
+
+  // TASK 12/13 follow-up: answer() must forward the SAME execution options start()
+  // accepts for a resume (at minimum the prompt-ops vector), so a workflow that
+  // asks a question and THEN dispatches ctx.agent steps can complete on the resume.
+  // The question times out → parks paused; answer({..., prompt}) starts a resume
+  // that replays the question from the journal AND runs the live agent step.
+  it.instance("answer() forwards prompt ops so a resumed run can dispatch agents after the question", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_AGENT_FIXTURE, QUESTION_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const run = yield* workflow.start({ name: QUESTION_AGENT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+
+      // Unanswered question times out → run parks as paused.
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("q-then-agent did not settle")))
+      expect(paused.status).toBe("paused")
+      expect(paused.pending_question?.question).toBe("go?")
+
+      // answer() with prompt ops → resume that runs the live agent step.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.answer({ id: run.id, answer: "yes", prompt: resumeOps })
+      expect(resumed).toBeDefined()
+      expect(resumed!.resume_of).toBe(run.id)
+
+      const done =
+        (yield* workflow.wait({ id: resumed!.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { answer: string; agentText: string }
+      // The question was replayed (answer served) AND the agent step ran live on
+      // the resumed run, prompted with the answer-dependent text.
+      expect(result.answer).toBe("yes")
+      expect(prompted).toContain("after-yes")
+      expect(result.agentText).toBe("out:after-yes")
+      // The resumed run carries both the (replayed) question node and the live
+      // agent node; no second pending_question.
+      expect(done.pending_question).toBeUndefined()
+      expect(done.agents.find((a) => a.kind === "question")?.answer).toBe("yes")
+      expect(done.agents.some((a) => a.kind !== "question" && a.output === "out:after-yes")).toBe(true)
     }),
   )
 

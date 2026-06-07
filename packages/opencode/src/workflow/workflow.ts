@@ -349,6 +349,22 @@ export type WaitResult = {
 export type AnswerInput = {
   id: RunID
   answer: string
+  /**
+   * Execution options forwarded UNCHANGED into the resume that `answer()` starts
+   * when the target run is `paused` on a question (Tasks 12/13). These mirror the
+   * subset of `StartOptions` the resume path consumes, so a workflow that asks a
+   * question and then dispatches more `ctx.agent` steps can run those steps on the
+   * resumed run. Ignored on the live-answer path (no resume happens). All optional
+   * for backward compatibility:
+   * - `prompt`: the prompt-ops vector (dispatch + abort) the agent steps need.
+   * - `permissionSessionID`: where interactive permission prompts surface.
+   * - `caller`: identity used to derive each subagent's inherited permission ruleset.
+   * - `budget`: cost cap (USD) for the resumed run.
+   */
+  prompt?: PromptOps
+  permissionSessionID?: SessionID
+  caller?: { sessionID: SessionID; agent?: string }
+  budget?: number
 }
 
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("WorkflowNotFoundError", {
@@ -2897,14 +2913,20 @@ export const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (!row || row.status !== "paused" || !row.pending_question) return undefined
       // Resume: re-run the SAME workflow, replaying the agent journal AND serving
-      // the seeded answer to the question node. No prompt ops are threaded here
-      // (answer() has no session identity) — a question-only resume needs none; a
-      // resume with live agent steps after the question is a later (HTTP) track.
+      // the seeded answer to the question node. The caller's execution options
+      // (prompt-ops vector, permissionSessionID, caller, budget) are forwarded
+      // UNCHANGED so a workflow that asks a question and then dispatches more
+      // `ctx.agent` steps can run those steps live on the resumed run — without
+      // them the post-question agent step would fail ("requires prompt operations").
       return yield* start({
         name: row.workflow,
         args: row.args ?? undefined,
         resume_of: id,
         questionAnswers: { [row.pending_question.question]: input.answer },
+        prompt: input.prompt,
+        permissionSessionID: input.permissionSessionID,
+        caller: input.caller,
+        budget: input.budget,
       })
     })
 
