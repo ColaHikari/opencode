@@ -169,11 +169,23 @@ Discovery (listing, autocomplete, reading, the dashboard, and the HTTP/tool
 `read` action) **never executes your workflow file** — it extracts metadata
 purely from the source text. The `name`, `description`, `phases`, and `arguments`
 values must therefore be literals (strings, numbers, booleans, arrays, and object
-literals). A computed value — a function call, an imported constant, a
-`process.env` lookup, or a template string with substitutions — cannot be read
-without running code, so the file is reported as invalid and cannot be started
-until the metadata is made literal. Only the `run` body may contain arbitrary
-logic; it runs at start time, after the permission gate.
+literals) to be read this way. A computed value — a function call, an imported
+constant, a `process.env` lookup, or a template string with substitutions —
+cannot be read without running code.
+
+A workflow with computed metadata is **reported as invalid by discovery**: it is
+omitted from `list`, autocomplete, and the agent-facing workflow list, and `read`
+returns it with `valid: false`. It is therefore **effectively unusable in
+practice** — nothing surfaces it to start. There is one seam to be aware of: a
+**direct start by exact name** (e.g. `/workflow my_file` or the HTTP
+`POST /workflow/:name/start`) resolves the target by **file name**, not by reading
+its metadata, then imports the module and validates only the _runtime_ metadata.
+So a computed value that resolves to a valid runtime value at import time can
+still start by name. Do not rely on this — keep metadata literal so the workflow
+is discoverable and behaves consistently everywhere. (Inline-source starts, by
+contrast, _are_ statically validated and reject computed metadata up front.) Only
+the `run` body should contain arbitrary logic; it runs at start time, after the
+permission gate.
 
 ```ts
 // Good — literal metadata
@@ -473,8 +485,13 @@ Key behaviors:
 - It runs in the run's workspace by default; pass `{ cwd }` to run elsewhere and
   `{ timeout }` (milliseconds) to kill a hung command (the killed run resolves
   with a non-zero `exitCode`, it does not hang).
-- It inherits the run session's shell permissions and is aborted along with the
-  run on cancel/pause.
+- It is aborted along with the run on cancel/pause (the in-flight command is
+  killed when the run scope closes).
+- It is **not gated by any permission ruleset**. Unlike the agent-facing `bash`
+  tool, `ctx.shell` spawns the command directly — it runs with the opencode
+  process's own privileges in the chosen `cwd`, with no allow/deny check. Treat a
+  workflow's `ctx.shell` calls as trusted code: only run workflows you trust, the
+  same way you would a local script.
 
 This pairs well with `ctx.agent`: run a build with `ctx.shell`, then feed its
 output to an agent only when it fails.
