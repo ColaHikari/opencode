@@ -854,14 +854,21 @@ function coerceArgs(
       const coerced =
         typeof trimmed === "number" ? trimmed : typeof trimmed === "string" && trimmed !== "" ? Number(trimmed) : NaN
       if (!Number.isFinite(coerced))
-        return new InvalidError({ path, message: `argument "${name}" must be a finite number, got ${JSON.stringify(value)}` })
+        return new InvalidError({
+          path,
+          message: `argument "${name}" must be a finite number, got ${JSON.stringify(value)}`,
+        })
       result[name] = coerced
       continue
     }
     if (argument.type === "boolean") {
-      const coerced = typeof value === "boolean" ? value : value === "true" ? true : value === "false" ? false : undefined
+      const coerced =
+        typeof value === "boolean" ? value : value === "true" ? true : value === "false" ? false : undefined
       if (coerced === undefined)
-        return new InvalidError({ path, message: `argument "${name}" must be a boolean ("true"/"false"), got ${JSON.stringify(value)}` })
+        return new InvalidError({
+          path,
+          message: `argument "${name}" must be a boolean ("true"/"false"), got ${JSON.stringify(value)}`,
+        })
       result[name] = coerced
       continue
     }
@@ -1681,263 +1688,262 @@ export const layer = Layer.effect(
         const prompt = input.prompt
         if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
         return dispatch(
-            Effect.gen(function* () {
-              const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
-              const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
-              // Resume replay: when this run has a journal (started with
-              // resume_of), consume the next unused source agent for this call's
-              // key (occurrence order) and replay it verbatim — NO session, NO
-              // prompt. The node adopts the source output/cost/tokens, is marked
-              // `cached`, and the replayed cost is charged once via the shared
-              // `ensuring` (post-step) — the SAME decrement the live-step path uses;
-              // the budget gate before this lookup still fails honestly when
-              // exhausted. `structured` is re-parsed from the stored output when a
-              // schema was requested so `result.data` stays the parsed object,
-              // identical to a live structured step. A miss falls through to the
-              // live path below. The agent name is resolved (`selected.name`)
-              // exactly like the seed side, so a default-agent call still matches.
-              if (active.journal && active.journalCursor) {
-                const key = journalKey({ prompt: agentInput.prompt, agent: selected.name, phase: node.phase })
-                const bucket = active.journal.get(key)
-                const cursor = active.journalCursor.get(key) ?? 0
-                const cached = bucket?.[cursor]
-                if (cached) {
-                  // A schema was requested ⇒ the replayed output must parse as JSON
-                  // to satisfy `result.data`. The source node may be a PLAINTEXT
-                  // agent whose journal key happens to match this schema call (the
-                  // workflow FILE drifted between the original run and the resume:
-                  // same prompt/agent/phase, but the agent now asks for a schema).
-                  // `JSON.parse` on that plaintext would throw SYNCHRONOUSLY and
-                  // turn into a defect. Guard it with `Effect.try` captured as an
-                  // `Effect.exit` (engine style; no try/catch). On a parse FAILURE
-                  // we treat the lookup as a cache MISS — semantically correct: the
-                  // cache cannot serve this schema, so we DON'T consume the journal
-                  // entry, fall through, and let the agent run live (which yields a
-                  // real structured result). Only commit the cache hit once we know
-                  // the parse succeeded.
-                  const parsedExit =
-                    agentInput.schema && cached.output !== undefined
-                      ? yield* Effect.try({
-                          try: () => JSON.parse(cached.output!) as unknown,
-                          catch: (error) => (error instanceof Error ? error.message : String(error)),
-                        }).pipe(Effect.exit)
-                      : undefined
-                  const parseFailed = parsedExit !== undefined && Exit.isFailure(parsedExit)
-                  if (!parseFailed) {
-                    active.journalCursor.set(key, cursor + 1)
-                    node.agent = selected.name
-                    node.status = "completed"
-                    node.completed_at = Date.now()
-                    node.output = cached.output
-                    node.cost = cached.cost
-                    node.tokens = cached.tokens
-                    node.model = cached.model
-                    node.cached = true
-                    // The budget decrement is left to the shared `ensuring` below
-                    // (node.cost is set), so a cache hit is charged exactly once.
-                    yield* persistRun(db, active)
-                    const structured = parsedExit !== undefined ? parsedExit.value : undefined
-                    return {
-                      data: structured !== undefined ? structured : (cached.output ?? ""),
-                      text: cached.output ?? "",
-                    }
+          Effect.gen(function* () {
+            const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
+            const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+            // Resume replay: when this run has a journal (started with
+            // resume_of), consume the next unused source agent for this call's
+            // key (occurrence order) and replay it verbatim — NO session, NO
+            // prompt. The node adopts the source output/cost/tokens, is marked
+            // `cached`, and the replayed cost is charged once via the shared
+            // `ensuring` (post-step) — the SAME decrement the live-step path uses;
+            // the budget gate before this lookup still fails honestly when
+            // exhausted. `structured` is re-parsed from the stored output when a
+            // schema was requested so `result.data` stays the parsed object,
+            // identical to a live structured step. A miss falls through to the
+            // live path below. The agent name is resolved (`selected.name`)
+            // exactly like the seed side, so a default-agent call still matches.
+            if (active.journal && active.journalCursor) {
+              const key = journalKey({ prompt: agentInput.prompt, agent: selected.name, phase: node.phase })
+              const bucket = active.journal.get(key)
+              const cursor = active.journalCursor.get(key) ?? 0
+              const cached = bucket?.[cursor]
+              if (cached) {
+                // A schema was requested ⇒ the replayed output must parse as JSON
+                // to satisfy `result.data`. The source node may be a PLAINTEXT
+                // agent whose journal key happens to match this schema call (the
+                // workflow FILE drifted between the original run and the resume:
+                // same prompt/agent/phase, but the agent now asks for a schema).
+                // `JSON.parse` on that plaintext would throw SYNCHRONOUSLY and
+                // turn into a defect. Guard it with `Effect.try` captured as an
+                // `Effect.exit` (engine style; no try/catch). On a parse FAILURE
+                // we treat the lookup as a cache MISS — semantically correct: the
+                // cache cannot serve this schema, so we DON'T consume the journal
+                // entry, fall through, and let the agent run live (which yields a
+                // real structured result). Only commit the cache hit once we know
+                // the parse succeeded.
+                const parsedExit =
+                  agentInput.schema && cached.output !== undefined
+                    ? yield* Effect.try({
+                        try: () => JSON.parse(cached.output!) as unknown,
+                        catch: (error) => (error instanceof Error ? error.message : String(error)),
+                      }).pipe(Effect.exit)
+                    : undefined
+                const parseFailed = parsedExit !== undefined && Exit.isFailure(parsedExit)
+                if (!parseFailed) {
+                  active.journalCursor.set(key, cursor + 1)
+                  node.agent = selected.name
+                  node.status = "completed"
+                  node.completed_at = Date.now()
+                  node.output = cached.output
+                  node.cost = cached.cost
+                  node.tokens = cached.tokens
+                  node.model = cached.model
+                  node.cached = true
+                  // The budget decrement is left to the shared `ensuring` below
+                  // (node.cost is set), so a cache hit is charged exactly once.
+                  yield* persistRun(db, active)
+                  const structured = parsedExit !== undefined ? parsedExit.value : undefined
+                  return {
+                    data: structured !== undefined ? structured : (cached.output ?? ""),
+                    text: cached.output ?? "",
                   }
                 }
               }
-              // Security (#26514 regression, Fund N9): a workflow subagent MUST
-              // inherit the caller's deny/external_directory rules and the caller
-              // agent's edit-class denies (Plan Mode lives on the agent ruleset,
-              // not the session) — exactly like the task tool derives a subagent's
-              // ruleset. Without the caller's identity (a purely programmatic/HTTP
-              // start with no session) we fall back to the prior behavior: no
-              // inherited ruleset (the engine still defaults task/todowrite denies
-              // for any non-permitting subagent via the normal session permission
-              // path). `agents.get` on the caller agent uses the same catchCause
-              // fallback as task.ts so an unknown caller agent never fails the run.
-              const callerSession = input.caller
-                ? yield* sessions.get(input.caller.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+            }
+            // Security (#26514 regression, Fund N9): a workflow subagent MUST
+            // inherit the caller's deny/external_directory rules and the caller
+            // agent's edit-class denies (Plan Mode lives on the agent ruleset,
+            // not the session) — exactly like the task tool derives a subagent's
+            // ruleset. Without the caller's identity (a purely programmatic/HTTP
+            // start with no session) we fall back to the prior behavior: no
+            // inherited ruleset (the engine still defaults task/todowrite denies
+            // for any non-permitting subagent via the normal session permission
+            // path). `agents.get` on the caller agent uses the same catchCause
+            // fallback as task.ts so an unknown caller agent never fails the run.
+            const callerSession = input.caller
+              ? yield* sessions.get(input.caller.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+              : undefined
+            const callerAgent =
+              input.caller?.agent !== undefined
+                ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
                 : undefined
-              const callerAgent =
-                input.caller?.agent !== undefined
-                  ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-                  : undefined
-              const session = yield* sessions.create({
-                parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
-                title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
-                agent: selected.name,
-                model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID } : undefined,
-                permission: callerSession
-                  ? deriveSubagentSessionPermission({
-                      parentSessionPermission: callerSession.permission ?? [],
-                      parentAgent: callerAgent,
-                      subagent: selected,
-                    })
-                  : undefined,
-              })
-              node.agent = selected.name
-              if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
-              node.session_id = session.id
-              // Track the child session so cancel()/remove() can abort it.
-              active.sessions.add(session.id)
-              // Fund 16: a cancel may have landed in the window between the start
-              // gate above and registering this session. Self-abort the freshly
-              // created session if so, instead of relying on a one-shot snapshot
-              // in abortRun that could miss it. The scope-close path will also
-              // interrupt this fiber, but aborting the session here stops the
-              // model spend deterministically and is idempotent.
-              if (active.cancelling || active.removed) {
-                if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
-              }
-              yield* persistRun(db, active)
-              const message = yield* prompt.prompt({
-                sessionID: session.id,
-                permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
-                agent: selected.name,
-                model: modelInfo,
-                format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
-                parts: [{ type: "text", text: agentInput.prompt }],
-              })
-              node.message_id = message.info.id
-              if (message.info.role === "assistant") {
-                node.model = `${message.info.providerID}/${message.info.modelID}`
-                // `prompt.prompt` is an agentic while(true) loop (SessionPrompt.runLoop):
-                // a single ctx.agent step that uses tools persists MANY assistant
-                // messages (one per turn), each with its own per-turn `cost`/`tokens`,
-                // but only ever RETURNS the LAST one. Charging just `message.info.cost`
-                // therefore discards every intermediate turn's spend — the dashboard
-                // under-reports and the budget under-counts massively (Fund N12). Sum
-                // cost/tokens over ALL assistant messages of this child session instead.
-                // `sessions.messages` returns the raw per-message list (NOT a cumulative
-                // pre-aggregate), so summing it cannot double-count; the returned
-                // `message` is itself one of those persisted rows, so it is NOT added on
-                // top. A single-turn session yields exactly one assistant message ⇒ the
-                // sum equals that message ⇒ identical to the prior single-message read.
-                const assistants = (yield* sessions.messages({ sessionID: session.id }).pipe(Effect.orDie))
-                  .map((m) => m.info)
-                  .filter((info) => info.role === "assistant")
-                node.cost = assistants.reduce((sum, info) => sum + info.cost, 0)
-                // Keep `total` optional exactly as the per-message tokens schema has it:
-                // only emit a summed total when at least one message actually carried one,
-                // otherwise leave it `undefined` so a single-message session is byte-for-byte
-                // identical to the prior `node.tokens = message.info.tokens` assignment.
-                const totals = assistants.map((info) => info.tokens.total).filter((t) => t !== undefined)
-                node.tokens = assistants.reduce(
-                  (acc, info) => ({
-                    total: acc.total,
-                    input: acc.input + info.tokens.input,
-                    output: acc.output + info.tokens.output,
-                    reasoning: acc.reasoning + info.tokens.reasoning,
-                    cache: {
-                      read: acc.cache.read + info.tokens.cache.read,
-                      write: acc.cache.write + info.tokens.cache.write,
-                    },
-                  }),
-                  {
-                    total: totals.length > 0 ? totals.reduce((sum, t) => sum + t, 0) : undefined,
-                    input: 0,
-                    output: 0,
-                    reasoning: 0,
-                    cache: { read: 0, write: 0 },
-                  } as NonNullable<AgentRun["tokens"]>,
-                )
-              }
-              // Fund 4: the production runner RESOLVES (does not reject) when a
-              // session is aborted — it returns the last assistant message, which
-              // carries an abort/cancelled error. If the run is cancelling/removed
-              // OR the message itself is abort-marked, this step did not succeed:
-              // fail it as cancelled so the body unwinds as `cancelled` and the
-              // settlement callbacks below never flip the node to `completed`.
-              if (active.cancelling || active.removed || isAbortedMessage(message)) {
-                return yield* Effect.die(new CancelledError())
-              }
-              const structured = message.info.role === "assistant" ? message.info.structured : undefined
-              // A schema was requested ⇒ a structured result is mandatory. When the
-              // session produced none (it set a StructuredOutputError on the message
-              // and/or `structured` came back undefined) we MUST fail the step rather
-              // than silently fall back to plaintext: a missing structured result is
-              // a genuine step failure that has to surface (node `failed`, run fails
-              // unless the module catches it). Non-schema agents are unaffected.
-              if (agentInput.schema && structured === undefined) {
-                const sessionMessage =
-                  message.info.role === "assistant" && message.info.error?.name === "StructuredOutputError"
-                    ? message.info.error.data.message
-                    : undefined
-                node.output = assistantText(message)
-                const schemaText = JSON.stringify(agentInput.schema)
-                return yield* new StructuredOutputError({
-                  message: [
-                    "Agent was asked for structured output but produced none",
-                    sessionMessage ? `(${sessionMessage})` : undefined,
-                    `expected a result matching the requested schema (${schemaText.length > 200 ? schemaText.slice(0, 200) + "…" : schemaText})`,
-                  ]
-                    .filter(Boolean)
-                    .join(" "),
-                })
-              }
-              node.output = structured !== undefined ? JSON.stringify(structured, null, 2) : assistantText(message)
-              return {
-                data: structured !== undefined ? structured : node.output,
-                text: node.output,
-              }
-            }).pipe(
-              Effect.ensuring(
-                Effect.sync(() => {
-                  if (node.session_id) active.sessions.delete(node.session_id)
-                  // Decrement the live budget by whatever this step ACTUALLY cost
-                  // — the SAME `cost` (USD) the dashboard shows, set on the node
-                  // from the assistant message above. Done in `ensuring` (not the
-                  // success branch) so failed-but-paid steps (e.g. a structured-
-                  // output failure that still incurred model cost) are charged too.
-                  // EXCEPT a cancelled run: an abort-resolved step did not produce
-                  // a real result and must not be charged (Fund 4) — and any cost
-                  // on an aborted message is the abort artifact, not real spend.
-                  // A step with no cost leaves the budget untouched; unset stays Infinity.
-                  // A pausing run is treated like a cancelling one: an interrupted
-                  // step did not really spend, so it must not be charged.
-                  if (active.cancelling || active.removed || active.pausing) return
-                  active.budgetRemaining -= node.cost ?? 0
+            const session = yield* sessions.create({
+              parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
+              title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
+              agent: selected.name,
+              model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID } : undefined,
+              permission: callerSession
+                ? deriveSubagentSessionPermission({
+                    parentSessionPermission: callerSession.permission ?? [],
+                    parentAgent: callerAgent,
+                    subagent: selected,
+                  })
+                : undefined,
+            })
+            node.agent = selected.name
+            if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
+            node.session_id = session.id
+            // Track the child session so cancel()/remove() can abort it.
+            active.sessions.add(session.id)
+            // Fund 16: a cancel may have landed in the window between the start
+            // gate above and registering this session. Self-abort the freshly
+            // created session if so, instead of relying on a one-shot snapshot
+            // in abortRun that could miss it. The scope-close path will also
+            // interrupt this fiber, but aborting the session here stops the
+            // model spend deterministically and is idempotent.
+            if (active.cancelling || active.removed) {
+              if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
+            }
+            yield* persistRun(db, active)
+            const message = yield* prompt.prompt({
+              sessionID: session.id,
+              permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
+              agent: selected.name,
+              model: modelInfo,
+              format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
+              parts: [{ type: "text", text: agentInput.prompt }],
+            })
+            node.message_id = message.info.id
+            if (message.info.role === "assistant") {
+              node.model = `${message.info.providerID}/${message.info.modelID}`
+              // `prompt.prompt` is an agentic while(true) loop (SessionPrompt.runLoop):
+              // a single ctx.agent step that uses tools persists MANY assistant
+              // messages (one per turn), each with its own per-turn `cost`/`tokens`,
+              // but only ever RETURNS the LAST one. Charging just `message.info.cost`
+              // therefore discards every intermediate turn's spend — the dashboard
+              // under-reports and the budget under-counts massively (Fund N12). Sum
+              // cost/tokens over ALL assistant messages of this child session instead.
+              // `sessions.messages` returns the raw per-message list (NOT a cumulative
+              // pre-aggregate), so summing it cannot double-count; the returned
+              // `message` is itself one of those persisted rows, so it is NOT added on
+              // top. A single-turn session yields exactly one assistant message ⇒ the
+              // sum equals that message ⇒ identical to the prior single-message read.
+              const assistants = (yield* sessions.messages({ sessionID: session.id }).pipe(Effect.orDie))
+                .map((m) => m.info)
+                .filter((info) => info.role === "assistant")
+              node.cost = assistants.reduce((sum, info) => sum + info.cost, 0)
+              // Keep `total` optional exactly as the per-message tokens schema has it:
+              // only emit a summed total when at least one message actually carried one,
+              // otherwise leave it `undefined` so a single-message session is byte-for-byte
+              // identical to the prior `node.tokens = message.info.tokens` assignment.
+              const totals = assistants.map((info) => info.tokens.total).filter((t) => t !== undefined)
+              node.tokens = assistants.reduce(
+                (acc, info) => ({
+                  total: acc.total,
+                  input: acc.input + info.tokens.input,
+                  output: acc.output + info.tokens.output,
+                  reasoning: acc.reasoning + info.tokens.reasoning,
+                  cache: {
+                    read: acc.cache.read + info.tokens.cache.read,
+                    write: acc.cache.write + info.tokens.cache.write,
+                  },
                 }),
-              ),
-              // Run-wide concurrency cap (Spec §5.1): acquire one permit around
-              // the whole dispatch so at most `agentConcurrencyCap()` ctx.agent
-              // steps run at once across the entire run, no matter how generous a
-              // per-call `concurrencyLimit` is. The permit is released on success,
-              // failure, OR interruption (withPermits semantics), so a cancelled
-              // step never leaks a permit. A journal replay returns early and so
-              // holds the permit only momentarily.
-              active.agentSemaphore.withPermits(1),
+                {
+                  total: totals.length > 0 ? totals.reduce((sum, t) => sum + t, 0) : undefined,
+                  input: 0,
+                  output: 0,
+                  reasoning: 0,
+                  cache: { read: 0, write: 0 },
+                } as NonNullable<AgentRun["tokens"]>,
+              )
+            }
+            // Fund 4: the production runner RESOLVES (does not reject) when a
+            // session is aborted — it returns the last assistant message, which
+            // carries an abort/cancelled error. If the run is cancelling/removed
+            // OR the message itself is abort-marked, this step did not succeed:
+            // fail it as cancelled so the body unwinds as `cancelled` and the
+            // settlement callbacks below never flip the node to `completed`.
+            if (active.cancelling || active.removed || isAbortedMessage(message)) {
+              return yield* Effect.die(new CancelledError())
+            }
+            const structured = message.info.role === "assistant" ? message.info.structured : undefined
+            // A schema was requested ⇒ a structured result is mandatory. When the
+            // session produced none (it set a StructuredOutputError on the message
+            // and/or `structured` came back undefined) we MUST fail the step rather
+            // than silently fall back to plaintext: a missing structured result is
+            // a genuine step failure that has to surface (node `failed`, run fails
+            // unless the module catches it). Non-schema agents are unaffected.
+            if (agentInput.schema && structured === undefined) {
+              const sessionMessage =
+                message.info.role === "assistant" && message.info.error?.name === "StructuredOutputError"
+                  ? message.info.error.data.message
+                  : undefined
+              node.output = assistantText(message)
+              const schemaText = JSON.stringify(agentInput.schema)
+              return yield* new StructuredOutputError({
+                message: [
+                  "Agent was asked for structured output but produced none",
+                  sessionMessage ? `(${sessionMessage})` : undefined,
+                  `expected a result matching the requested schema (${schemaText.length > 200 ? schemaText.slice(0, 200) + "…" : schemaText})`,
+                ]
+                  .filter(Boolean)
+                  .join(" "),
+              })
+            }
+            node.output = structured !== undefined ? JSON.stringify(structured, null, 2) : assistantText(message)
+            return {
+              data: structured !== undefined ? structured : node.output,
+              text: node.output,
+            }
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (node.session_id) active.sessions.delete(node.session_id)
+                // Decrement the live budget by whatever this step ACTUALLY cost
+                // — the SAME `cost` (USD) the dashboard shows, set on the node
+                // from the assistant message above. Done in `ensuring` (not the
+                // success branch) so failed-but-paid steps (e.g. a structured-
+                // output failure that still incurred model cost) are charged too.
+                // EXCEPT a cancelled run: an abort-resolved step did not produce
+                // a real result and must not be charged (Fund 4) — and any cost
+                // on an aborted message is the abort artifact, not real spend.
+                // A step with no cost leaves the budget untouched; unset stays Infinity.
+                // A pausing run is treated like a cancelling one: an interrupted
+                // step did not really spend, so it must not be charged.
+                if (active.cancelling || active.removed || active.pausing) return
+                active.budgetRemaining -= node.cost ?? 0
+              }),
             ),
-          )
-          .then(
-            (result) => {
-              // Settlement guard (Fund 4): once the run is cancelling/pausing/
-              // removed or already terminal, the success branch is a NO-OP for the
-              // node and emits NO further write. Otherwise a resolve-on-abort step
-              // (the production runner resolves on abort) would flip a cancelled/
-              // paused node to `completed` and re-persist after the terminal write.
-              if (active.cancelling || active.pausing || active.removed || active.run.status !== "running") {
-                throw new CancelledError()
-              }
-              node.status = "completed"
-              node.completed_at = Date.now()
-              node.output = result.text
-              persistInScope(active, bridge, db)
-              return result
-            },
-            (error) => {
-              // Same guard on the failure path: do not mutate/persist the node
-              // for a run that has already moved to (or is moving to) terminal/
-              // paused — finish() owns the node's terminal state in that case.
-              if (active.cancelling || active.pausing || active.removed || active.run.status !== "running") {
-                return Promise.reject(error)
-              }
-              node.status = "failed"
-              node.completed_at = Date.now()
-              node.error = errorText(error)
-              persistInScope(active, bridge, db)
+            // Run-wide concurrency cap (Spec §5.1): acquire one permit around
+            // the whole dispatch so at most `agentConcurrencyCap()` ctx.agent
+            // steps run at once across the entire run, no matter how generous a
+            // per-call `concurrencyLimit` is. The permit is released on success,
+            // failure, OR interruption (withPermits semantics), so a cancelled
+            // step never leaks a permit. A journal replay returns early and so
+            // holds the permit only momentarily.
+            active.agentSemaphore.withPermits(1),
+          ),
+        ).then(
+          (result) => {
+            // Settlement guard (Fund 4): once the run is cancelling/pausing/
+            // removed or already terminal, the success branch is a NO-OP for the
+            // node and emits NO further write. Otherwise a resolve-on-abort step
+            // (the production runner resolves on abort) would flip a cancelled/
+            // paused node to `completed` and re-persist after the terminal write.
+            if (active.cancelling || active.pausing || active.removed || active.run.status !== "running") {
+              throw new CancelledError()
+            }
+            node.status = "completed"
+            node.completed_at = Date.now()
+            node.output = result.text
+            persistInScope(active, bridge, db)
+            return result
+          },
+          (error) => {
+            // Same guard on the failure path: do not mutate/persist the node
+            // for a run that has already moved to (or is moving to) terminal/
+            // paused — finish() owns the node's terminal state in that case.
+            if (active.cancelling || active.pausing || active.removed || active.run.status !== "running") {
               return Promise.reject(error)
-            },
-          )
+            }
+            node.status = "failed"
+            node.completed_at = Date.now()
+            node.error = errorText(error)
+            persistInScope(active, bridge, db)
+            return Promise.reject(error)
+          },
+        )
       }
 
       // Fund 5 (TOCTOU): a cancel/remove can land during the startup window —
@@ -2058,9 +2064,7 @@ export const layer = Layer.effect(
       // cannot wedge cancel.
       const scope = (yield* InstanceState.get(state)).scope
       const closed = yield* Scope.close(active.runScope, Exit.void).pipe(Effect.ignore, Effect.forkIn(scope))
-      const interrupted = active.fiber
-        ? yield* Fiber.interrupt(active.fiber).pipe(Effect.forkIn(scope))
-        : undefined
+      const interrupted = active.fiber ? yield* Fiber.interrupt(active.fiber).pipe(Effect.forkIn(scope)) : undefined
       if (interrupted) yield* Fiber.await(interrupted).pipe(Effect.ignore)
       yield* Fiber.await(closed).pipe(Effect.ignore)
       if (active.fiber) yield* Fiber.await(active.fiber).pipe(Effect.ignore)

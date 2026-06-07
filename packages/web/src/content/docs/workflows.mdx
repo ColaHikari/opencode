@@ -423,7 +423,7 @@ entry for is served from the cache instead of being re-prompted.
 
 From the dashboard, **p** pauses the selected running run and resumes a selected
 `paused` (or `interrupted`) one. In a run's detail view, **r** resumes while
-forcing the *selected* agent back to a live re-run — useful for re-doing one step
+forcing the _selected_ agent back to a live re-run — useful for re-doing one step
 without re-running the whole pipeline.
 
 A replayed (cached) agent step:
@@ -462,20 +462,20 @@ export default workflow({
   name: "Fan Out Summary",
   phases: ["brief", "parallel", "summary"],
   async run(args, ctx) {
-  ctx.setPhase("brief")
-  const brief = await ctx.agent({ agent: "build", prompt: "Create a task brief." })
+    ctx.setPhase("brief")
+    const brief = await ctx.agent({ agent: "build", prompt: "Create a task brief." })
 
-  ctx.setPhase("parallel")
-  const findings = await ctx.parallel([
-    () => ctx.agent({ agent: "plan", prompt: `Check risks:\n${brief.text}` }),
-    () => ctx.agent({ agent: "general", prompt: `Check opportunities:\n${brief.text}` }),
-  ])
+    ctx.setPhase("parallel")
+    const findings = await ctx.parallel([
+      () => ctx.agent({ agent: "plan", prompt: `Check risks:\n${brief.text}` }),
+      () => ctx.agent({ agent: "general", prompt: `Check opportunities:\n${brief.text}` }),
+    ])
 
-  ctx.setPhase("summary")
-  return await ctx.agent({
-    agent: "build",
-    prompt: findings.map((item) => item.text).join("\n\n"),
-  })
+    ctx.setPhase("summary")
+    return await ctx.agent({
+      agent: "build",
+      prompt: findings.map((item) => item.text).join("\n\n"),
+    })
   },
 })
 ```
@@ -507,7 +507,7 @@ In a run's detail view:
 - **X** kills (cancels) the run if it is still running.
 - **P** pauses the run, or resumes it if it is `paused` / `interrupted` (see
   [Pause and resume](#pause-and-resume)).
-- **R** resumes the run while forcing the *selected* agent back to a live re-run,
+- **R** resumes the run while forcing the _selected_ agent back to a live re-run,
   replaying every other completed agent from the journal.
 - **S** saves the run's workflow script as a command (see
   [Save a run as a command](#save-a-run-as-a-command)).
@@ -631,7 +631,7 @@ The keyword only matches as a whole word — `ultracodex`, `ultracode2`, or
 
 `/ultracode` toggles ultracode **for the whole session**. While it is on, every
 substantial turn defaults to planning and running workflows — chaining
-*understand → change → verify* runs when the task has phases — and only trivial or
+_understand → change → verify_ runs when the task has phases — and only trivial or
 conversational turns are handled directly. The footer shows an **ULTRACODE** badge
 while the toggle is on.
 

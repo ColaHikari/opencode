@@ -298,7 +298,11 @@ export async function run(args, ctx) { await ctx.agent({ prompt: "do it" }); ret
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "hello", `export const meta = { name: "Hello" }\nexport async function run() { return "ok" }\n`),
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello" }\nexport async function run() { return "ok" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -319,7 +323,11 @@ export async function run(args, ctx) { await ctx.agent({ prompt: "do it" }); ret
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "hello", `export const meta = { name: "Hello" }\nexport async function run() { return "ok" }\n`),
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello" }\nexport async function run() { return "ok" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -438,70 +446,76 @@ export async function run() { return "done" }
   // FOREGROUND-Workflow läuft, muss (1) der Tool-Call zügig zurückkehren statt
   // bis zum 1h-Timeout zu blockieren und (2) der Run gecancelt werden (keine
   // weiterlaufenden Modellkosten).
-  it.live("foreground workflow tool honors ctx.abort: returns promptly and cancels the run", () =>
-    provideTmpdirInstance((dir) =>
-      Effect.gen(function* () {
-        // Ein Agent-Schritt, der hängt, bis seine Session abgebrochen wird.
-        yield* Effect.promise(() =>
-          writeWorkflow(
-            dir,
-            "hang",
-            `export const meta = { name: "Hang" }
+  it.live(
+    "foreground workflow tool honors ctx.abort: returns promptly and cancels the run",
+    () =>
+      provideTmpdirInstance((dir) =>
+        Effect.gen(function* () {
+          // Ein Agent-Schritt, der hängt, bis seine Session abgebrochen wird.
+          yield* Effect.promise(() =>
+            writeWorkflow(
+              dir,
+              "hang",
+              `export const meta = { name: "Hang" }
 export async function run(args, ctx) { await ctx.agent({ prompt: "hang" }); return "done" }
 `,
-          ),
-        )
-        const tool = yield* workflowTool()
-        const recorder = requestRecorder()
-        const controller = new AbortController()
-        // prompt-ops, die den Agent-Prompt hängen lassen und bei cancel die
-        // Session abbrechen (resolve-on-abort) — wie der echte Runner.
-        const gates = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>()
-        const ctx: Tool.Context = {
-          ...recorder.ctx,
-          abort: controller.signal,
-          extra: {
-            promptOps: {
-              prompt: (input: SessionPrompt.PromptInput) =>
-                Effect.gen(function* () {
-                  if (input.noReply)
+            ),
+          )
+          const tool = yield* workflowTool()
+          const recorder = requestRecorder()
+          const controller = new AbortController()
+          // prompt-ops, die den Agent-Prompt hängen lassen und bei cancel die
+          // Session abbrechen (resolve-on-abort) — wie der echte Runner.
+          const gates = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>()
+          const ctx: Tool.Context = {
+            ...recorder.ctx,
+            abort: controller.signal,
+            extra: {
+              promptOps: {
+                prompt: (input: SessionPrompt.PromptInput) =>
+                  Effect.gen(function* () {
+                    if (input.noReply)
+                      return {
+                        info: { id: MessageID.ascending(), role: "assistant" },
+                        parts: [],
+                      } as unknown as SessionV1.WithParts
+                    const gate = Promise.withResolvers<void>()
+                    gates.set(input.sessionID, gate)
+                    yield* Effect.promise(() => gate.promise)
                     return {
-                      info: { id: MessageID.ascending(), role: "assistant" },
+                      info: {
+                        id: MessageID.ascending(),
+                        role: "assistant",
+                        error: { name: "MessageAbortedError", data: {} },
+                      },
                       parts: [],
                     } as unknown as SessionV1.WithParts
-                  const gate = Promise.withResolvers<void>()
-                  gates.set(input.sessionID, gate)
-                  yield* Effect.promise(() => gate.promise)
-                  return {
-                    info: { id: MessageID.ascending(), role: "assistant", error: { name: "MessageAbortedError", data: {} } },
-                    parts: [],
-                  } as unknown as SessionV1.WithParts
-                }),
-              cancel: (sessionID: SessionID) =>
-                Effect.sync(() => {
-                  gates.get(sessionID)?.resolve()
-                }),
+                  }),
+                cancel: (sessionID: SessionID) =>
+                  Effect.sync(() => {
+                    gates.get(sessionID)?.resolve()
+                  }),
+              },
             },
-          },
-        }
+          }
 
-        // Foreground-Start in einer Fiber; nach kurzer Zeit ctx.abort feuern.
-        const fiber = yield* Effect.forkScoped(tool.execute({ action: "start", name: "hang" }, ctx))
-        yield* Effect.sleep("300 millis")
-        controller.abort()
+          // Foreground-Start in einer Fiber; nach kurzer Zeit ctx.abort feuern.
+          const fiber = yield* Effect.forkScoped(tool.execute({ action: "start", name: "hang" }, ctx))
+          yield* Effect.sleep("300 millis")
+          controller.abort()
 
-        // Der Tool-Call kehrt zügig zurück (nicht erst nach dem 1h-Timeout).
-        const exit = yield* awaitWithTimeout(Fiber.await(fiber), "tool did not return after ctx.abort", "8 seconds")
-        expect(Exit.isSuccess(exit)).toBe(true)
-        const result = Exit.isSuccess(exit) ? exit.value : undefined
-        const runId = result?.metadata.runId as string
-        expect(runId).toBeTruthy()
+          // Der Tool-Call kehrt zügig zurück (nicht erst nach dem 1h-Timeout).
+          const exit = yield* awaitWithTimeout(Fiber.await(fiber), "tool did not return after ctx.abort", "8 seconds")
+          expect(Exit.isSuccess(exit)).toBe(true)
+          const result = Exit.isSuccess(exit) ? exit.value : undefined
+          const runId = result?.metadata.runId as string
+          expect(runId).toBeTruthy()
 
-        // Und der Run wurde gecancelt (läuft nicht weiter).
-        const inspected = yield* tool.execute({ action: "inspect", run_id: runId }, ctx)
-        expect(inspected.output).toContain('state="cancelled"')
-      }),
-    ),
+          // Und der Run wurde gecancelt (läuft nicht weiter).
+          const inspected = yield* tool.execute({ action: "inspect", run_id: runId }, ctx)
+          expect(inspected.output).toContain('state="cancelled"')
+        }),
+      ),
     30_000,
   )
 
@@ -604,7 +618,11 @@ export async function run() { return "done" }
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "slow", `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`),
+          writeWorkflow(
+            dir,
+            "slow",
+            `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -621,7 +639,11 @@ export async function run() { return "done" }
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "slow", `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`),
+          writeWorkflow(
+            dir,
+            "slow",
+            `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -643,7 +665,11 @@ export async function run() { return "done" }
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "slow", `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`),
+          writeWorkflow(
+            dir,
+            "slow",
+            `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -782,7 +808,8 @@ export async function run() {
           Effect.sync(() =>
             recorder.prompts.find((prompt) =>
               prompt.parts?.some(
-                (part) => part.type === "text" && part.text.includes("<workflow_run") && part.text.includes("Background"),
+                (part) =>
+                  part.type === "text" && part.text.includes("<workflow_run") && part.text.includes("Background"),
               ),
             ),
           ),
@@ -837,7 +864,11 @@ export async function run() {
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "hello", `export const meta = { name: "Hello" }\nexport async function run() { return "done" }\n`),
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello" }\nexport async function run() { return "done" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -857,13 +888,21 @@ export async function run() {
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "dup", `export const meta = { name: "Dup" }\nexport async function run() { return "ok" }\n`),
+          writeWorkflow(
+            dir,
+            "dup",
+            `export const meta = { name: "Dup" }\nexport async function run() { return "ok" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
         const exit = yield* Effect.exit(
           tool.execute(
-            { action: "create", name: "dup", source: `export const meta = { name: "Dup" }\nexport async function run() { return "ok" }\n` },
+            {
+              action: "create",
+              name: "dup",
+              source: `export const meta = { name: "Dup" }\nexport async function run() { return "ok" }\n`,
+            },
             recorder.ctx,
           ),
         )
@@ -880,7 +919,11 @@ export async function run() {
       Effect.gen(function* () {
         // meta.name is a number -> statically parses but fails the Meta schema -> invalid.
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "broken", `export const meta = { name: 42 }\nexport async function run() { return "x" }\n`),
+          writeWorkflow(
+            dir,
+            "broken",
+            `export const meta = { name: 42 }\nexport async function run() { return "x" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -899,7 +942,11 @@ export async function run() {
       Effect.gen(function* () {
         // meta.name is a number -> statically parses but fails the Meta schema -> invalid.
         yield* Effect.promise(() =>
-          writeWorkflow(dir, "broken", `export const meta = { name: 42 }\nexport async function run() { return "x" }\n`),
+          writeWorkflow(
+            dir,
+            "broken",
+            `export const meta = { name: 42 }\nexport async function run() { return "x" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()

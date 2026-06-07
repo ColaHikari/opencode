@@ -97,10 +97,7 @@ const briefSchema = {
 const brief = await ctx.agent({
   agent: "plan",
   schema: briefSchema,
-  prompt: [
-    `Feature: ${args.feature}`,
-    "Return only data that matches the provided JSON schema.",
-  ].join("\n"),
+  prompt: [`Feature: ${args.feature}`, "Return only data that matches the provided JSON schema."].join("\n"),
 })
 
 return { brief: brief.data }
@@ -118,11 +115,7 @@ const plan = await ctx.agent({ agent: "plan", prompt: `Plan work for ${args.topi
 ctx.setPhase("review")
 const review = await ctx.agent({
   agent: "general",
-  prompt: [
-    "Review this plan for risks and missing checks.",
-    "",
-    plan.text,
-  ].join("\n"),
+  prompt: ["Review this plan for risks and missing checks.", "", plan.text].join("\n"),
 })
 ```
 
@@ -172,10 +165,13 @@ Each item runs step 1, then step 2, and so on; different items can progress
 concurrently.
 
 ```ts
-const outputs = await ctx.pipeline(["api", "ui", "tests"], [
-  async (area) => (await ctx.agent({ agent: "explore", prompt: `Inspect ${area}` })).text,
-  async (notes) => (await ctx.agent({ agent: "plan", prompt: `Turn notes into checks:\n${notes}` })).text,
-])
+const outputs = await ctx.pipeline(
+  ["api", "ui", "tests"],
+  [
+    async (area) => (await ctx.agent({ agent: "explore", prompt: `Inspect ${area}` })).text,
+    async (notes) => (await ctx.agent({ agent: "plan", prompt: `Turn notes into checks:\n${notes}` })).text,
+  ],
+)
 ```
 
 ### Intermediate Results

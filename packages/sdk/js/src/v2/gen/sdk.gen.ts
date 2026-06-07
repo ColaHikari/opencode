@@ -172,6 +172,8 @@ import type {
   QuestionReplyErrors,
   QuestionReplyResponses,
   QuestionV2Reply,
+  ReferenceListErrors,
+  ReferenceListResponses,
   SessionAbortErrors,
   SessionAbortResponses,
   SessionChildrenErrors,
@@ -3348,6 +3350,38 @@ export class Provider extends HeyApiClient {
   }
 }
 
+export class Reference extends HeyApiClient {
+  /**
+   * List configured references
+   *
+   * List configured references resolved in the current workspace.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ReferenceListResponses, ReferenceListErrors, ThrowOnError>({
+      url: "/reference",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Session2 extends HeyApiClient {
   /**
    * List sessions
@@ -5245,9 +5279,9 @@ export class Workflow extends HeyApiClient {
 
 export class Health extends HeyApiClient {
   /**
-   * Check v2 server health
+   * Check server health
    *
-   * Check whether the v2 API server is ready to accept requests.
+   * Check whether the API server is ready to accept requests.
    */
   public get<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).get<V2HealthGetResponses, V2HealthGetErrors, ThrowOnError>({
@@ -5259,9 +5293,9 @@ export class Health extends HeyApiClient {
 
 export class Agent extends HeyApiClient {
   /**
-   * List v2 agents
+   * List agents
    *
-   * Retrieve currently registered v2 agents.
+   * Retrieve currently registered agents.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -5299,7 +5333,7 @@ export class Permission2 extends HeyApiClient {
       V2SessionPermissionListErrors,
       ThrowOnError
     >({
-      url: "/api/session/{sessionID}/permission/request",
+      url: "/api/session/{sessionID}/permission",
       ...options,
       ...params,
     })
@@ -5337,7 +5371,7 @@ export class Permission2 extends HeyApiClient {
       V2SessionPermissionReplyErrors,
       ThrowOnError
     >({
-      url: "/api/session/{sessionID}/permission/request/{requestID}/reply",
+      url: "/api/session/{sessionID}/permission/{requestID}/reply",
       ...options,
       ...params,
       headers: {
@@ -5380,7 +5414,7 @@ export class Question2 extends HeyApiClient {
       V2SessionQuestionReplyErrors,
       ThrowOnError
     >({
-      url: "/api/session/{sessionID}/question/request/{requestID}/reply",
+      url: "/api/session/{sessionID}/question/{requestID}/reply",
       ...options,
       ...params,
       headers: {
@@ -5419,7 +5453,7 @@ export class Question2 extends HeyApiClient {
       V2SessionQuestionRejectErrors,
       ThrowOnError
     >({
-      url: "/api/session/{sessionID}/question/request/{requestID}/reject",
+      url: "/api/session/{sessionID}/question/{requestID}/reject",
       ...options,
       ...params,
     })
@@ -5428,7 +5462,7 @@ export class Question2 extends HeyApiClient {
 
 export class Session3 extends HeyApiClient {
   /**
-   * List v2 sessions
+   * List sessions
    *
    * Retrieve sessions in the requested order. Items keep that order across pages; use cursor.next or cursor.previous to move through the ordered list.
    */
@@ -5470,9 +5504,9 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
-   * Send v2 message
+   * Send message
    *
-   * Durably admit one v2 session input and schedule agent-loop execution unless resume is false.
+   * Durably admit one session input and schedule agent-loop execution unless resume is false.
    */
   public prompt<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5511,9 +5545,9 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
-   * Compact v2 session
+   * Compact session
    *
-   * Compact a v2 session conversation.
+   * Compact a session conversation.
    */
   public compact<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5530,9 +5564,9 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
-   * Wait for v2 session
+   * Wait for session
    *
-   * Wait for a v2 session agent loop to become idle.
+   * Wait for a session agent loop to become idle.
    */
   public wait<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5549,9 +5583,9 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
-   * Get v2 session context
+   * Get session context
    *
-   * Retrieve the active context messages for a v2 session (all messages after the last compaction).
+   * Retrieve the active context messages for a session (all messages after the last compaction).
    */
   public context<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5568,9 +5602,9 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
-   * Get v2 session messages
+   * Get session messages
    *
-   * Retrieve projected v2 messages for a session. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline.
+   * Retrieve projected messages for a session. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline.
    */
   public messages<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5614,9 +5648,9 @@ export class Session3 extends HeyApiClient {
 
 export class Model extends HeyApiClient {
   /**
-   * List v2 models
+   * List models
    *
-   * Retrieve available v2 models ordered by release date.
+   * Retrieve available models ordered by release date.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -5638,9 +5672,9 @@ export class Model extends HeyApiClient {
 
 export class Provider2 extends HeyApiClient {
   /**
-   * List v2 providers
+   * List providers
    *
-   * Retrieve active v2 AI providers so clients can show provider availability and configuration.
+   * Retrieve active AI providers so clients can show provider availability and configuration.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -5660,9 +5694,9 @@ export class Provider2 extends HeyApiClient {
   }
 
   /**
-   * Get v2 provider
+   * Get provider
    *
-   * Retrieve a single v2 AI provider so clients can inspect its availability and endpoint settings.
+   * Retrieve a single AI provider so clients can inspect its availability and endpoint settings.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5855,9 +5889,9 @@ export class Fs extends HeyApiClient {
 
 export class Command2 extends HeyApiClient {
   /**
-   * List v2 commands
+   * List commands
    *
-   * Retrieve currently registered v2 commands.
+   * Retrieve currently registered commands.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -5879,9 +5913,9 @@ export class Command2 extends HeyApiClient {
 
 export class Skill extends HeyApiClient {
   /**
-   * List v2 skills
+   * List skills
    *
-   * Retrieve currently registered v2 skills.
+   * Retrieve currently registered skills.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -5903,9 +5937,9 @@ export class Skill extends HeyApiClient {
 
 export class Event2 extends HeyApiClient {
   /**
-   * Subscribe to v2 events
+   * Subscribe to events
    *
-   * Subscribe to native EventV2 payloads for a location.
+   * Subscribe to native event payloads for a location.
    */
   public subscribe<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -6133,6 +6167,11 @@ export class OpencodeClient extends HeyApiClient {
   private _provider?: Provider
   get provider(): Provider {
     return (this._provider ??= new Provider({ client: this.client }))
+  }
+
+  private _reference?: Reference
+  get reference(): Reference {
+    return (this._reference ??= new Reference({ client: this.client }))
   }
 
   private _session?: Session2
