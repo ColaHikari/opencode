@@ -366,6 +366,23 @@ export async function run(_args, ctx) {
 }
 `
 
+// Finding 5: a ctx.shell with NO timeout must have its OS child reaped when the
+// run is cancelled/paused (the scope-close path). The shell command writes a
+// "running" marker immediately so the test can synchronize on the child being
+// live, then sleeps, then writes a "leaked" marker. If the child were orphaned on
+// cancel (the bug), the leaked marker would appear ~after the sleep; with the fix
+// the child is SIGTERMed on interruption so the leaked marker is NEVER written.
+// The markers' paths come from args so the test controls them.
+const SHELL_LEAK_FIXTURE = "shell-leak-step"
+const SHELL_LEAK_WORKFLOW = `export const meta = { name: "${SHELL_LEAK_FIXTURE}", phases: ["run"], arguments: { running: { type: "string" }, leaked: { type: "string" } } }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  // No timeout: only a scope-close interrupt (cancel/pause) can stop this.
+  await ctx.shell("touch '" + args.running + "'; sleep 3; touch '" + args.leaked + "'")
+  return { ok: true }
+}
+`
+
 // Task 11b (depth-1 nesting): a parent workflow runs a DISCOVERED child workflow
 // inline via ctx.workflow under the SAME run (no second run row). The child's
 // logs are prefixed (`child: ...`) and its result flows back to the parent.
@@ -5798,6 +5815,55 @@ export async function run(args, ctx) {
       expect(result.exitCode).not.toBe(0)
       // It resolved promptly: well before the command's natural 5s duration.
       expect(result.elapsed).toBeLessThan(3000)
+    }),
+  )
+
+  // Finding 5: a ctx.shell with NO timeout must have its OS child reaped on
+  // cancel — closing the run scope interrupts the Effect fiber, and the fix wires
+  // that interrupt to the AbortController so Process.run SIGTERMs the child. The
+  // shell writes a "running" marker immediately (so we can synchronize on the
+  // child being live) then sleeps 3s then writes a "leaked" marker. We cancel once
+  // the running marker exists and assert: the run is cancelled AND the leaked
+  // marker is NEVER written within a window comfortably past the 3s sleep — i.e.
+  // the orphaned child did not survive the cancel and fire the second touch.
+  it.instance("ctx.shell with no timeout has its OS child killed on cancel (no process leak)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_LEAK_FIXTURE, SHELL_LEAK_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const running = path.join(test.directory, "shell-running.marker")
+      const leaked = path.join(test.directory, "shell-leaked.marker")
+
+      const run = yield* workflow.start({ name: SHELL_LEAK_FIXTURE, args: { running, leaked } })
+
+      // Wait until the shell child is actually live (it just wrote `running`).
+      yield* pollWithTimeout(
+        Effect.promise(() =>
+          fs
+            .stat(running)
+            .then(() => true as const)
+            .catch(() => undefined),
+        ),
+        "shell child never started (running marker not written)",
+      )
+
+      // Cancel mid-sleep: the scope close interrupts the shell fiber, which (with
+      // the fix) aborts the controller and SIGTERMs the OS child.
+      yield* workflow.cancel(run.id)
+      const after = yield* workflow.get(run.id)
+      expect(after?.status).toBe("cancelled")
+
+      // Give the child MORE than its 3s sleep to (incorrectly) fire the second
+      // touch if it were leaked. With the child killed, the leaked marker never
+      // appears; if the process leaked, it would appear ~3s after the touch ran.
+      yield* Effect.sleep("4 seconds")
+      const leakedExists = yield* Effect.promise(() =>
+        fs
+          .stat(leaked)
+          .then(() => true)
+          .catch(() => false),
+      )
+      expect(leakedExists).toBe(false)
     }),
   )
 

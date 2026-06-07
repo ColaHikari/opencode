@@ -2760,24 +2760,33 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             const cfg = yield* config.get()
             const sh = Shell.preferred(cfg.shell)
+            // Finding 5: Process.run only kills the child when its `abort` signal
+            // fires. Closing the run scope (cancel/pause/remove) INTERRUPTS this
+            // Effect fiber, but `Effect.tryPromise` does NOT abort the underlying
+            // promise — so without wiring the interrupt to an AbortController, a
+            // no-timeout shell (e.g. `sleep 600`) was orphaned and kept running
+            // after the run was cancelled/paused. ALWAYS create the controller and
+            // fire it on BOTH (a) the optional wall-clock timeout AND (b) fiber
+            // interruption (the scope-close path), so a cancel/pause actually
+            // SIGTERMs/SIGKILLs the OS child. The controller is created OUTSIDE
+            // tryPromise so `Effect.onInterrupt` can reach it.
+            const controller = new AbortController()
             const result = yield* Effect.tryPromise(() => {
-              // Real wall-clock timeout: Process.run only uses `timeout` as the
-              // SIGKILL grace AFTER an abort fires, so a hung command needs an
-              // explicit AbortController to be killed at all. When `opts.timeout`
-              // is set we arm a timer that aborts the signal; Process.run then
-              // SIGTERMs the child (and SIGKILLs it after its own default grace),
-              // and `nothrow` resolves the killed run with a non-zero exitCode
-              // (1) instead of hanging or throwing. The timer is always cleared.
-              const controller = opts?.timeout ? new AbortController() : undefined
-              const timer = controller ? setTimeout(() => controller.abort(), opts!.timeout) : undefined
+              const timer = opts?.timeout ? setTimeout(() => controller.abort(), opts.timeout) : undefined
               return Process.run([sh, ...Shell.args(sh, command, cwd)], {
                 cwd,
                 nothrow: true,
-                abort: controller?.signal,
+                abort: controller.signal,
               }).finally(() => {
                 if (timer) clearTimeout(timer)
               })
-            }).pipe(Effect.orDie)
+            }).pipe(
+              // Reap the OS child on fiber interruption: aborting the controller
+              // makes Process.run SIGTERM the child (then SIGKILL after its grace),
+              // so a scope-close cancel/pause no longer leaks the process.
+              Effect.onInterrupt(() => Effect.sync(() => controller.abort())),
+              Effect.orDie,
+            )
             const output = Buffer.concat([result.stdout, result.stderr]).toString()
             return { output, exitCode: result.code }
           }),
