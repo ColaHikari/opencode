@@ -2062,6 +2062,13 @@ export const layer = Layer.effect(
               : agentInput.model
                 ? Provider.parseModel(agentInput.model)
                 : selected.model
+            // OTel: enrich the enclosing `workflow.agent` span with the RESOLVED
+            // agent name and model now that both are known (the boundary above set
+            // only the static/requested attributes). Purely observational.
+            yield* Effect.annotateCurrentSpan({
+              "workflow.agent.name": selected.name,
+              ...(modelInfo ? { "workflow.agent.model": `${modelInfo.providerID}/${modelInfo.modelID}` } : {}),
+            })
             // Per-step model reasoning variant (e.g. "max"). opencode keeps the
             // variant SEPARATE from the model ref (model ids legitimately contain
             // slashes, so it is never peeled from the model string here — that is
@@ -2448,6 +2455,25 @@ export const layer = Layer.effect(
             // step never leaks a permit. A journal replay returns early and so
             // holds the permit only momentarily.
             active.agentSemaphore.withPermits(1),
+            // OTel: each ctx.agent dispatch gets a `workflow.agent` span (the
+            // engine had no agent-level spans before). Static attributes are set
+            // here at construction time; the RESOLVED agent name and model are
+            // only known once `selected`/`modelInfo` are computed inside the gen,
+            // so they are added there via `Effect.annotateCurrentSpan`. Dotted
+            // lowercase keys match the repo convention (tool.name/session.id …);
+            // the span is purely observational and changes no behavior.
+            Effect.withSpan("workflow.agent", {
+              attributes: {
+                "workflow.run_id": active.run.id,
+                "workflow.agent.id": node.id,
+                "workflow.phase": node.phase ?? undefined,
+                // Requested (pre-resolution) agent/model, useful even on a step
+                // that fails before resolution. The resolved values are annotated
+                // onto this same span once known (see the gen body above).
+                ...(agentInput.agent ? { "workflow.agent.requested": agentInput.agent } : {}),
+                ...(agentInput.model ? { "workflow.agent.model_requested": agentInput.model } : {}),
+              },
+            }),
           ),
         ).then(
           (result) => {
@@ -2719,6 +2745,15 @@ export const layer = Layer.effect(
             ),
         }),
         Effect.asVoid,
+        // OTel: wrap the whole run body in a `workflow.run` span so HTTP/CI/server
+        // operators get observability for a run (the engine had ZERO spans before;
+        // only the generic Tool.execute span wrapped a subagent's tool calls). The
+        // span is purely observational — it sits AFTER matchCauseEffect/asVoid so it
+        // never alters the run's success/cancel/fail mapping. Attribute style mirrors
+        // the repo convention (dotted lowercase keys, e.g. tool.name/session.id).
+        Effect.withSpan("workflow.run", {
+          attributes: { "workflow.run_id": id, "workflow.name": active.run.workflow },
+        }),
         // Fork lazily (no `startImmediately`) so this returns the fiber handle
         // immediately. With `startImmediately` the runtime drives the run body
         // synchronously into the first agent step, blocking `start` and leaving

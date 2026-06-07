@@ -5049,4 +5049,31 @@ export async function run() { return { from: "global" } }
       expect(done.current_phase).toBe("plan")
     }),
   )
+
+  // Task 14: a workflow run now emits OTel spans — `workflow.run` for the run
+  // body and `workflow.agent` for each ctx.agent dispatch. The test stack has NO
+  // span-collection seam (no in-memory tracer/exporter is wired into the engine's
+  // layer), so this is a SMOKE test: it proves the spans are transparent (a full
+  // 1-agent run still completes, the agent step succeeds, and the prompt was
+  // dispatched exactly once). The spans themselves are exercised by the engine's
+  // default no-op tracer; behavioral equivalence is the real gate.
+  it.instance("a 1-agent run still completes with run/agent spans wrapping it (transparent)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SINGLE_AGENT_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("single-agent workflow did not finish")))
+
+      // The wrapping spans changed nothing: the run completes and its single agent
+      // step ran to completion against exactly one dispatched prompt.
+      expect(done.status).toBe("completed")
+      expect(done.agents.length).toBe(1)
+      expect(done.agents[0]?.status).toBe("completed")
+      expect(inputs.length).toBe(1)
+    }),
+  )
 })
