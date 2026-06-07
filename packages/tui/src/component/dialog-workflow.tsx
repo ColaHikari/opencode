@@ -24,6 +24,7 @@ import {
   formatShortElapsed,
   phaseIcon,
   phaseStatus,
+  questionBadge,
   reanchorSelection,
   sanitizeWorkflowFilename,
   saveTargets,
@@ -31,7 +32,8 @@ import {
   statusIcon,
   timestamp,
 } from "./dialog-workflow-helpers"
-import { asWorkflowRunEvent } from "./dialog-workflow-client"
+import { asWorkflowRunEvent, type WorkflowRunWithQuestion } from "./dialog-workflow-client"
+import { DialogWorkflowQuestion } from "./dialog-workflow-question"
 
 // Re-exported so existing pure derivations keep a single import surface.
 export { phaseStatus } from "./dialog-workflow-helpers"
@@ -347,6 +349,7 @@ function scrollIndexIntoView(scroll: ScrollBoxRenderable | undefined, index: num
 
 export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string; openAgentID?: string }) {
   const dialog = useDialog()
+  const route = useRoute()
   const sdk = useSDK()
   const events = useEvent()
   const toast = useToast()
@@ -504,6 +507,34 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     }
   }
 
+  // Spec §5.2 (4): answer the selected run's pending question. A run carries
+  // `pending_question` on the wire (the SDK type omits it; read via the shim).
+  // Live runs resolve in place; a parked (paused) run spawns a NEW resume run,
+  // and we then follow that new id into its detail view. The dialog replaces the
+  // dashboard, so we re-open the dashboard whichever way it resolves.
+  async function answerSelected() {
+    const run = selected() as WorkflowRunWithQuestion | undefined
+    if (!run || !run.pending_question) return
+    const sessionID = route.data.type === "session" ? route.data.sessionID : undefined
+    const resumeRunID = await DialogWorkflowQuestion.show(dialog, { run, sessionID })
+    if (resumeRunID) {
+      // Follow the freshly-spawned resume run into its detail view. Fetch it once
+      // so the detail view has an `initial` to render before its own poll/event
+      // refetch arrives; fall back to the dashboard if the run is not retrievable.
+      const resumed = await sdk.client.workflow.get({ id: resumeRunID }).then((r) => r.data, () => undefined)
+      if (resumed) {
+        dialog.replace(
+          () => <DialogWorkflowRun id={resumeRunID} initial={resumed} workflows={workflows()} />,
+          undefined,
+          { notifyClose: false },
+        )
+        return
+      }
+    }
+    dialog.replace(() => <DialogWorkflow />, undefined, { notifyClose: false })
+    void refetch()
+  }
+
   // Fund 10 (behavior change): deleting a run from history is irreversible, so it
   // now asks for confirmation first. DialogConfirm.show replaces the dashboard, so
   // the dashboard is re-opened afterwards whichever way the prompt resolves.
@@ -545,6 +576,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       { key: "return", desc: "View workflow details", group: "Workflow", cmd: openSelected },
       { key: "r", desc: "Refresh workflows", group: "Workflow", cmd: () => void refetchWorkflows() },
       { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancelSelected },
+      { key: "a", desc: "Answer pending question", group: "Workflow", cmd: () => void answerSelected() },
       { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: pauseOrResumeSelected },
       { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => void deleteSelected() },
       { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => dialog.clear() },
@@ -618,7 +650,10 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                 <text fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
                   {dashboardRowText(
                     {
-                      marker: active() ? "›" : "",
+                      // Spec §5.2 (4): a run waiting on an answer (running/parked
+                      // with a pending question) shows the ⏳ badge; otherwise the
+                      // selection arrow when active. The marker cell is 2 wide.
+                      marker: questionBadge(run as WorkflowRunWithQuestion) || (active() ? "›" : ""),
                       id: shortRunID(run),
                       workflow: run.workflow,
                       input: workflowInput(run),
@@ -643,7 +678,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
           Spent this month: {formatCost(monthlySpend())} | Active Background Workers: {activeWorkers()}
         </text>
         <text fg={theme.textMuted}>
-          [Enter] View Details | [R] Refresh | [X] Kill | [D] Delete history | [Esc]/[B] Exit
+          [Enter] View Details | [A] Answer | [R] Refresh | [X] Kill | [D] Delete history | [Esc]/[B] Exit
         </text>
       </box>
     </box>
