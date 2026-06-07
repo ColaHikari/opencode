@@ -25,6 +25,7 @@ import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 import {
   detectUltracodeKeyword,
+  formatParkedQuestion,
   parseHeadlessWorkflowArgs,
   RUN_ULTRACODE_DIRECTIVE,
   stripUltracodeKeyword,
@@ -626,11 +627,18 @@ export const RunCommand = effectCmd({
 
       // Headless --workflow path (Spec §5.2 (5), Delta 7): orthogonal to sessions.
       // Start the workflow via the SDK (start/get ARE in the generated client;
-      // only `answer` is not — Delta 2), poll to a terminal status (robust in a
+      // only `answer` is not — Delta 2), poll to a STOP status (robust in a
       // short-lived headless process; the run.* events are not in the SDK either),
       // print result/error, and exit with workflowExitCode. No permissionSessionID
-      // (no interactive session); a parked question would be denied by the headless
-      // ruleset just like the prompt path.
+      // (no interactive session).
+      //
+      // Finding 6: `paused` is a NON-terminal status the engine parks to when a
+      // `ctx.question` step times out waiting for an answer. Headless mode has no
+      // interactive answerer, so polling for ONLY the terminal statuses would spin
+      // forever on such a run. We therefore stop polling on `paused` too and, when
+      // it carries a pending_question, print the question + the exact (resumable)
+      // answer command and exit with the distinct parked code (2) — we never
+      // auto-answer.
       async function runWorkflow(sdk: OpencodeClient) {
         const wfArgs = parseHeadlessWorkflowArgs([...args.message, ...(args["--"] || [])])
         const started = await sdk.workflow
@@ -642,12 +650,41 @@ export const RunCommand = effectCmd({
           process.exit(1)
         }
         const id = started.data.id
-        const terminal = new Set(["completed", "failed", "cancelled", "interrupted"])
+        // `paused` is a stop status here even though the engine treats it as
+        // non-terminal: a headless run can never be answered, so we must not poll
+        // past it (Finding 6).
+        const stop = new Set(["completed", "failed", "cancelled", "interrupted", "paused"])
         let final = started.data
-        while (!terminal.has(final.status)) {
+        while (!stop.has(final.status)) {
           await Bun.sleep(500)
           const polled = await sdk.workflow.get({ id }).catch(() => undefined)
           if (polled?.data) final = polled.data
+        }
+        // A run that parked on an unanswerable question gets its own guidance +
+        // exit code; everything else falls through to the normal result print.
+        if (final.status === "paused" && final.pending_question) {
+          const guidance = formatParkedQuestion({
+            id,
+            question: final.pending_question.question,
+            options: final.pending_question.options,
+          })
+          if (args.format === "json") {
+            process.stdout.write(
+              JSON.stringify({
+                type: "workflow_parked",
+                timestamp: Date.now(),
+                id,
+                workflow: final.workflow,
+                status: final.status,
+                question: final.pending_question.question,
+                options: final.pending_question.options,
+              }) + EOL,
+            )
+          } else {
+            UI.error(guidance)
+          }
+          process.exitCode = workflowExitCode(final.status)
+          return
         }
         if (args.format === "json") {
           process.stdout.write(
