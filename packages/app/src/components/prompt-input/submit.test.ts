@@ -26,6 +26,15 @@ const promptParts: Array<Array<{ type: string; text?: string }>> = []
 let dashboardOpened = 0
 let workflowListData: Array<{ name: string; valid?: boolean; meta: { name: string; arguments?: any } }> = []
 let workflowStartSessionId: string | undefined
+// Approval gate test seams: the configured approval mode + the persisted
+// approved list (read off sync.data.config.workflows), the canned reply the
+// mocked approval dialog returns, how many times the dialog was shown, and the
+// config writes the gate makes on "Yes, always".
+let workflowApprovalMode: "always" | "first-run" | "never" | undefined
+let workflowApprovedList: string[] = []
+let workflowApprovalReply: "once" | "always" | "cancel" = "once"
+let workflowApprovalShown = 0
+const configUpdates: Array<Record<string, unknown>> = []
 
 let params: { id?: string } = {}
 let selected = "/repo/worktree-a"
@@ -70,6 +79,12 @@ const clientFor = (directory: string) => {
           permission: input.workflowStartPayload?.permissionSessionID,
         })
         return { data: { id: "run-1", session_id: workflowStartSessionId } }
+      },
+    },
+    config: {
+      update: async (input: { directory?: string; config?: Record<string, unknown> }) => {
+        configUpdates.push(input.config ?? {})
+        return { data: {} }
       },
     },
     worktree: {
@@ -170,7 +185,13 @@ beforeAll(async () => {
     useSync: () => ({
       data: {
         command: [],
-        config: { workflows: { ultracode_keyword: keywordEnabled } },
+        config: {
+          workflows: {
+            ultracode_keyword: keywordEnabled,
+            approval: workflowApprovalMode,
+            approved: workflowApprovedList,
+          },
+        },
       },
       session: {
         optimistic: {
@@ -228,6 +249,23 @@ beforeAll(async () => {
     }),
   }))
 
+  mock.module("@opencode-ai/ui/context/dialog", () => ({
+    useDialog: () => ({
+      show: () => undefined,
+      close: () => undefined,
+    }),
+  }))
+
+  // The approval dialog is exercised in its own pure-helper + component context;
+  // here we stub it to return the canned reply so the gate's branching (start /
+  // cancel / persist consent) is what's under test.
+  mock.module("@/components/dialog-workflow-approval", () => ({
+    showWorkflowApproval: async () => {
+      workflowApprovalShown += 1
+      return workflowApprovalReply
+    },
+  }))
+
   const mod = await import("./submit")
   createPromptSubmit = mod.createPromptSubmit
 })
@@ -247,6 +285,13 @@ beforeEach(() => {
   dashboardOpened = 0
   workflowListData = []
   workflowStartSessionId = undefined
+  // Default to approval:"never" so the existing direct-start tests are unchanged;
+  // the gate tests opt into first-run/always explicitly.
+  workflowApprovalMode = "never"
+  workflowApprovedList = []
+  workflowApprovalReply = "once"
+  workflowApprovalShown = 0
+  configUpdates.length = 0
   selected = "/repo/worktree-a"
   variant = undefined
   ultracodeSession = false
@@ -469,6 +514,89 @@ describe("workflow command routing on submit", () => {
       permission: "session-1",
     })
     expect(promptParts).toEqual([])
+    // approval:"never" (the test default) never opens the dialog.
+    expect(workflowApprovalShown).toBe(0)
+  })
+
+  test("first-run gate asks, then starts on Yes (without persisting consent)", async () => {
+    params = { id: "session-1" }
+    workflowApprovalMode = "first-run"
+    workflowApprovalReply = "once"
+    workflowListData = [{ name: "review", valid: true, meta: { name: "review" } }]
+    promptValue = [{ type: "text", content: "/workflow review", start: 0, end: 16 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowApprovalShown).toBe(1)
+    expect(workflowStarts).toHaveLength(1)
+    expect(workflowStarts[0]).toMatchObject({ name: "review", permission: "session-1" })
+    // "Yes" (once) never writes consent.
+    expect(configUpdates).toEqual([])
+  })
+
+  test("first-run gate aborts the start on No", async () => {
+    params = { id: "session-1" }
+    workflowApprovalMode = "first-run"
+    workflowApprovalReply = "cancel"
+    workflowListData = [{ name: "review", valid: true, meta: { name: "review" } }]
+    promptValue = [{ type: "text", content: "/workflow review", start: 0, end: 16 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowApprovalShown).toBe(1)
+    expect(workflowStarts).toEqual([])
+  })
+
+  test("Yes-always persists consent to workflows.approved and starts", async () => {
+    params = { id: "session-1" }
+    workflowApprovalMode = "first-run"
+    workflowApprovalReply = "always"
+    workflowApprovedList = ["other"]
+    workflowListData = [{ name: "review", valid: true, meta: { name: "review" } }]
+    promptValue = [{ type: "text", content: "/workflow review", start: 0, end: 16 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowApprovalShown).toBe(1)
+    expect(workflowStarts).toHaveLength(1)
+    // The approved list is rewritten whole with the appended name.
+    expect(configUpdates).toEqual([{ workflows: { approved: ["other", "review"] } }])
+  })
+
+  test("an already-approved workflow under first-run starts without asking", async () => {
+    params = { id: "session-1" }
+    workflowApprovalMode = "first-run"
+    workflowApprovedList = ["review"]
+    workflowListData = [{ name: "review", valid: true, meta: { name: "review" } }]
+    promptValue = [{ type: "text", content: "/workflow review", start: 0, end: 16 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowApprovalShown).toBe(0)
+    expect(workflowStarts).toHaveLength(1)
+  })
+
+  test("an unknown workflow name skips the dialog and lets the engine report not-found", async () => {
+    params = { id: "session-1" }
+    workflowApprovalMode = "first-run"
+    workflowListData = []
+    promptValue = [{ type: "text", content: "/workflow nope", start: 0, end: 14 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowApprovalShown).toBe(0)
+    // No info to gate, so the start still fires (the engine surfaces not-found).
+    expect(workflowStarts).toHaveLength(1)
   })
 })
 

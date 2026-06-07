@@ -21,6 +21,15 @@ import { formatServerError } from "@/utils/server-errors"
 import { ScopedKey } from "@/utils/server-scope"
 import { buildUltracodeParts } from "./ultracode"
 import { parseWorkflowArgs, parseWorkflowCommand, type WorkflowArgDeclaration } from "./workflow-command"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
+import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
+import {
+  approvalDecision,
+  isApproved,
+  nextApprovedList,
+  rememberSessionApproval,
+} from "@/components/dialog-workflow-approval-helpers"
+import { showWorkflowApproval } from "@/components/dialog-workflow-approval"
 
 type PendingPrompt = {
   abort: AbortController
@@ -210,6 +219,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   const navigate = useNavigate()
   const sdk = useSDK()
   const sync = useSync()
+  const dialog = useDialog()
   const serverSync = useServerSync()
   const local = useLocal()
   const permission = usePermission()
@@ -448,8 +458,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     // `/workflow <name>` → start the run. Resolve the workflow's declared
     // arguments for type-aware coercion, then call workflow.start with the
-    // current session as the permission context (mirror TUI index.tsx:1202-1222).
-    // v1 starts directly (== approval:"never"); the approval gate is a follow-up.
+    // current session as the permission context (mirror TUI index.tsx:1202-1264).
+    // An interactive start is gated behind the approval dialog (parity with the
+    // TUI): config.workflows.approval ∈ always/first-run(default)/never decides
+    // whether to ask; "Yes, always" persists consent to workflows.approved.
     // Runs BEFORE the queue check so a workflow start is never deferred into the
     // session.command queue path.
     if (workflowCommand?.type === "start") {
@@ -460,14 +472,45 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           const workflows = await client.workflow
             .list({ directory: sessionDirectory })
             .then((response) => response.data ?? [])
-            .catch(() => [])
+            .catch(() => [] as WorkflowInfo[])
           const info = workflows.find((workflow) => workflow.name === name)
           const declaration = (info?.meta.arguments ?? {}) as WorkflowArgDeclaration
+          const parsedArgs = parseWorkflowArgs(args, declaration)
+
+          // Approval gate (parity with the TUI start gate). An unknown name has no
+          // info, so it cannot render a meaningful dialog — let the start surface
+          // the engine's "not found" rather than asking to approve a non-existent
+          // workflow. A known workflow follows the configured approval mode.
+          const approvedList = sync.data.config?.workflows?.approved ?? []
+          const decision = !info
+            ? "start"
+            : approvalDecision({
+                mode: sync.data.config?.workflows?.approval,
+                alreadyApproved: isApproved(name, approvedList),
+              })
+          if (decision === "ask") {
+            const reply = await showWorkflowApproval(dialog, { info: info!, args: parsedArgs })
+            if (reply === "cancel") {
+              showToast({ title: language.t("toast.workflow.approval.cancelled.title", { name }) })
+              return
+            }
+            if (reply === "always") {
+              // Remember in-session first so a second start this session never
+              // re-asks even before the persisted config re-syncs.
+              rememberSessionApproval(name)
+              const next = nextApprovedList(name, approvedList)
+              if (next)
+                await client.config
+                  .update({ directory: sessionDirectory, config: { workflows: { approved: next } } })
+                  .catch(() => {})
+            }
+          }
+
           const result = await client.workflow.start({
             name,
             directory: sessionDirectory,
             workflowStartPayload: {
-              args: parseWorkflowArgs(args, declaration),
+              args: parsedArgs,
               permissionSessionID: session.id,
             },
           })
