@@ -1,4 +1,5 @@
-import type { PendingQuestion, WorkflowRunWithQuestion } from "./dialog-workflow-client"
+import type { WorkflowRun } from "@opencode-ai/sdk/v2"
+import type { PendingQuestion } from "./dialog-workflow-client"
 
 // One selectable entry in the question dialog: either a declared option or the
 // trailing free-text sentinel (always last, so a question with no declared
@@ -29,6 +30,6 @@ export function selectedAnswer(options: QuestionOption[], index: number, freetex
 // id) from a parked-resume answer (the run was paused/parked and answering it
 // spawns a NEW resume run with a different id; Phase-1 contract). The caller
 // follows the new id into its detail view when this is true.
-export function isResumeAnswer(sourceID: string, returnedRun: WorkflowRunWithQuestion): boolean {
+export function isResumeAnswer(sourceID: string, returnedRun: WorkflowRun): boolean {
   return returnedRun.id !== sourceID
 }

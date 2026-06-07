@@ -50,8 +50,8 @@ function update(version: string): Event {
 }
 
 function workflowFinished(id: string): Event {
-  // Wire shape from WORKFLOWSVC EventV2.define; not in the SDK Event union, so
-  // cast through unknown exactly like production code does.
+  // `workflow.run.finished` is now a generated Event union member, so this is a
+  // genuinely typed event (no cast).
   return {
     id: `evt_wf_${id}`,
     type: "workflow.run.finished",
@@ -59,11 +59,13 @@ function workflowFinished(id: string): Event {
       id,
       workflow: "demo",
       status: "completed",
+      current_phase: "",
       directory,
       agents: { total: 1, running: 0, failed: 0 },
       pending_question: false,
+      error: "",
     },
-  } as unknown as Event
+  }
 }
 
 async function mount() {

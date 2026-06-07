@@ -277,9 +277,11 @@ describe("mergeRunEvent (event-driven dashboard refresh)", () => {
         id: "job_a",
         workflow: "demo",
         status: "completed",
+        current_phase: "",
         directory: "/ws",
         agents: { total: 1, running: 0, failed: 0 },
         pending_question: false,
+        error: "",
       },
     })
     expect(next.find((r) => r.id === "job_a")!.status).toBe("completed")
@@ -295,9 +297,11 @@ describe("mergeRunEvent (event-driven dashboard refresh)", () => {
         id: "job_new",
         workflow: "demo",
         status: "running",
+        current_phase: "",
         directory: "/ws",
         agents: { total: 0, running: 0, failed: 0 },
         pending_question: false,
+        error: "",
       },
     })
     expect(next).toBe(runs)
@@ -306,13 +310,13 @@ describe("mergeRunEvent (event-driven dashboard refresh)", () => {
 
 describe("questionBadge (Dashboard ⏳ for waiting/parked runs)", () => {
   test("a running run with pending_question gets the waiting badge", () => {
-    expect(questionBadge({ status: "running", pending_question: { question: "q?", asked_at: 1 } } as never)).toBe("⏳")
+    expect(questionBadge(makeRun({ status: "running", pending_question: { question: "q?", asked_at: 1 } }))).toBe("⏳")
   })
   test("a paused run with pending_question gets the waiting badge (parked)", () => {
-    expect(questionBadge({ status: "paused", pending_question: { question: "q?", asked_at: 1 } } as never)).toBe("⏳")
+    expect(questionBadge(makeRun({ status: "paused", pending_question: { question: "q?", asked_at: 1 } }))).toBe("⏳")
   })
   test("a run without a pending question gets no badge", () => {
-    expect(questionBadge({ status: "running" } as never)).toBe("")
+    expect(questionBadge(makeRun({ status: "running" }))).toBe("")
   })
 })
 

@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test"
+import type { WorkflowRun } from "@opencode-ai/sdk/v2"
 import {
   questionOptions,
   selectedAnswer,
   isResumeAnswer,
 } from "../../../../src/component/dialog-workflow-question-helpers"
+
+function run(id: string): WorkflowRun {
+  return { id, workflow: "demo", status: "running", started_at: 1, logs: [], agents: [] }
+}
 
 describe("questionOptions", () => {
   test("declared options plus a free-text sentinel", () => {
@@ -33,9 +38,9 @@ describe("selectedAnswer", () => {
 
 describe("isResumeAnswer", () => {
   test("answering a parked (paused) run yields a NEW run id => resume to follow", () => {
-    expect(isResumeAnswer("job_src", { id: "job_new", status: "running" } as never)).toBe(true)
+    expect(isResumeAnswer("job_src", run("job_new"))).toBe(true)
   })
   test("answering a live run resolves in place (same id) => not a resume", () => {
-    expect(isResumeAnswer("job_src", { id: "job_src", status: "running" } as never)).toBe(false)
+    expect(isResumeAnswer("job_src", run("job_src"))).toBe(false)
   })
 })

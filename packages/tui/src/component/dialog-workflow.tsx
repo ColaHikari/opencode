@@ -32,7 +32,7 @@ import {
   statusIcon,
   timestamp,
 } from "./dialog-workflow-helpers"
-import { asWorkflowRunEvent, type WorkflowRunWithQuestion } from "./dialog-workflow-client"
+import { asWorkflowRunEvent } from "./dialog-workflow-client"
 import { DialogWorkflowQuestion } from "./dialog-workflow-question"
 
 // Re-exported so existing pure derivations keep a single import surface.
@@ -511,13 +511,13 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     }
   }
 
-  // Spec §5.2 (4): answer the selected run's pending question. A run carries
-  // `pending_question` on the wire (the SDK type omits it; read via the shim).
-  // Live runs resolve in place; a parked (paused) run spawns a NEW resume run,
-  // and we then follow that new id into its detail view. The dialog replaces the
-  // dashboard, so we re-open the dashboard whichever way it resolves.
+  // Spec §5.2 (4): answer the selected run's pending question, read straight off
+  // the generated `WorkflowRun.pending_question`. Live runs resolve in place; a
+  // parked (paused) run spawns a NEW resume run, and we then follow that new id
+  // into its detail view. The dialog replaces the dashboard, so we re-open the
+  // dashboard whichever way it resolves.
   async function answerSelected() {
-    const run = selected() as WorkflowRunWithQuestion | undefined
+    const run = selected()
     if (!run || !run.pending_question) return
     const sessionID = route.data.type === "session" ? route.data.sessionID : undefined
     const resumeRunID = await DialogWorkflowQuestion.show(dialog, { run, sessionID })
@@ -660,7 +660,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                       // Spec §5.2 (4): a run waiting on an answer (running/parked
                       // with a pending question) shows the ⏳ badge; otherwise the
                       // selection arrow when active. The marker cell is 2 wide.
-                      marker: questionBadge(run as WorkflowRunWithQuestion) || (active() ? "›" : ""),
+                      marker: questionBadge(run) || (active() ? "›" : ""),
                       id: shortRunID(run),
                       workflow: run.workflow,
                       input: workflowInput(run),

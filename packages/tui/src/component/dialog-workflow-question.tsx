@@ -1,4 +1,5 @@
 import { TextAttributes, type TextareaRenderable } from "@opentui/core"
+import type { WorkflowRun } from "@opencode-ai/sdk/v2"
 import { createMemo, createSignal, For, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useSDK } from "../context/sdk"
@@ -6,7 +7,7 @@ import { selectedForeground, useTheme } from "../context/theme"
 import { useDialog, type DialogContext } from "../ui/dialog"
 import { useToast } from "../ui/toast"
 import { useBindings } from "../keymap"
-import { answerWorkflowRun, workflowClientFromSdk, type WorkflowRunWithQuestion } from "./dialog-workflow-client"
+import { answerWorkflowRun } from "./dialog-workflow-client"
 import { isResumeAnswer, questionOptions, selectedAnswer } from "./dialog-workflow-question-helpers"
 
 // Thin Solid component for the question dialog (Spec §5.2 (4)): renders the
@@ -17,7 +18,7 @@ import { isResumeAnswer, questionOptions, selectedAnswer } from "./dialog-workfl
 // `onClose(resumeRunID?)` is called with the NEW run id when answering a parked
 // run spawned a resume run, so the caller can follow it into its detail view.
 export function DialogWorkflowQuestion(props: {
-  run: WorkflowRunWithQuestion
+  run: WorkflowRun
   sessionID?: string
   onClose: (resumeRunID?: string) => void
 }) {
@@ -46,7 +47,7 @@ export function DialogWorkflowQuestion(props: {
       return
     }
     setStore("submitting", true)
-    const result = await answerWorkflowRun(workflowClientFromSdk(sdk), {
+    const result = await answerWorkflowRun(sdk, {
       id: props.run.id,
       answer,
       permissionSessionID: props.sessionID,
@@ -132,7 +133,7 @@ export function DialogWorkflowQuestion(props: {
 // Promise wrapper mirroring DialogConfirm.show / DialogWorkflowApproval.show.
 // Resolves to the resume run id when answering parked a run produced one, or
 // undefined (answered in place / cancelled / failed).
-DialogWorkflowQuestion.show = (dialog: DialogContext, input: { run: WorkflowRunWithQuestion; sessionID?: string }) => {
+DialogWorkflowQuestion.show = (dialog: DialogContext, input: { run: WorkflowRun; sessionID?: string }) => {
   return new Promise<string | undefined>((resolve) => {
     dialog.replace(
       () => (

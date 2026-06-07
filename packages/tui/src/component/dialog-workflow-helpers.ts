@@ -1,5 +1,5 @@
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
-import type { WorkflowRunEvent, WorkflowRunWithQuestion } from "./dialog-workflow-client"
+import type { WorkflowRunEvent } from "./dialog-workflow-client"
 import path from "path"
 
 // The engine persists timestamps as numbers, but the SDK schema widens them to
@@ -147,9 +147,8 @@ export function mergeRunEvent(runs: WorkflowRun[], event: WorkflowRunEvent): Wor
 // Dashboard waiting badge (Spec §5.2 (4)): a run that has asked a question and is
 // still running or parked (paused) shows the hourglass so the operator can spot
 // it needs an answer. Any other state (no pending question, or terminal) shows no
-// badge. Reads pending_question via the WorkflowRunWithQuestion shim (the SDK type
-// omits it; Delta 3).
-export function questionBadge(run: WorkflowRunWithQuestion): "⏳" | "" {
+// badge. Reads `pending_question` directly off the generated WorkflowRun type.
+export function questionBadge(run: WorkflowRun): "⏳" | "" {
   if (!run.pending_question) return ""
   if (run.status === "running" || run.status === "paused") return "⏳"
   return ""
