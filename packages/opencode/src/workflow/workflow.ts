@@ -1265,6 +1265,17 @@ const DEFAULT_QUESTION_TIMEOUT_MS = 10 * 60 * 1000
 const TEMP_FILE_RE = /^\.(.+)\.(\d+)\.[0-9a-f]+\.(mts|mjs)$/
 const TEMP_FILE_MAX_AGE_MS = 60 * 60 * 1000
 
+// Finding 3: per-step worktree isolation mints a private base dir via
+// `fs.mkdtemp(os.tmpdir()/oc-wf-…)`. The run-scope finalizer removes it on a
+// normal finish/cancel, but a SIGKILL/crash mid-run never fires that finalizer,
+// leaking the checked-out repo content (and any secrets the subagent wrote) into
+// tmp indefinitely. A best-effort startup sweep (mirroring sweepTempFiles)
+// reclaims stale `oc-wf-*` worktrees older than the cutoff so a crashed process
+// does not leave repo content behind. The prefix is shared with the creation site
+// so the sweep matches exactly the dirs the engine mints.
+const WORKTREE_PREFIX = "oc-wf-"
+const WORKTREE_MAX_AGE_MS = 60 * 60 * 1000
+
 function tempFileName(file: string): string {
   const ext = path.extname(file)
   return `.${path.basename(file, ext)}.${Date.now()}.${Math.random().toString(16).slice(2)}${ext === ".js" ? ".mjs" : ".mts"}`
@@ -1382,6 +1393,36 @@ async function sweepTempFiles(workflowsDir: string) {
         if (stat && stat.mtimeMs < cutoff) await fs.rm(full, { force: true }).catch(() => undefined)
       }),
   )
+}
+
+// Finding 3: best-effort startup sweep of orphaned per-step worktree base dirs
+// (`<tmp>/oc-wf-*`) left behind by a SIGKILLed/crashed run whose run-scope remove
+// finalizer never fired. Only dirs older than WORKTREE_MAX_AGE_MS are touched so a
+// worktree of a CURRENTLY running sibling process is never removed out from under
+// it. Each stale dir is detached as a git worktree first (so the source repo's
+// worktree list does not keep a dangling registration) and then removed, and a
+// final `git worktree prune` reclaims any other stale registrations. Best-effort:
+// every error (missing dir, race, permission, non-git, locked tree) is swallowed.
+async function sweepWorktrees(directory: string) {
+  const tmp = os.tmpdir()
+  const names = await fs.readdir(tmp).catch(() => [] as string[])
+  const cutoff = Date.now() - WORKTREE_MAX_AGE_MS
+  await Promise.all(
+    names
+      .filter((name) => name.startsWith(WORKTREE_PREFIX))
+      .map(async (name) => {
+        const full = path.join(tmp, name)
+        const stat = await fs.stat(full).catch(() => undefined)
+        if (!stat || !stat.isDirectory() || stat.mtimeMs >= cutoff) return
+        // Detach the registration from the owning repo (best-effort), then remove
+        // the leaked dir. `remove --force` covers the common case; the explicit rm
+        // is the backstop for a dir git no longer recognizes as a worktree.
+        Bun.spawnSync(["git", "worktree", "remove", "--force", full], { cwd: directory })
+        await fs.rm(full, { recursive: true, force: true }).catch(() => undefined)
+      }),
+  )
+  // Reclaim any dangling worktree registrations whose dir is already gone.
+  Bun.spawnSync(["git", "worktree", "prune"], { cwd: directory })
 }
 
 // Fund 2: a discovered file must really live inside its workflows directory.
@@ -1690,6 +1731,13 @@ export const layer = Layer.effect(
         // — a sibling directory's live run shares the global DB and must be left
         // running.
         yield* sweepOrphans(db, new Set(), yield* Clock.currentTimeMillis, ctx.directory)
+        // Finding 3: reclaim stale per-step worktree base dirs (`<tmp>/oc-wf-*`)
+        // leaked by a crashed run whose remove finalizer never fired, so a
+        // SIGKILLed run does not leave repo content + secrets in tmp. Bounded
+        // (a single tmp readdir + rm of only aged dirs) and best-effort: any error
+        // is swallowed, and it runs inline alongside the DB orphan sweep so it
+        // cannot be interrupted by an instance teardown mid-sweep.
+        yield* Effect.promise(() => sweepWorktrees(ctx.directory)).pipe(Effect.ignore)
         return {
           runs,
           scope: yield* Scope.Scope,
@@ -2415,9 +2463,24 @@ export const layer = Layer.effect(
             let promptInstanceCtx = instanceCtx
             let sessionDirectory = instanceCtx.directory
             if (agentInput.isolation === "worktree") {
-              const base = path.join(os.tmpdir(), `oc-wf-${active.run.id}-${node.id}`)
+              // Finding 3: do NOT use a predictable, world-readable path under the
+              // shared tmp root (`os.tmpdir()/oc-wf-<runid>-<nodeid>`). Both run.id
+              // (monotonic, returned verbatim by the API/events) and node.id (a
+              // sequential counter) are guessable, so on a multi-user host any local
+              // user could read the full checkout + any secrets the subagent writes.
+              // Mint a private base via `fs.mkdtemp` (random, unguessable suffix) and
+              // chmod it 0700 so only the running user can traverse it; the empty
+              // mkdtemp dir is a valid `git worktree add` target. The `WORKTREE_PREFIX`
+              // is shared with the startup orphan sweep so a SIGKILLed run's leaked
+              // worktree is reclaimed on next start.
+              const base = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), WORKTREE_PREFIX)))
+              yield* Effect.promise(() => fs.chmod(base, 0o700)).pipe(Effect.ignore)
               const res = Bun.spawnSync(["git", "worktree", "add", "--detach", base], { cwd: instanceCtx.directory })
               if (res.exitCode !== 0) {
+                // The mkdtemp dir is orphaned when `git worktree add` fails (e.g. a
+                // non-git workspace); remove it so a failed isolation request does
+                // not leak an empty private dir into tmp.
+                yield* Effect.promise(() => fs.rm(base, { recursive: true, force: true })).pipe(Effect.ignore)
                 return yield* new InvalidError({
                   path: active.run.workflow,
                   message: `ctx.agent isolation:"worktree" requires a git repository (${new TextDecoder().decode(res.stderr).trim()})`,
@@ -2437,6 +2500,10 @@ export const layer = Layer.effect(
                 active.runScope,
                 Effect.sync(() => {
                   Bun.spawnSync(["git", "worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
+                  // `git worktree remove` deletes the worktree dir on success; force
+                  // a recursive rm as a backstop so the private base never lingers
+                  // even if the git removal was partial (e.g. dirty/locked tree).
+                  fs.rm(base, { recursive: true, force: true }).catch(() => {})
                 }),
               )
               // A fresh worktree is a self-contained working tree, so both the

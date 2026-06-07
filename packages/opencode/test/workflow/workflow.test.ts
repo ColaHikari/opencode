@@ -489,6 +489,9 @@ function directoryCapturingPromptOps() {
   // (i.e. while the worktree was still live) — proving it was a real git
   // worktree, observed before the run-scope finalizer removes it.
   const wasGitWorktree: boolean[] = []
+  // The directory's permission bits (mode & 0o777) AT DISPATCH TIME — used by
+  // Finding 3 to prove the private worktree base is 0700, not world-readable.
+  const modes: number[] = []
   const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
     prompt: (input) =>
       Effect.gen(function* () {
@@ -504,12 +507,20 @@ function directoryCapturingPromptOps() {
                 .catch(() => false),
             ),
           )
+          modes.push(
+            yield* Effect.promise(() =>
+              fs
+                .stat(dir)
+                .then((s) => s.mode & 0o777)
+                .catch(() => -1),
+            ),
+          )
         }
         return assistantReply()
       }),
     cancel: () => Effect.void,
   }
-  return { ops, inputs, directories, wasGitWorktree }
+  return { ops, inputs, directories, wasGitWorktree, modes }
 }
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
@@ -5527,6 +5538,109 @@ export async function run(args, ctx) {
         )
       }),
     { git: true },
+  )
+
+  // Finding 3: the per-step worktree base must NOT be a predictable, world-readable
+  // path under the shared tmp root (`<tmp>/oc-wf-<runid>-<nodeid>`, both segments
+  // guessable). It must be minted via `fs.mkdtemp` (random suffix) AND chmod 0700,
+  // so on a multi-user host no other local user can read the checkout or any secrets
+  // the subagent writes. We observe the worktree directory live at dispatch time
+  // (the directory-capturing prompt-ops record its mode then) and assert: it lives
+  // under tmpdir with the `oc-wf-` prefix, it is NOT the predictable
+  // `oc-wf-<runid>-<nodeid>` name, and its mode is exactly 0700.
+  it.instance(
+    'ctx.agent isolation:"worktree" mints a private (0700) worktree under an unguessable mkdtemp path',
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, inputs, directories, modes } = directoryCapturingPromptOps()
+
+        const started = yield* workflow.start({ name: ISOLATION_FIXTURE, args: {}, prompt: ops })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("isolation workflow did not finish")))
+        expect(done.status).toBe("completed")
+        expect(inputs.length).toBe(1)
+
+        const worktree = directories[0]!
+        expect(worktree).toBeDefined()
+        const tmp = yield* Effect.promise(() => fs.realpath(os.tmpdir()))
+        const realWorktree = yield* Effect.promise(() => fs.realpath(worktree).catch(() => worktree))
+        // It lives under the shared tmp root with the shared `oc-wf-` prefix.
+        const name = path.basename(realWorktree)
+        expect(path.dirname(realWorktree)).toBe(tmp)
+        expect(name.startsWith("oc-wf-")).toBe(true)
+        // But it is NOT the OLD predictable `oc-wf-<runid>-<nodeid>` path: an
+        // attacker who knows the run id + node id could no longer guess it.
+        const node = done.agents[0]!
+        expect(name).not.toBe(`oc-wf-${started.id}-${node.id}`)
+        expect(name.includes(started.id)).toBe(false)
+        // And it was 0700 at dispatch time — only the running user may traverse it.
+        expect(modes[0]).toBe(0o700)
+      }),
+    { git: true },
+  )
+
+  // Finding 3 (orphan sweep): a SIGKILLed/crashed run never fires its run-scope
+  // remove finalizer, leaking its `<tmp>/oc-wf-*` worktree (with checked-out repo
+  // content + any agent-written secrets) into tmp indefinitely. The startup sweep
+  // must reclaim a STALE such dir on the next instance start, while leaving a FRESH
+  // one (a currently-running sibling's worktree) untouched. We plant one aged dir
+  // and one new dir, reload the instance (re-runs the startup sweep), and assert the
+  // stale one is gone and the fresh one survives.
+  it.live("startup sweep removes a stale orphaned oc-wf-* worktree but spares a fresh one", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      const tmp = os.tmpdir()
+      // A stale leaked worktree dir, aged well past the 1h cutoff.
+      const stale = yield* Effect.promise(() => fs.mkdtemp(path.join(tmp, "oc-wf-")))
+      yield* Effect.promise(() => fs.writeFile(path.join(stale, "leaked-secret"), "shh"))
+      const old = Date.now() - 3 * 60 * 60 * 1000
+      yield* Effect.promise(() => fs.utimes(stale, old / 1000, old / 1000))
+      // A fresh worktree dir (mtime now) — represents a sibling process's live run.
+      const fresh = yield* Effect.promise(() => fs.mkdtemp(path.join(tmp, "oc-wf-")))
+
+      try {
+        // Bring an instance up over the directory and touch an operation that
+        // MATERIALIZES the per-directory InstanceState (a ScopedCache value whose
+        // factory runs the startup sweep). `runs()` reads the registry, forcing
+        // materialization → the sweep runs.
+        yield* Effect.gen(function* () {
+          const workflow = yield* Workflow.Service
+          yield* workflow.runs()
+        }).pipe(provideInstance(directory))
+        // Reload to force a fresh state materialization (and a second sweep), proving
+        // the sweep is wired to startup regardless of first-vs-subsequent access.
+        yield* reloadInstance({ directory })
+        yield* Effect.gen(function* () {
+          const workflow = yield* Workflow.Service
+          yield* workflow.runs()
+        }).pipe(provideInstance(directory))
+
+        // The sweep is forked (best-effort, non-blocking); poll for its effect.
+        yield* pollWithTimeout(
+          Effect.promise(() =>
+            fs
+              .stat(stale)
+              .then(() => undefined)
+              .catch(() => true as const),
+          ),
+          `stale orphaned worktree ${stale} was not swept`,
+        )
+        // The fresh dir (a live sibling's worktree) must NOT be touched.
+        const freshAlive = yield* Effect.promise(() =>
+          fs
+            .stat(fresh)
+            .then(() => true)
+            .catch(() => false),
+        )
+        expect(freshAlive).toBe(true)
+      } finally {
+        yield* Effect.promise(() => fs.rm(stale, { recursive: true, force: true }).catch(() => {}))
+        yield* Effect.promise(() => fs.rm(fresh, { recursive: true, force: true }).catch(() => {}))
+      }
+    }).pipe(Effect.provide(testInstanceStoreLayer)),
   )
 
   // Task 11 (error path): isolation:"worktree" in a NON-git workspace is an
