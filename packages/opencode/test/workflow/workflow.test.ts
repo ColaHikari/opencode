@@ -5155,3 +5155,17 @@ export async function run() { return { from: "global" } }
     }),
   )
 })
+
+describe("Workflow.fmt", () => {
+  test("fmt renders whenToUse inside the available_workflows block", () => {
+    const out = Workflow.fmt([
+      {
+        name: "deploy",
+        path: "/p/.opencode/workflows/deploy.ts",
+        valid: true,
+        meta: { name: "Deploy", description: "Deploy the app.", whenToUse: "When shipping to prod." },
+      },
+    ])
+    expect(out).toContain("<when_to_use>When shipping to prod.</when_to_use>")
+  })
+})

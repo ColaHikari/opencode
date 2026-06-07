@@ -1586,6 +1586,7 @@ export function fmt(list: Info[]) {
         "  <workflow>",
         `    <name>${workflow.name}</name>`,
         `    <description>${workflow.meta.description}</description>`,
+        ...(workflow.meta.whenToUse ? [`    <when_to_use>${workflow.meta.whenToUse}</when_to_use>`] : []),
         `    <path>${pathToFileURL(workflow.path).href}</path>`,
         ...(workflow.meta.phases?.length
           ? [`    <phases>${workflow.meta.phases.map((phase) => phase.title).join(", ")}</phases>`]
