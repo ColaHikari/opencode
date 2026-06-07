@@ -1,0 +1,69 @@
+// Ultracode opt-in: a standalone `ultracode` keyword (or the /ultracode session
+// toggle) tells the agent to orchestrate the task via the workflow tool instead
+// of working turn by turn. This module is pure so it can be unit tested without
+// the renderer runtime; the prompt component wires detection, highlighting,
+// stripping, and directive injection on top of it.
+
+// Word-boundary match via Unicode lookarounds: the keyword only matches when it is
+// not flanked by a letter, digit, or underscore (\p{L}\p{N}_). Unlike the ASCII-only
+// `\b`, this treats non-ASCII letters as word characters too, so "ultracodeö",
+// "öultracode", "ultracodex", "ultracode2", and "ultracode_mode" never match while
+// "ultracode:", "(ultracode)", and "foo-ultracode" do. The `i` flag makes detection
+// case-insensitive, `u` enables Unicode property escapes.
+const KEYWORD = "ultracode"
+const BOUNDARY = `(?<![\\p{L}\\p{N}_])${KEYWORD}(?![\\p{L}\\p{N}_])`
+const KEYWORD_RE = new RegExp(BOUNDARY, "iu")
+
+export const ULTRACODE_PROMPT_DIRECTIVE =
+  "The user opted into workflow orchestration for this task (ultracode). " +
+  "Author a workflow for it with the workflow tool (action: create, then start) " +
+  "instead of working turn by turn. Use parallel/pipeline fan-out and adversarial " +
+  "verification where they fit. Only skip the workflow if the task is trivial or " +
+  "purely conversational."
+
+export const ULTRACODE_SESSION_DIRECTIVE =
+  "Ultracode session mode is ON: for every substantial task, plan and run workflows " +
+  "by default (workflow tool: create + start) — chain understand → change → verify " +
+  "runs when the task has phases. Skip only trivial or conversational turns. Treat " +
+  "explicit requests like 'use a workflow' as the same opt-in."
+
+// Returns the first standalone-keyword hit (index + length) for live highlighting,
+// or undefined when the keyword is absent. Length tracks the matched text so the
+// caller can style exactly the keyword span.
+export function detectUltracodeKeyword(input: string): { index: number; length: number } | undefined {
+  const match = KEYWORD_RE.exec(input)
+  if (!match) return undefined
+  return { index: match.index, length: match[0].length }
+}
+
+// Removes every standalone occurrence of the keyword and collapses the whitespace
+// it leaves behind: doubled spaces become single, a leading colon left dangling
+// (e.g. "ultracode: audit") is dropped, and the result is trimmed.
+export function stripUltracodeKeyword(input: string): string {
+  return input
+    .replace(new RegExp(BOUNDARY, "giu"), "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([:;,.!?])/g, "$1")
+    .replace(/^[:\s]+/, "")
+    .trim()
+}
+
+// Assembles the ultracode directives to prepend to a normal prompt. `session` is
+// the /ultracode session-toggle state (every turn gets the session directive);
+// `keywordEnabled` gates the standalone-keyword detection (config flag). When the
+// keyword is present, it is stripped from the visible user text and the prompt
+// directive is added. Pure so it is unit-testable; the submit path prepends the
+// returned directives as leading text parts before the user text.
+export function buildUltracodeParts(input: { text: string; session: boolean; keywordEnabled: boolean }): {
+  directives: string[]
+  text: string
+} {
+  const directives: string[] = []
+  if (input.session) directives.push(ULTRACODE_SESSION_DIRECTIVE)
+  let text = input.text
+  if (input.keywordEnabled && detectUltracodeKeyword(input.text)) {
+    directives.push(ULTRACODE_PROMPT_DIRECTIVE)
+    text = stripUltracodeKeyword(input.text)
+  }
+  return { directives, text }
+}
