@@ -138,6 +138,13 @@ export type WorkflowContext = {
    * inspect `exitCode` to branch on failure.
    */
   shell(command: string, opts?: { timeout?: number; cwd?: string }): Promise<{ output: string; exitCode: number }>
+  /**
+   * Run another DISCOVERED workflow inline under the SAME run (no separate run
+   * row), sharing this run's concurrency, budget, abort scope, and agent-lifetime
+   * cap. Returns the child's `run()` result. Nesting is limited to depth 1: a
+   * workflow invoked via `ctx.workflow` cannot itself call `ctx.workflow`.
+   */
+  workflow(name: string, args?: Record<string, unknown>): Promise<unknown>
 }
 
 export function workflow<const Args extends WorkflowArguments | undefined = undefined>(input: {

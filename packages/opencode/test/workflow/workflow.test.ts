@@ -325,6 +325,64 @@ export async function run(_args, ctx) {
 }
 `
 
+// Task 11b (depth-1 nesting): a parent workflow runs a DISCOVERED child workflow
+// inline via ctx.workflow under the SAME run (no second run row). The child's
+// logs are prefixed (`child: ...`) and its result flows back to the parent.
+const NEST_CHILD_FIXTURE = "child"
+const NEST_CHILD_WORKFLOW = `export const meta = { name: "${NEST_CHILD_FIXTURE}", description: "c" }
+export async function run(args, ctx) {
+  ctx.log("child-ran")
+  return { doubled: Number(args.n) * 2 }
+}
+`
+const NEST_PARENT_FIXTURE = "parent"
+const NEST_PARENT_WORKFLOW = `export const meta = { name: "${NEST_PARENT_FIXTURE}", description: "p" }
+export async function run(_a, ctx) {
+  const r = await ctx.workflow("child", { n: 21 })
+  return { fromChild: r.doubled }
+}
+`
+
+// Task 11b (depth guard): a child that ITSELF calls ctx.workflow must be refused —
+// nesting is limited to depth 1, so the nested call throws a WorkflowInvalidError
+// and the run fails with that error.
+const NEST_GRANDCHILD_FIXTURE = "grandchild"
+const NEST_GRANDCHILD_WORKFLOW = `export const meta = { name: "${NEST_GRANDCHILD_FIXTURE}", description: "gc" }
+export async function run(args, ctx) { return { ok: true } }
+`
+const NEST_DEEP_CHILD_FIXTURE = "deep-child"
+const NEST_DEEP_CHILD_WORKFLOW = `export const meta = { name: "${NEST_DEEP_CHILD_FIXTURE}", description: "dc" }
+export async function run(args, ctx) {
+  // depth-2 attempt: this nested ctx.workflow must throw.
+  return await ctx.workflow("grandchild", {})
+}
+`
+const NEST_DEEP_PARENT_FIXTURE = "deep-parent"
+const NEST_DEEP_PARENT_WORKFLOW = `export const meta = { name: "${NEST_DEEP_PARENT_FIXTURE}", description: "dp" }
+export async function run(_a, ctx) {
+  return await ctx.workflow("deep-child", {})
+}
+`
+
+// Task 11b (c) (shared agent-lifetime cap): a parent that dispatches one agent and
+// then runs a child that dispatches more — collectively exceeding the run's
+// (test-lowered) agent-lifetime cap. The cap is shared via the SAME run, so the
+// over-cap dispatch (inside the child) fails the WHOLE run with AgentLimitError.
+const NEST_AGENT_CHILD_FIXTURE = "agent-child"
+const NEST_AGENT_CHILD_WORKFLOW = `export const meta = { name: "${NEST_AGENT_CHILD_FIXTURE}", description: "ac" }
+export async function run(args, ctx) {
+  for (let i = 0; i < args.count; i++) await ctx.agent({ prompt: "child step " + i })
+  return { ok: true }
+}
+`
+const NEST_AGENT_PARENT_FIXTURE = "agent-parent"
+const NEST_AGENT_PARENT_WORKFLOW = `export const meta = { name: "${NEST_AGENT_PARENT_FIXTURE}", description: "ap" }
+export async function run(_a, ctx) {
+  await ctx.agent({ prompt: "parent step" })
+  return await ctx.workflow("agent-child", { count: 10 })
+}
+`
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -4635,6 +4693,92 @@ export async function run() { return { from: "global" } }
       expect(result.failCode).toBe(3)
       // Shell does not touch the budget — spend stays at 0.
       expect(result.spent).toBe(0)
+    }),
+  )
+
+  // Task 11b (a): a parent runs a DISCOVERED child inline via ctx.workflow under
+  // the SAME run. The parent completes, the child's result flows back
+  // (fromChild === 42), exactly ONE run row exists for this start (no separate
+  // child run row), and the parent's logs include the child's prefixed log entry.
+  it.instance("ctx.workflow runs a discovered child inline under the same run with prefixed logs", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_CHILD_FIXTURE, NEST_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_PARENT_FIXTURE, NEST_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: NEST_PARENT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("parent workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      expect((done.result as { fromChild: number }).fromChild).toBe(42)
+
+      // Exactly ONE run row exists for this start: no separate child run row.
+      const runs = yield* workflow.runs()
+      expect(runs.length).toBe(1)
+      expect(runs[0]!.id).toBe(started.id)
+
+      // The parent's logs include the child's prefixed log entry.
+      const messages = done.logs.map((l) => l.message)
+      expect(messages).toContain("child: child-ran")
+    }),
+  )
+
+  // Task 11b (b): nesting is limited to depth 1. A child that itself calls
+  // ctx.workflow must be refused — the nested call throws a WorkflowInvalidError
+  // mentioning the depth limit, and the run fails with that error.
+  it.instance("ctx.workflow enforces a depth-1 limit: a nested ctx.workflow call fails the run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_GRANDCHILD_FIXTURE, NEST_GRANDCHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_DEEP_CHILD_FIXTURE, NEST_DEEP_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_DEEP_PARENT_FIXTURE, NEST_DEEP_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: NEST_DEEP_PARENT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("deep-parent workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/WorkflowInvalidError|nesting|depth/i)
+
+      // Still exactly ONE run row — the failed nesting never created a second run.
+      const runs = yield* workflow.runs()
+      expect(runs.length).toBe(1)
+    }),
+  )
+
+  // Task 11b (c): the child's agent dispatches count against the SAME run's
+  // agent-lifetime cap. With the cap lowered to 3, the parent's one agent plus the
+  // child's dispatches collectively exceed it, so the over-cap dispatch (inside
+  // the child) fails the WHOLE run with a tagged AgentLimitError — proving the cap
+  // is shared, not reset per nested workflow.
+  it.instance("ctx.workflow shares the run's agent-lifetime cap with the child", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_AGENT_CHILD_FIXTURE, NEST_AGENT_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_AGENT_PARENT_FIXTURE, NEST_AGENT_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      Workflow.__testHooks.agentLimit(3)
+
+      const started = yield* workflow.start({
+        name: NEST_AGENT_PARENT_FIXTURE,
+        args: {},
+        prompt: costPromptOps(db, 0),
+      })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("agent-parent workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/WorkflowAgentLimitError|agent.*limit/i)
+      // The cap is shared across parent + child: exactly 3 agents (1 parent + 2
+      // child) reach `completed` before the 4th dispatch is refused.
+      expect(done.agents.filter((a) => a.status === "completed").length).toBe(3)
+      // One run row only — the child never created its own run.
+      const runs = yield* workflow.runs()
+      expect(runs.length).toBe(1)
     }),
   )
 })

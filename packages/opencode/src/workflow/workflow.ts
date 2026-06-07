@@ -450,6 +450,14 @@ export type ContextApi = {
     command: string,
     opts?: { timeout?: number; cwd?: string },
   ) => Promise<{ output: string; exitCode: number }>
+  /**
+   * Run another DISCOVERED workflow inline under the SAME run (no separate run
+   * row), sharing this run's concurrency, budget, abort scope, and agent-lifetime
+   * cap. Returns the child workflow's `run()` result. Nesting is limited to depth
+   * 1: a workflow invoked via `ctx.workflow` cannot itself call `ctx.workflow`
+   * (the nested call throws a WorkflowInvalidError).
+   */
+  readonly workflow: (name: string, args?: Record<string, unknown>) => Promise<unknown>
 }
 
 // `ContextApi` is the engine-side view of the run context handed to a workflow
@@ -1221,10 +1229,17 @@ function createContext(input: {
   active: Active
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
   shell: ContextApi["shell"]
+  workflow: ContextApi["workflow"]
   permissionSessionID?: SessionID
   persist: () => void
   /** AbortSignal of the run fiber; fires when the run is interrupted/cancelled. */
   signal: () => AbortSignal | undefined
+  /**
+   * Run-relative prefix for `ctx.log`/`ctx.setPhase` messages. Empty for the
+   * top-level run; set to `"<child-name>: "` for a depth-1 nested workflow so its
+   * logs/phases are attributable to the child without a second run row.
+   */
+  logPrefix?: string
   /**
    * Runs the parallel/pipeline task graph as a child of the run scope (not as a
    * detached root fiber): closing the run scope on cancel/remove propagates
@@ -1261,11 +1276,15 @@ function createContext(input: {
           : Math.max(0, input.active.budgetTotal - input.active.costSpent),
     },
     setPhase(phase: string) {
-      input.active.run.current_phase = phase
+      input.active.run.current_phase = (input.logPrefix ?? "") + phase
       input.persist()
     },
     log(message: string) {
-      input.active.run.logs.push({ time: Date.now(), phase: input.active.run.current_phase, message })
+      input.active.run.logs.push({
+        time: Date.now(),
+        phase: input.active.run.current_phase,
+        message: (input.logPrefix ?? "") + message,
+      })
       input.persist()
     },
     parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
@@ -1359,6 +1378,7 @@ function createContext(input: {
     }) as ContextApi["pipeline"],
     agent: input.agent,
     shell: input.shell,
+    workflow: input.workflow,
   }
 }
 
@@ -2318,6 +2338,54 @@ export const layer = Layer.effect(
         )
       }
 
+      // Build the run context for the top-level body OR a depth-1 nested workflow.
+      // Captured here so `ctx.workflow` (below) can re-enter it with a bumped
+      // `depth` and a `logPrefix`, sharing the SAME `active` — and thus the same
+      // concurrency semaphore, budget, abort scope, and agent-lifetime cap.
+      const buildContext = (ctxInput: { depth: number; logPrefix?: string }): ContextApi =>
+        createContext({
+          active,
+          agent,
+          shell,
+          workflow: (name, childArgs) => runNested(ctxInput.depth, name, childArgs),
+          logPrefix: ctxInput.logPrefix,
+          persist: () => void persistInScope(active, bridge, db, events),
+          signal: () => runSignal,
+          dispatch,
+        })
+
+      // Depth-1 nesting: run another DISCOVERED workflow inline under the SAME run
+      // (no second run row). It shares this run's `active`, so the concurrency
+      // semaphore, budget, abort scope, and agent-lifetime cap all carry over
+      // automatically — the child's `ctx.agent` dispatches funnel through the same
+      // `agent` closure and count against the same gates. The parent run was
+      // already approved (its own start went through the permission gate), so the
+      // child loads with NO additional permission ask. A nested call (the child
+      // itself calling ctx.workflow) is refused: nesting is limited to depth 1.
+      const runNested = async (parentDepth: number, name: string, childArgs?: Record<string, unknown>) => {
+        if (parentDepth >= 1) {
+          throw new InvalidError({
+            path: active.run.workflow,
+            message: "ctx.workflow nesting is limited to depth 1",
+          })
+        }
+        // Load the named workflow via the existing discovery + loadModule path
+        // (discoverWorkflows reads InstanceState, so run it through `dispatch`).
+        // No permission ask: the parent run is already approved.
+        const discovered = await dispatch(discoverWorkflows())
+        const target = discovered.find((item) => item.name === name)
+        if (!target) {
+          throw new InvalidError({ path: active.run.workflow, message: `Workflow not found: ${name}` })
+        }
+        const childModule = await loadModule(target.path, target.source)
+        const coerced = coerceArgs(childArgs, childModule.meta.arguments, target.path)
+        if (coerced instanceof InvalidError) throw coerced
+        // Child context shares `active`; depth+1 closes the nesting at 1 and the
+        // logPrefix attributes the child's logs/phases without a second run row.
+        const childCtx = buildContext({ depth: parentDepth + 1, logPrefix: `${name}: ` })
+        return childModule.run(coerced ?? {}, childCtx)
+      }
+
       // Fund 5 (TOCTOU): a cancel/remove can land during the startup window —
       // after the run was registered but before the body fiber exists. In that
       // window abortRun set `cancelling`/closed the run scope and finish() already
@@ -2332,17 +2400,7 @@ export const layer = Layer.effect(
 
       active.fiber = yield* Effect.promise((signal) => {
         runSignal = signal
-        return module.run(
-          args ?? {},
-          createContext({
-            active,
-            agent,
-            shell,
-            persist: () => void persistInScope(active, bridge, db, events),
-            signal: () => runSignal,
-            dispatch,
-          }),
-        )
+        return module.run(args ?? {}, buildContext({ depth: 0 }))
       }).pipe(
         Effect.matchCauseEffect({
           onSuccess: (result) => finish(id, "completed", { result }),
