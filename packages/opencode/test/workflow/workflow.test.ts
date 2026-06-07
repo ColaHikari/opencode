@@ -247,6 +247,18 @@ export async function run(args, ctx) {
 }
 `
 
+// Per-step skills fixture (Task 9): a single agent step that requests specific
+// skills. opencode only loads skills via the runtime \`skill\` tool, so the engine
+// prepends a load directive to the prompt and enables the skill tool for the step.
+const SKILLS_FIXTURE = "skills-step"
+const SKILLS_WORKFLOW = `export const meta = { name: "${SKILLS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "do it", skills: ["pdf", "xlsx"] })
+  return { ok: true }
+}
+`
+
 
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
@@ -4261,6 +4273,38 @@ export async function run() { return { from: "global" } }
       // Exactly one real agent dispatch, carrying the requested tools object unchanged.
       expect(inputs.length).toBe(1)
       expect(inputs[0]?.tools).toEqual({ webfetch: false })
+    }),
+  )
+
+  // Task 9: a per-step `skills` array passed to ctx.agent must be honoured.
+  // opencode only loads skills via the runtime `skill` tool (no structured
+  // create/prompt field), so the engine prepends a load directive naming the
+  // skills to the prompt text and enables the `skill` tool for the step. Both
+  // are asserted on the captured PromptInput.
+  it.instance("ctx.agent skills are loaded via a prompt directive and the enabled skill tool", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SKILLS_FIXTURE, SKILLS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SKILLS_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("skills workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      expect(inputs.length).toBe(1)
+      // The skill tool is enabled for this step.
+      expect(inputs[0]?.tools?.skill).toBe(true)
+      // The text part carries a directive naming both skills, ahead of the prompt.
+      const textPart = inputs[0]?.parts.find((p) => p.type === "text")
+      expect(textPart?.type).toBe("text")
+      const text = textPart?.type === "text" ? textPart.text : ""
+      expect(text).toContain("pdf")
+      expect(text).toContain("xlsx")
+      expect(text).toContain("do it")
+      // Directive comes BEFORE the author's prompt.
+      expect(text.indexOf("pdf")).toBeLessThan(text.indexOf("do it"))
     }),
   )
 })

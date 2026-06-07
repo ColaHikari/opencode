@@ -404,6 +404,7 @@ export type AgentInput = {
   model?: string
   variant?: string
   tools?: Record<string, boolean>
+  skills?: string[]
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
 }
@@ -1852,6 +1853,21 @@ export const layer = Layer.effect(
             // the registry-aware job of the model picker); it rides alongside the
             // model into both the child session and the prompt run.
             const variant = agentInput.variant
+            // Per-step skills (Task 9). opencode has NO structured "give this
+            // session these skills" field: skills are only loadable at runtime via
+            // the `skill` tool (which asks for the `skill` permission and injects
+            // the skill content into the conversation). So the supported mechanism
+            // is a documented prompt convention — prepend a directive naming the
+            // requested skills and ENABLE the `skill` tool for the step (folded
+            // into the per-step tools scoping above). The directive precedes the
+            // author's prompt so the model loads the skills before starting.
+            const skills = agentInput.skills?.filter((s) => s.length > 0) ?? []
+            const promptText =
+              skills.length > 0
+                ? `Load these skills before starting: ${skills.join(", ")}.\n\n${agentInput.prompt}`
+                : agentInput.prompt
+            const tools =
+              skills.length > 0 ? { ...(agentInput.tools ?? {}), skill: true } : agentInput.tools
             // Resume replay: when this run has a journal (started with
             // resume_of), consume the next unused source agent for this call's
             // key (occurrence order) and replay it verbatim — NO session, NO
@@ -1968,10 +1984,14 @@ export const layer = Layer.effect(
               // lives on PromptInput.tools (NOT sessions.create — that only takes a
               // permission Ruleset). The prompt loop folds each entry into an
               // allow/deny session permission rule, so threading it here scopes the
-              // child session's tools for this step. Passed through unchanged.
-              tools: agentInput.tools,
+              // child session's tools for this step. `tools` already merges the
+              // step's own scoping with the `skill: true` enablement that the
+              // skills directive (above) requires.
+              tools,
               format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
-              parts: [{ type: "text", text: agentInput.prompt }],
+              // `promptText` is the author's prompt, optionally prefixed with the
+              // per-step skill-load directive (see the `skills` resolution above).
+              parts: [{ type: "text", text: promptText }],
             })
             node.message_id = message.info.id
             if (message.info.role === "assistant") {

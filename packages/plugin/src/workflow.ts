@@ -31,6 +31,14 @@ export type WorkflowAgentInput = {
    * the child session, so the subagent only sees the tools you scope it to.
    */
   tools?: Record<string, boolean>
+  /**
+   * Skills to make available to this agent step. opencode loads skills at
+   * runtime via the `skill` tool, so naming them here prepends a "Load these
+   * skills before starting: …" directive to the prompt and enables the `skill`
+   * tool for the step (merged with any `tools` scoping). The agent loads each
+   * named skill before doing its work.
+   */
+  skills?: string[]
   schema?: unknown
   permissionSessionID?: string
 }
