@@ -68,6 +68,9 @@ import {
   promptLength,
 } from "./prompt-input/history"
 import { createPromptSubmit, type FollowupDraft } from "./prompt-input/submit"
+import { ultracodeToggle } from "./prompt-input/ultracode"
+import { workflowCommandOptions } from "./prompt-input/workflow-command"
+import { openWorkflowDashboard } from "./prompt-input/workflow-dashboard"
 import { PromptPopover, type AtOption, type SlashCommand } from "./prompt-input/slash-popover"
 import { PromptContextItems } from "./prompt-input/context-items"
 import { PromptImageAttachments } from "./prompt-input/image-attachments"
@@ -282,6 +285,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     mode: "normal" | "shell"
     applyingHistory: boolean
     variantOpen: boolean
+    ultracodeSession: boolean
   }>({
     popover: null,
     historyIndex: -1,
@@ -291,6 +295,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     mode: "normal",
     applyingHistory: false,
     variantOpen: false,
+    ultracodeSession: false,
   })
   const [picker, setPicker] = createStore({
     projectOpen: false,
@@ -534,6 +539,36 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       disabled: store.mode === "normal",
       onSelect: () => setMode("normal"),
     },
+    {
+      id: "ultracode.toggle",
+      title: language.t(
+        store.ultracodeSession ? "command.ultracode.disable" : "command.ultracode.enable",
+      ),
+      category: language.t("command.category.session"),
+      slash: "ultracode",
+      onSelect: () => {
+        const result = ultracodeToggle(store.ultracodeSession)
+        setStore("ultracodeSession", result.next)
+        showToast({
+          title: language.t(result.toast.title as Parameters<typeof language.t>[0]),
+          description: language.t(result.toast.description as Parameters<typeof language.t>[0]),
+        })
+      },
+    },
+    {
+      id: "workflow.start",
+      title: language.t("command.workflow.start"),
+      category: language.t("command.category.workflow"),
+      slash: "workflow",
+      onSelect: () => insertSlashText("/workflow "),
+    },
+    {
+      id: "workflow.list",
+      title: language.t("command.workflow.dashboard"),
+      category: language.t("command.category.workflow"),
+      slash: "workflows",
+      onSelect: () => void openWorkflowDashboard(dialog),
+    },
   ])
 
   const closePopover = () => setStore("popover", null)
@@ -563,6 +598,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       selection?.removeAllRanges()
       selection?.addRange(range)
     })
+  }
+
+  // Replaces the editor with `text`, keeps the current image attachments, and
+  // parks the cursor at the end — the same insert used for selecting a custom
+  // slash command (handleSlashSelect) and for the /workflow starter command.
+  const insertSlashText = (text: string) => {
+    const images = imageAttachments()
+    setEditorText(text)
+    prompt.set([{ type: "text", content: text, start: 0, end: text.length }, ...images], text.length)
+    focusEditorEnd()
   }
 
   const currentCursor = () => {
@@ -595,6 +640,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }, 6500)
     onCleanup(() => clearInterval(interval))
   })
+
+  // Ultracode session mode is per-session: reset it when the active session
+  // changes (mirror TUI index.tsx:344-352) so the toggle never leaks across
+  // sessions.
+  createEffect(
+    on(
+      () => params.id,
+      () => setStore("ultracodeSession", false),
+      { defer: true },
+    ),
+  )
 
   const [composing, setComposing] = createSignal(false)
   const isImeComposing = (event: KeyboardEvent) => event.isComposing || composing() || event.keyCode === 229
@@ -703,11 +759,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     closePopover()
     const images = imageAttachments()
 
+    // A discovered workflow entry inserts `/workflow <name> ` so SUBMIT routes it
+    // through the /workflow path (parity with the TUI's `/<name>` → `/workflow
+    // <name>` dispatch). There is no per-name command registered to trigger.
+    if (cmd.type === "workflow") {
+      insertSlashText(`/workflow ${cmd.trigger} `)
+      return
+    }
+
     if (cmd.type === "custom") {
-      const text = `/${cmd.trigger} `
-      setEditorText(text)
-      prompt.set([{ type: "text", content: text, start: 0, end: text.length }, ...images], text.length)
-      focusEditorEnd()
+      insertSlashText(`/${cmd.trigger} `)
       return
     }
 
@@ -1150,6 +1211,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     commentCount,
     autoAccept: () => accepting(),
     mode: () => store.mode,
+    ultracodeSession: () => store.ultracodeSession,
     working,
     editor: () => editorRef,
     queueScroll,

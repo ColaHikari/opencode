@@ -3,6 +3,7 @@ import {
   buildUltracodeParts,
   detectUltracodeKeyword,
   stripUltracodeKeyword,
+  ultracodeToggle,
   ULTRACODE_PROMPT_DIRECTIVE,
   ULTRACODE_SESSION_DIRECTIVE,
 } from "./ultracode"
@@ -45,5 +46,25 @@ describe("buildUltracodeParts", () => {
     const out = buildUltracodeParts({ text: "ultracode fix bug", session: false, keywordEnabled: false })
     expect(out.directives).toEqual([])
     expect(out.text).toBe("ultracode fix bug")
+  })
+})
+
+describe("ultracodeToggle", () => {
+  test("flips state and reports the labels for the resulting state", () => {
+    const turningOn = ultracodeToggle(false)
+    expect(turningOn.next).toBe(true)
+    expect(turningOn.commandTitle).toBe("command.ultracode.disable")
+    expect(turningOn.toast).toEqual({
+      title: "toast.ultracode.on.title",
+      description: "toast.ultracode.on.description",
+    })
+
+    const turningOff = ultracodeToggle(true)
+    expect(turningOff.next).toBe(false)
+    expect(turningOff.commandTitle).toBe("command.ultracode.enable")
+    expect(turningOff.toast).toEqual({
+      title: "toast.ultracode.off.title",
+      description: "toast.ultracode.off.description",
+    })
   })
 })

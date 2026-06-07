@@ -48,6 +48,34 @@ export function stripUltracodeKeyword(input: string): string {
     .trim()
 }
 
+// Pure derivation of the /ultracode session-toggle outcome: given the CURRENT
+// session-mode state, returns the next state plus the i18n keys for the command
+// title and the on/off toast (mirrors the TUI toggle toast, index.tsx:1489-1518).
+// Kept pure (returns keys, not resolved strings) so the toggle logic is unit-
+// testable; the prompt component resolves the keys via language.t and shows the
+// toast. The command title is for the state AFTER the toggle so the menu reads as
+// the action it will perform next.
+export type UltracodeToggleResult = {
+  next: boolean
+  commandTitle: "command.ultracode.enable" | "command.ultracode.disable"
+  toast: { title: string; description: string }
+}
+
+export function ultracodeToggle(current: boolean): UltracodeToggleResult {
+  const next = !current
+  return next
+    ? {
+        next,
+        commandTitle: "command.ultracode.disable",
+        toast: { title: "toast.ultracode.on.title", description: "toast.ultracode.on.description" },
+      }
+    : {
+        next,
+        commandTitle: "command.ultracode.enable",
+        toast: { title: "toast.ultracode.off.title", description: "toast.ultracode.off.description" },
+      }
+}
+
 // Assembles the ultracode directives to prepend to a normal prompt. `session` is
 // the /ultracode session-toggle state (every turn gets the session directive);
 // `keywordEnabled` gates the standalone-keyword detection (config flag). When the
