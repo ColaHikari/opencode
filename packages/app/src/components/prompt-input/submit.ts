@@ -19,6 +19,8 @@ import { buildRequestParts } from "./build-request-parts"
 import { setCursorPosition } from "./editor-dom"
 import { formatServerError } from "@/utils/server-errors"
 import { ScopedKey } from "@/utils/server-scope"
+import { buildUltracodeParts } from "./ultracode"
+import { parseWorkflowArgs, parseWorkflowCommand, type WorkflowArgDeclaration } from "./workflow-command"
 
 type PendingPrompt = {
   abort: AbortController
@@ -177,6 +179,8 @@ type PromptSubmitInput = {
   commentCount: Accessor<number>
   autoAccept: Accessor<boolean>
   mode: Accessor<"normal" | "shell">
+  ultracodeSession: Accessor<boolean>
+  openWorkflowDashboard: () => void
   working: Accessor<boolean>
   editor: () => HTMLDivElement | undefined
   queueScroll: () => void
@@ -299,6 +303,21 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     if (text.trim().length === 0 && images.length === 0 && input.commentCount() === 0) {
       if (input.working()) void abort()
+      return
+    }
+
+    // Workflow command routing (parity with the TUI dispatch): `/workflows` and
+    // `/workflow` with no name open the dashboard; `/workflow <name>` starts a
+    // run. This must run BEFORE the generic /command (session.command) branch so a
+    // workflow is never sent as a plain custom command. Only in normal mode.
+    const workflowCommand = mode === "normal" ? parseWorkflowCommand(text) : undefined
+    if (workflowCommand?.type === "dashboard") {
+      input.addToHistory(currentPrompt, mode)
+      input.resetHistoryNavigation()
+      prompt.reset()
+      input.setMode("normal")
+      input.setPopover(null)
+      input.openWorkflowDashboard()
       return
     }
 
@@ -427,6 +446,47 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       })
     }
 
+    // `/workflow <name>` → start the run. Resolve the workflow's declared
+    // arguments for type-aware coercion, then call workflow.start with the
+    // current session as the permission context (mirror TUI index.tsx:1202-1222).
+    // v1 starts directly (== approval:"never"); the approval gate is a follow-up.
+    // Runs BEFORE the queue check so a workflow start is never deferred into the
+    // session.command queue path.
+    if (workflowCommand?.type === "start") {
+      clearInput()
+      const { name, args } = workflowCommand
+      void (async () => {
+        try {
+          const workflows = await client.workflow
+            .list({ directory: sessionDirectory })
+            .then((response) => response.data ?? [])
+            .catch(() => [])
+          const info = workflows.find((workflow) => workflow.name === name)
+          const declaration = (info?.meta.arguments ?? {}) as WorkflowArgDeclaration
+          const result = await client.workflow.start({
+            name,
+            directory: sessionDirectory,
+            workflowStartPayload: {
+              args: parseWorkflowArgs(args, declaration),
+              permissionSessionID: session.id,
+            },
+          })
+          showToast({
+            title: language.t("toast.workflow.started.title"),
+            description: language.t("toast.workflow.started.description", { name }),
+          })
+          const startedSession = result.data?.session_id
+          if (startedSession) navigate(`/${base64Encode(sessionDirectory)}/session/${startedSession}`)
+        } catch (err) {
+          showToast({
+            title: language.t("toast.workflow.start.failed.title"),
+            description: errorMessage(err),
+          })
+        }
+      })()
+      return
+    }
+
     if (!isNewSession && mode === "normal" && input.shouldQueue?.()) {
       input.onQueue?.(draft)
       clearContext()
@@ -453,6 +513,36 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           restoreInput()
         })
       return
+    }
+
+    // Ultracode directive injection on a normal prompt (parity with the TUI's
+    // ultracodeParts). Prepend the session/keyword directives as leading synthetic
+    // text and strip the keyword from the user's visible text. Reuses the tested
+    // buildUltracodeParts; the directives flow through sendFollowupDraft's
+    // draftText join into the request's first text part.
+    if (mode === "normal" && !text.trimStart().startsWith("/")) {
+      const keywordEnabled = sync.data.config?.workflows?.ultracode_keyword ?? true
+      const ultracode = buildUltracodeParts({ text, session: input.ultracodeSession(), keywordEnabled })
+      if (ultracode.directives.length > 0) {
+        const directiveParts: Prompt = ultracode.directives.map((content) => ({
+          type: "text",
+          content: `${content}\n\n`,
+          start: 0,
+          end: 0,
+        }))
+        // Strip the keyword from the visible text parts so the user prompt the
+        // model sees no longer contains the trigger word.
+        const stripped = ultracode.text !== text
+        const bodyParts: Prompt = stripped
+          ? currentPrompt.map((part) =>
+              part.type === "text" && part.content.length > 0 ? { ...part, content: ultracode.text } : part,
+            )
+          : currentPrompt
+        // Collapse the body to a single text part when stripping (the keyword span
+        // was computed over the joined text) while preserving non-text parts.
+        const nonText = stripped ? currentPrompt.filter((part) => part.type !== "text") : []
+        draft.prompt = stripped ? [...directiveParts, { type: "text", content: ultracode.text, start: 0, end: 0 }, ...nonText] : [...directiveParts, ...bodyParts]
+      }
     }
 
     if (text.startsWith("/")) {
