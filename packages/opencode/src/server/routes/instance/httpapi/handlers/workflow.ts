@@ -3,8 +3,8 @@ import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { notFound } from "../errors"
-import { type StartPayload, WorkflowApiError } from "../groups/workflow"
+import { ConflictError, notFound } from "../errors"
+import { type AnswerPayload, type StartPayload, WorkflowApiError } from "../groups/workflow"
 
 // Maps the engine's typed start() failures onto the HTTP contract:
 // - a broken/invalid workflow file (load failure) → 400 WorkflowApiError, with
@@ -91,6 +91,42 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       return run
     })
 
+    const answer = Effect.fn("WorkflowHttpApi.answer")(function* (ctx: {
+      params: { id: Workflow.RunID }
+      payload: AnswerPayload
+    }) {
+      // Distinguish 404 (unknown id) from 409 (no open question): answer() itself
+      // returns undefined for BOTH (Grounding-Delta 1). get() is directory-scoped
+      // exactly like answer()'s own probe, so a known-to-this-workspace run is the
+      // precondition for "has a question to answer".
+      const existing = yield* workflow.get(ctx.params.id)
+      if (!existing) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      const result = yield* workflow
+        .answer({
+          id: ctx.params.id,
+          answer: ctx.payload.answer,
+          // Thread the same prompt-ops the start handler uses so a PARKED run resumed
+          // by this answer can dispatch its post-question ctx.agent steps live.
+          prompt,
+          // When the caller supplied a session identity, surface the resumed run's
+          // interactive permission prompts there and derive its subagents' inherited
+          // permission ruleset from it — mirroring the start handler. Omitted ⇒ the
+          // documented headless fallback (no inherited ruleset).
+          permissionSessionID: ctx.payload.permissionSessionID,
+          caller: ctx.payload.permissionSessionID ? { sessionID: ctx.payload.permissionSessionID } : undefined,
+        })
+        .pipe(Effect.mapError(apiError(existing.workflow)))
+      // The run exists but answer() declined: there is no open question on it (a
+      // live run not waiting, a paused run without a pending_question, or a terminal
+      // run) → 409.
+      if (!result)
+        return yield* new ConflictError({
+          message: `Workflow run has no open question: ${ctx.params.id}`,
+          resource: ctx.params.id,
+        })
+      return result
+    })
+
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
       return yield* workflow.remove(ctx.params.id)
     })
@@ -102,6 +138,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("start", start)
       .handle("cancel", cancel)
       .handle("pause", pause)
+      .handle("answer", answer)
       .handle("remove", remove)
   }),
 )
