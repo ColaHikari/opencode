@@ -48,6 +48,14 @@ export type WorkflowAgentInput = {
   files?: string[]
   schema?: unknown
   permissionSessionID?: string
+  /**
+   * Run this step's subagent in a FRESH `git worktree` instead of the run's
+   * workspace, so parallel agents that mutate files do not conflict. The
+   * worktree is created when the step dispatches and auto-removed when the run
+   * finishes or is cancelled. Requires the workspace to be a git repository;
+   * otherwise the step fails with a clear error.
+   */
+  isolation?: "worktree"
 }
 
 export type WorkflowAgentResult = {

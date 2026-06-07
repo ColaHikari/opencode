@@ -14,6 +14,7 @@ import { MessageID } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { eq, sql } from "drizzle-orm"
 import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"
+import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Fiber, Layer } from "effect"
 import { Global } from "@opencode-ai/core/global"
@@ -297,6 +298,19 @@ export async function run(args, ctx) {
 `
 
 
+// Task 11: a single agent step requesting worktree isolation. When the workspace
+// is a git repository the engine runs the subagent inside a fresh `git worktree`
+// (auto-cleaned on the run scope); a non-git workspace fails the step with a
+// WorkflowInvalidError naming the missing git repository.
+const ISOLATION_FIXTURE = "isolation-step"
+const ISOLATION_WORKFLOW = `export const meta = { name: "${ISOLATION_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", isolation: "worktree" })
+  return { ok: true }
+}
+`
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -324,6 +338,43 @@ function capturingPromptOps() {
     cancel: () => Effect.void,
   }
   return { ops, inputs }
+}
+
+// Directory-capturing prompt-ops: like capturingPromptOps, but for each real
+// (non-noReply) dispatch it ALSO records the EFFECTIVE instance directory the
+// prompt runs under (`InstanceState.directory`). This is the directory the
+// subagent's file tools (bash/edit/write/read) resolve their cwd against — so
+// recording it from INSIDE the prompt-op Effect proves whether worktree
+// isolation actually redirects the child (the assertion target for Task 11),
+// not merely that a worktree was created.
+function directoryCapturingPromptOps() {
+  const inputs: SessionPrompt.PromptInput[] = []
+  const directories: string[] = []
+  // Whether the captured directory contained a `.git` entry AT DISPATCH TIME
+  // (i.e. while the worktree was still live) — proving it was a real git
+  // worktree, observed before the run-scope finalizer removes it.
+  const wasGitWorktree: boolean[] = []
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (!input.noReply) {
+          inputs.push(input)
+          const dir = yield* InstanceState.directory
+          directories.push(dir)
+          wasGitWorktree.push(
+            yield* Effect.promise(() =>
+              fs
+                .stat(path.join(dir, ".git"))
+                .then(() => true)
+                .catch(() => false),
+            ),
+          )
+        }
+        return assistantReply()
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, inputs, directories, wasGitWorktree }
 }
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
@@ -4464,6 +4515,86 @@ export async function run() { return { from: "global" } }
       expect(node?.status).toBe("failed")
       expect(node?.error).toContain("DOES_NOT_EXIST.md")
       // The prompt was never dispatched (the attachment could not be resolved).
+      expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 11: ctx.agent({ isolation: "worktree" }) runs the subagent inside a
+  // FRESH git worktree so parallel agents that mutate files do not conflict. The
+  // load-bearing assertion is that the EFFECTIVE instance directory the prompt
+  // runs under (what the subagent's file tools resolve cwd against) is the
+  // worktree path — NOT the run's workspace directory. The directory-capturing
+  // prompt-ops read InstanceState.directory from inside the dispatch, so we can
+  // assert real isolation rather than merely "a worktree was created". After the
+  // run finishes the worktree must be gone (run-scope finalizer cleaned it up).
+  it.instance(
+    "ctx.agent isolation:\"worktree\" runs the subagent in a fresh git worktree and cleans it up",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, inputs, directories, wasGitWorktree } = directoryCapturingPromptOps()
+
+        const started = yield* workflow.start({ name: ISOLATION_FIXTURE, args: {}, prompt: ops })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("isolation workflow did not finish")))
+        expect(done.status).toBe("completed")
+
+        // Exactly one real agent dispatch.
+        expect(inputs.length).toBe(1)
+        const effectiveDir = directories[0]
+        // The subagent ran under a DIFFERENT directory than the workspace — this
+        // is the load-bearing proof of real isolation: the prompt run (and so the
+        // subagent's file tools) resolves cwd against the worktree, not the
+        // workspace. Before the InstanceRef override this was the workspace dir.
+        expect(effectiveDir).toBeDefined()
+        expect(effectiveDir).not.toBe(test.directory)
+        // It was a real git worktree at dispatch time: it had a `.git` entry (a
+        // worktree's `.git` is a file pointing at the parent's gitdir), observed
+        // live before the finalizer removed it.
+        expect(wasGitWorktree[0]).toBe(true)
+        // The worktree lived OUTSIDE the workspace (a sibling temp dir), so it can
+        // never collide with the workspace or another step's worktree.
+        expect(effectiveDir!.startsWith(test.directory)).toBe(false)
+
+        // Run-scope finalizer cleans up the worktree. On a normal finish the run
+        // scope is closed fire-and-forget (so the terminal return is never delayed
+        // by a finalizer), meaning cleanup is async relative to wait() — poll for
+        // the directory to disappear rather than asserting it synchronously.
+        yield* pollWithTimeout(
+          Effect.promise(() =>
+            fs
+              .stat(effectiveDir!)
+              .then(() => undefined)
+              .catch(() => true as const),
+          ),
+          `worktree ${effectiveDir} was not cleaned up after the run finished`,
+        )
+      }),
+    { git: true },
+  )
+
+  // Task 11 (error path): isolation:"worktree" in a NON-git workspace is an
+  // authoring/environment error. The step must fail with a clear
+  // WorkflowInvalidError naming the missing git repository rather than crashing,
+  // and the prompt is never dispatched.
+  it.instance("ctx.agent isolation:\"worktree\" fails clearly outside a git repository", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: ISOLATION_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("isolation workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toContain("requires a git repository")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      // The prompt was never dispatched (no worktree to run in).
       expect(inputs.length).toBe(0)
     }),
   )

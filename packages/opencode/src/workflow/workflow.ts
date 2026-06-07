@@ -5,6 +5,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
 import { Identifier } from "@/id/id"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
@@ -408,6 +409,14 @@ export type AgentInput = {
   files?: string[]
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
+  /**
+   * Run this step's subagent in a FRESH `git worktree` instead of the run's
+   * workspace, so parallel agents that mutate files do not conflict. The
+   * worktree is created on first dispatch and auto-removed when the run finishes
+   * or is cancelled (registered on the run scope). Requires the workspace to be
+   * a git repository; otherwise the step fails with a WorkflowInvalidError.
+   */
+  isolation?: "worktree"
 }
 
 // Pipeline/parallel option and stage shapes are the public workflow-authoring
@@ -2008,12 +2017,64 @@ export const layer = Layer.effect(
             const createPermission = composeTools
               ? [...toolRules, ...derivedPermission!]
               : derivedPermission
+            // Per-step git-worktree isolation (Task 11). When requested, run the
+            // subagent inside a FRESH `git worktree` so parallel agents that
+            // mutate files cannot conflict. The worktree is created off the run's
+            // workspace (`active.directory`) and removed when the run finishes or
+            // is cancelled — the remove finalizer is registered on the RUN scope
+            // (this effect runs via dispatch → `Effect.forkIn(effect, runScope)`,
+            // so the finalizer attaches there, survives parallel steps, and fires
+            // on cancel). A non-git workspace cannot host a worktree, so the step
+            // fails with a clear WorkflowInvalidError instead of crashing.
+            //
+            // The isolation is load-bearing via the `InstanceRef` override below,
+            // NOT the session's `directory` field: the subagent's file tools
+            // (bash/edit/write/read) and the prompt loop resolve their cwd from
+            // the effective `InstanceState.context` (the `InstanceRef`), not from
+            // `session.directory`. So we both (a) override `InstanceRef` for the
+            // prompt run (what actually redirects the tools) and (b) record the
+            // worktree as the session's `directory` so the dashboard reflects
+            // where the work happened.
+            const instanceCtx = yield* InstanceState.context
+            let promptInstanceCtx = instanceCtx
+            let sessionDirectory = instanceCtx.directory
+            if (agentInput.isolation === "worktree") {
+              const base = path.join(os.tmpdir(), `oc-wf-${active.run.id}-${node.id}`)
+              const res = Bun.spawnSync(["git", "worktree", "add", "--detach", base], { cwd: instanceCtx.directory })
+              if (res.exitCode !== 0) {
+                return yield* new InvalidError({
+                  path: active.run.workflow,
+                  message: `ctx.agent isolation:"worktree" requires a git repository (${new TextDecoder().decode(res.stderr).trim()})`,
+                })
+              }
+              // Cleanup on the RUN scope: survives parallel steps, fires on
+              // cancel/finish. Register EXPLICITLY on `active.runScope` rather
+              // than via `Effect.addFinalizer` (which targets the ambient Scope):
+              // this effect is forked via `Effect.forkIn(effect, runScope)`, which
+              // SUPERVISES the fiber under the run scope but does NOT provide that
+              // scope as the `Scope` service in context — so an ambient
+              // `addFinalizer` would attach to the wrong (or no) scope. Targeting
+              // the run scope object directly guarantees the worktree is removed
+              // exactly once when the run terminates (finish closes runScope) or
+              // is cancelled/removed (abortRun closes it), never per step.
+              yield* Scope.addFinalizer(
+                active.runScope,
+                Effect.sync(() => {
+                  Bun.spawnSync(["git", "worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
+                }),
+              )
+              // A fresh worktree is a self-contained working tree, so both the
+              // working directory AND the worktree root point at `base`.
+              promptInstanceCtx = { ...instanceCtx, directory: base, worktree: base }
+              sessionDirectory = base
+            }
             const session = yield* sessions.create({
               parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
               title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
               agent: selected.name,
               model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID, variant } : undefined,
               permission: createPermission,
+              directory: sessionDirectory,
             })
             node.agent = selected.name
             if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
@@ -2059,7 +2120,14 @@ export const layer = Layer.effect(
               // Declarative file attachments (Task 10) follow the text part, in the
               // order they were declared.
               parts: [{ type: "text", text: promptText }, ...fileParts],
-            })
+              // Worktree isolation (Task 11): override the effective InstanceRef
+              // for the subagent's prompt run so its file tools resolve cwd
+              // against the worktree, not the run's workspace. `InstanceRef` is a
+              // Context.Reference (innermost-wins), so this local provide beats
+              // the run-level one attached at the dispatch boundary. When isolation
+              // is off, `promptInstanceCtx === instanceCtx` so this is the prior
+              // (effectively no-op) provide of the same ref value.
+            }).pipe(Effect.provideService(InstanceRef, promptInstanceCtx))
             node.message_id = message.info.id
             if (message.info.role === "assistant") {
               node.model = `${message.info.providerID}/${message.info.modelID}`
