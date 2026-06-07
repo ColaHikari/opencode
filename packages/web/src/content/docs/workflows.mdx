@@ -3,11 +3,13 @@ title: Workflows
 description: Create repeatable multi-step workflows with phases, arguments, and agent fan-out.
 ---
 
-Workflows let you define repeatable, project-specific automation. A workflow can collect arguments, report progress through phases, run steps in sequence, fan out work in parallel, and call agents for model-generated results. You can start one interactively from the TUI, or let an agent start one through the `workflow` tool.
+Workflows let you define repeatable, project-specific automation. A workflow can collect arguments, report progress through phases, run steps in sequence, fan out work in parallel, and call agents for model-generated results. You can start one interactively from the terminal TUI or the desktop app, or let an agent start one through the `workflow` tool.
+
+The `/workflow`, `/<name>`, and `/workflows` slash commands, the `/ultracode` toggle, and the run dashboard are available in both the terminal TUI and the desktop app. Two dashboard actions are terminal-only for now: saving a run as a reusable command (the desktop app has no file-write path yet) and the per-run start-approval prompt (the desktop app starts a workflow directly).
 
 ## Run a workflow
 
-Open the TUI:
+Open the terminal TUI (or the desktop app — the slash commands and dashboard work the same in both):
 
 ```bash frame="none"
 opencode
