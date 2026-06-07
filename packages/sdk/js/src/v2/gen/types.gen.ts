@@ -2917,6 +2917,13 @@ export type ConflictError = {
   resource?: string
 }
 
+export type WorkflowSource = {
+  name: string
+  path: string
+  source: string
+  source_kind?: "builtin"
+}
+
 export type WorkflowStartPayload = {
   args?: {
     [key: string]: unknown
@@ -9835,6 +9842,40 @@ export type WorkflowGetResponses = {
 }
 
 export type WorkflowGetResponse = WorkflowGetResponses[keyof WorkflowGetResponses]
+
+export type WorkflowSourceData = {
+  body?: never
+  path: {
+    name: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/{name}/source"
+}
+
+export type WorkflowSourceErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowSourceError = WorkflowSourceErrors[keyof WorkflowSourceErrors]
+
+export type WorkflowSourceResponses = {
+  /**
+   * Workflow source
+   */
+  200: WorkflowSource
+}
+
+export type WorkflowSourceResponse = WorkflowSourceResponses[keyof WorkflowSourceResponses]
 
 export type WorkflowStartData = {
   body?: WorkflowStartPayload

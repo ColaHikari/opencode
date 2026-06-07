@@ -338,6 +338,8 @@ import type {
   WorkflowSaveErrors,
   WorkflowSavePayload,
   WorkflowSaveResponses,
+  WorkflowSourceErrors,
+  WorkflowSourceResponses,
   WorkflowStartErrors,
   WorkflowStartPayload,
   WorkflowStartResponses,
@@ -5211,6 +5213,38 @@ export class Workflow extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<WorkflowGetResponses, WorkflowGetErrors, ThrowOnError>({
       url: "/workflow/run/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Read workflow source
+   *
+   * Resolve a single named workflow's module source (file text for an on-disk workflow, the bundled string for a builtin) for the pre-run approval preview.
+   */
+  public source<ThrowOnError extends boolean = false>(
+    parameters: {
+      name: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "name" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowSourceResponses, WorkflowSourceErrors, ThrowOnError>({
+      url: "/workflow/{name}/source",
       ...options,
       ...params,
     })

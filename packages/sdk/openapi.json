@@ -10306,6 +10306,78 @@
         ]
       }
     },
+    "/workflow/{name}/source": {
+      "get": {
+        "tags": ["workflow"],
+        "operationId": "workflow.source",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowSource"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Resolve a single named workflow's module source (file text for an on-disk workflow, the bundled string for a builtin) for the pre-run approval preview.",
+        "summary": "Read workflow source",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.source({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/workflow/{name}/start": {
       "post": {
         "tags": ["workflow"],
@@ -21916,6 +21988,26 @@
           }
         },
         "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "WorkflowSource": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_kind": {
+            "type": "string",
+            "enum": ["builtin"]
+          }
+        },
+        "required": ["name", "path", "source"],
         "additionalProperties": false
       },
       "WorkflowStartPayload": {
