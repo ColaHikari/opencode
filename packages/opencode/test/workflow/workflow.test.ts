@@ -1333,6 +1333,30 @@ export async function run(args, ctx) {
 }
 `
 
+// Tasks 12/13 (ctx.question): ein Workflow, der EINE Frage stellt und die Antwort
+// zurückgibt. Wird live beantwortet (Deferred), bevor das Timeout feuert. Der
+// Question-Node landet als Journal-Step (kind:"question"), so dass ein Resume die
+// Antwort aus dem Journal serviert statt erneut zu fragen.
+const QUESTION_FIXTURE = "ask-question"
+const QUESTION_WORKFLOW = `export const meta = { name: "${QUESTION_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "deploy?", options: ["yes", "no"] })
+  return { answer: a.answer }
+}
+`
+// Timeout-Variante: dieselbe Frage, aber mit winzigem Timeout. Wird sie nicht
+// rechtzeitig beantwortet, PARKT der Run als `paused` über die bestehende
+// Pause-Maschinerie, die offene Question wird persistiert (pending_question).
+const QUESTION_TIMEOUT_FIXTURE = "ask-question-timeout"
+const QUESTION_TIMEOUT_WORKFLOW = `export const meta = { name: "${QUESTION_TIMEOUT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "deploy?", options: ["yes", "no"], timeout: 50 })
+  return { answer: a.answer }
+}
+`
+
 // Prompt-Ops für den Drift-Test: zählt jeden GEFEUERTEN (live) Prompt und liefert,
 // wenn ein Schema angefordert wurde (input.format gesetzt), eine strukturierte
 // Antwort (message.info.structured) — sonst PLAINTEXT, dessen Text KEIN gültiges
@@ -1434,6 +1458,9 @@ describe("Workflow", () => {
       expect(last.data["directory"]).toBe(test.directory)
       expect(last.data["agents"]).toEqual({ total: 0, running: 0, failed: 0 })
       expect(Array.isArray(last.data["agents"])).toBe(false)
+      // The slim payload carries a `pending_question` flag (false for a run with
+      // no open human-in-the-loop question — Tasks 12/13).
+      expect(last.data["pending_question"]).toBe(false)
     }),
   )
 
@@ -2498,6 +2525,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
         "result",
         "error",
         "resume_of",
+        "pending_question",
       ])
       for (const key of Object.keys(liveAny))
         expect(allowed.has(key)).toBe(true)
@@ -4445,6 +4473,102 @@ export async function run() { return { from: "global" } }
       // Der Agent-Node ist NICHT als cached markiert (Cache-MISS → Live-Lauf).
       const node = done.agents.find((a) => a.prompt === "drift agent")
       expect(node?.cached).not.toBe(true)
+    }),
+  )
+
+  // TASK 12/13 — TEST A (live answer): ctx.question persists a pending question on
+  // the run (pending_question + a kind:"question" journal node), emits a
+  // workflow.run.updated event carrying pending_question:true, and waits LIVE for
+  // an answer. workflow.answer({ id, answer }) resolves the Deferred → the body
+  // gets { answer }, the run completes, pending_question is cleared, and the
+  // question node carries the answer.
+  it.instance("ctx.question waits live for an answer, records it on the journal node, clears pending_question", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_FIXTURE, QUESTION_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const events = yield* EventV2Bridge.Service
+      const seenPending: boolean[] = []
+      const unsub = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === "workflow.run.updated") seenPending.push((event.data as Record<string, unknown>)["pending_question"] === true)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsub)
+
+      const run = yield* workflow.start({ name: QUESTION_FIXTURE, args: {}, prompt: immediatePromptOps() })
+
+      // Poll until the pending question is persisted/visible on the run.
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.pending_question?.question === "deploy?" ? current : undefined
+        }),
+        "pending question never appeared",
+      )
+      expect(live.pending_question?.options).toEqual(["yes", "no"])
+      expect(live.status).toBe("running")
+
+      // Answer it live.
+      const answered = yield* workflow.answer({ id: run.id, answer: "yes" })
+      expect(answered?.id).toBe(run.id)
+
+      const done =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("question run did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("yes")
+      // pending_question cleared after the answer.
+      expect(done.pending_question).toBeUndefined()
+      // The journal carries a kind:"question" node with the answer.
+      const qnode = done.agents.find((a) => a.kind === "question")
+      expect(qnode).toBeDefined()
+      expect(qnode?.prompt).toBe("deploy?")
+      expect(qnode?.answer).toBe("yes")
+      expect(qnode?.status).toBe("completed")
+      // At least one workflow.run.updated event carried pending_question:true.
+      expect(seenPending.some((p) => p === true)).toBe(true)
+    }),
+  )
+
+  // TASK 12/13 — TEST B (park + resume): a question with a tiny timeout that goes
+  // unanswered PARKS the run as `paused` (existing pause machinery), keeping the
+  // journal (incl. the open question node) and the persisted pending_question.
+  // workflow.answer on the paused run starts a RESUME (resume_of) whose journal
+  // replay serves the answer to the question node WITHOUT asking again.
+  it.instance("an unanswered ctx.question times out, parks as paused, and answer() resumes serving the reply", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_TIMEOUT_FIXTURE, QUESTION_TIMEOUT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const run = yield* workflow.start({ name: QUESTION_TIMEOUT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+
+      // The timeout (50ms) fires → the run parks as paused.
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("timeout run did not settle")))
+      expect(paused.status).toBe("paused")
+      // The open question node + persisted pending_question survive the park.
+      expect(paused.pending_question?.question).toBe("deploy?")
+      const openNode = paused.agents.find((a) => a.kind === "question")
+      expect(openNode).toBeDefined()
+      expect(openNode?.answer).toBeUndefined()
+
+      // answer() on the paused run starts a NEW resume run.
+      const resumed = yield* workflow.answer({ id: run.id, answer: "no" })
+      expect(resumed).toBeDefined()
+      expect(resumed!.id).not.toBe(run.id)
+      expect(resumed!.resume_of).toBe(run.id)
+
+      const done =
+        (yield* workflow.wait({ id: resumed!.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("no")
+      // No second live ask on the resumed run: the question node carries the
+      // replayed answer and there is no open pending_question.
+      expect(done.pending_question).toBeUndefined()
+      const replayed = done.agents.find((a) => a.kind === "question")
+      expect(replayed?.answer).toBe("no")
+      expect(replayed?.status).toBe("completed")
     }),
   )
 

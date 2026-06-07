@@ -69,6 +69,7 @@ const it = testEffect(
           wait: () => Effect.succeed({ timedOut: false }),
           cancel: () => Effect.succeed(undefined),
           pause: () => Effect.succeed(undefined),
+          answer: () => Effect.succeed(undefined),
           remove: () => Effect.succeed(false),
           sweep: () => Effect.void,
         }),

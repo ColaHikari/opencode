@@ -145,6 +145,16 @@ export type WorkflowContext = {
    * workflow invoked via `ctx.workflow` cannot itself call `ctx.workflow`.
    */
   workflow(name: string, args?: Record<string, unknown>): Promise<unknown>
+  /**
+   * Ask a human a question and wait for the answer (human-in-the-loop). Persists
+   * the question on the run and resolves to `{ answer }` once it is answered via
+   * the workflow `answer` API, racing a timeout (default 10 minutes). If the
+   * timeout elapses unanswered the run PARKS as `paused` with the question kept —
+   * a later answer resumes the run and the body receives the reply (replayed from
+   * the journal) without asking again. `options` is an optional list of suggested
+   * answers surfaced to the human; the resolved `answer` is a free-form string.
+   */
+  question(input: { question: string; options?: readonly string[]; timeout?: number }): Promise<{ answer: string }>
 }
 
 export function workflow<const Args extends WorkflowArguments | undefined = undefined>(input: {

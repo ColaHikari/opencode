@@ -324,6 +324,16 @@ export type StartOptions = StartInput & {
    * replay, so its `ctx.agent` call runs live and re-prompts.
    */
   invalidate_agents?: number[]
+  /**
+   * Seeded answers for a resume that picks up a run parked on a `ctx.question`
+   * (Tasks 12/13). A map of question TEXT → answer. During the resume the engine
+   * builds a question journal from the source run's `kind:"question"` nodes; on
+   * reaching the matching `ctx.question` the body is served the seeded answer
+   * (and the node is marked `cached`) instead of asking the user again. Only
+   * meaningful together with `resume_of`. Set by `answer()` on a paused run;
+   * unused by an ordinary resume.
+   */
+  questionAnswers?: Record<string, string>
 }
 
 export type WaitInput = {
@@ -334,6 +344,11 @@ export type WaitInput = {
 export type WaitResult = {
   run?: Run
   timedOut: boolean
+}
+
+export type AnswerInput = {
+  id: RunID
+  answer: string
 }
 
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("WorkflowNotFoundError", {
@@ -487,6 +502,22 @@ export type ContextApi = {
    * (the nested call throws a WorkflowInvalidError).
    */
   readonly workflow: (name: string, args?: Record<string, unknown>) => Promise<unknown>
+  /**
+   * Human-in-the-loop step (Tasks 12/13): persist a pending question on the run,
+   * emit a `workflow.run.updated` event carrying `pending_question: true`, then
+   * wait LIVE for an answer (a Deferred resolved by the service `answer()` method),
+   * racing a timeout (default 10 minutes). On answer it resolves to `{ answer }`
+   * and clears the pending question; the question is also recorded as a
+   * `kind:"question"` journal node so a resumed run can replay the answer instead
+   * of asking again. If the timeout elapses unanswered the run PARKS as `paused`
+   * (the same pause machinery), keeping the open question so a later `answer()`
+   * resumes it.
+   */
+  readonly question: (input: {
+    question: string
+    options?: readonly string[]
+    timeout?: number
+  }) => Promise<{ answer: string }>
 }
 
 // `ContextApi` is the engine-side view of the run context handed to a workflow
@@ -596,6 +627,23 @@ type Active = {
   journalCursor?: Map<string, number>
   /** Id of the source run this run resumed from; mirrored onto `run.resume_of` and the row. */
   resumeOf?: RunID
+  /**
+   * The open human-in-the-loop question this run is currently parked on inside
+   * `ctx.question` (Tasks 12/13). `deferred` is resolved by `answer()` on a LIVE
+   * run to hand the reply back to the body; `node` is the `kind:"question"`
+   * journal node so `answer()` can stamp the answer onto it. Set while a question
+   * is awaited, cleared the instant it resolves (live) or times out (park).
+   */
+  pendingQuestion?: { deferred: Deferred.Deferred<{ answer: string }>; node: AgentRun }
+  /**
+   * Resume answer journal (Tasks 12/13): when this run resumed a source run that
+   * was parked on a question, the answer supplied to `answer()` keyed by the
+   * question node's call shape ([question, phase]). On reaching the matching
+   * `ctx.question` the body is served this answer from the journal instead of
+   * asking again — the SAME journal-replay seam the agent journal uses. Absent on
+   * a run that did not resume a question.
+   */
+  questionJournal?: Map<string, string>
 }
 
 type State = {
@@ -622,6 +670,18 @@ export interface Interface {
    * returned as-is (idempotent); a non-live but persisted row is returned verbatim.
    */
   readonly pause: (id: RunID) => Effect.Effect<Run | undefined>
+  /**
+   * Answers the open human-in-the-loop question on a run (Tasks 12/13):
+   * - a LIVE run waiting in `ctx.question` → resolve the Deferred so the body
+   *   receives `{ answer }`, clear the pending question, persist, and return the
+   *   updated run.
+   * - a `paused` run with a persisted `pending_question` → START a resume
+   *   (`resume_of`) whose journal replay serves this answer to the question node
+   *   instead of asking again, and return the NEW run.
+   * - an unknown id, or a run with no open question → `undefined` (the HTTP
+   *   mapping is a later track).
+   */
+  readonly answer: (input: AnswerInput) => Effect.Effect<Run | undefined, InvalidError | NotFoundError>
   readonly remove: (id: RunID) => Effect.Effect<boolean>
   /**
    * Marks every `running` DB row that has no live registry entry as
@@ -1094,6 +1154,23 @@ function journalKey(parts: { prompt: string; agent?: string; phase?: string }): 
   return JSON.stringify([parts.prompt, parts.agent ?? null, parts.phase ?? null])
 }
 
+// Resume journal key for a `ctx.question` node (Tasks 12/13). The question has no
+// agent/model/schema, so it keys purely on [kind:"question", question, phase] —
+// the question text plus the phase it was asked in. The literal "question" tag
+// keeps the namespace disjoint from agent keys even if a prompt happened to equal
+// a question. Built identically on the seed side (from the source run's question
+// node) and the live side (the re-asked question), so a resumed run resolves the
+// answer from the journal instead of asking again.
+function questionJournalKey(parts: { question: string; phase?: string }): string {
+  return JSON.stringify(["question", parts.question, parts.phase ?? null])
+}
+
+// The default wait for a `ctx.question` with no explicit `timeout` (Tasks 12/13):
+// 10 minutes. Once it elapses with no answer the run PARKS as `paused` (existing
+// pause machinery) with the open question persisted, so a later `answer()` can
+// resume it. Tests pass a tiny timeout to exercise the park path quickly.
+const DEFAULT_QUESTION_TIMEOUT_MS = 10 * 60 * 1000
+
 // loadModule writes a transient import copy ALONGSIDE the source file (same
 // directory) on purpose: relative imports and the workflow module's
 // node_modules resolution are anchored on the source directory, so moving the
@@ -1286,6 +1363,7 @@ function createContext(input: {
   active: Active
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
   shell: ContextApi["shell"]
+  question: ContextApi["question"]
   workflow: ContextApi["workflow"]
   permissionSessionID?: SessionID
   persist: () => void
@@ -1435,6 +1513,7 @@ function createContext(input: {
     }) as ContextApi["pipeline"],
     agent: input.agent,
     shell: input.shell,
+    question: input.question,
     workflow: input.workflow,
   }
 }
@@ -1753,6 +1832,12 @@ export const layer = Layer.effect(
       // call then runs live), so a stale resume id degrades to a normal run rather
       // than failing the start.
       const journal = new Map<string, AgentRun[]>()
+      // Question replay journal (Tasks 12/13): when this resume seeds answers
+      // (answer() on a paused run), map the source run's `kind:"question"` nodes to
+      // their provided answer keyed by [question, phase] — the SAME shape the live
+      // `ctx.question` will rebuild. On reaching that question the body is served
+      // the answer from here instead of asking again.
+      const questionJournal = new Map<string, string>()
       if (input.resume_of) {
         const sourceRow = yield* db
           .select()
@@ -1776,6 +1861,18 @@ export const layer = Layer.effect(
           }
           const invalidate = new Set(input.invalidate_agents ?? [])
           sourceRow.agents.forEach((node, index) => {
+            // A `kind:"question"` node is replayed from the SEEDED answer (not the
+            // agent journal): match it on [question, phase] and record the supplied
+            // answer. The source node may be `failed`/"Paused" (a timed-out park
+            // flips the still-open node), so — unlike the agent journal — we do NOT
+            // gate on `completed`; the seed answer is what makes the replay valid.
+            if (node.kind === "question") {
+              const seeded = input.questionAnswers?.[node.prompt]
+              if (seeded !== undefined) {
+                questionJournal.set(questionJournalKey({ question: node.prompt, phase: node.phase }), seeded)
+              }
+              return
+            }
             if (node.status !== "completed") return
             if (invalidate.has(index)) return
             const key = journalKey({ prompt: node.prompt, agent: node.agent, phase: node.phase })
@@ -1837,6 +1934,7 @@ export const layer = Layer.effect(
         journal: input.resume_of ? journal : undefined,
         journalCursor: input.resume_of ? new Map<string, number>() : undefined,
         resumeOf: input.resume_of,
+        questionJournal: input.resume_of && questionJournal.size > 0 ? questionJournal : undefined,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, events, active)
@@ -2408,6 +2506,100 @@ export const layer = Layer.effect(
         )
       }
 
+      // Human-in-the-loop step (Tasks 12/13). Persists a pending question on the
+      // run, records it as a `kind:"question"` journal node, and waits LIVE for an
+      // answer (a Deferred resolved by the service `answer()` method) racing a
+      // timeout (default 10 minutes). It deliberately does NOT consume an agent
+      // dispatch, the budget, or the lifetime cap — a question is not an LLM step.
+      const question: ContextApi["question"] = (questionInput) => {
+        // Gate exactly like ctx.agent/ctx.shell: a fired signal or a landed
+        // cancel/pause means the run is unwinding, so refuse to ask.
+        if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
+        const phase = active.run.current_phase
+        const node: AgentRun = {
+          id: `${active.run.agents.length + 1}`,
+          status: "running",
+          started_at: Date.now(),
+          phase,
+          kind: "question",
+          // The question text rides on `prompt` so it shares the journal-node
+          // shape (and the resume key is built from it, like an agent prompt).
+          prompt: questionInput.question,
+        }
+        active.run.agents.push(node)
+        // Resume replay: a resumed run that was parked on this exact question
+        // ([question, phase]) is served the SEEDED answer from the question journal
+        // — no live ask, no pending_question. Mirrors the agent-journal replay:
+        // mark the node completed + cached, record the answer, return it.
+        const replayKey = questionJournalKey({ question: questionInput.question, phase })
+        const seeded = active.questionJournal?.get(replayKey)
+        if (seeded !== undefined) {
+          node.status = "completed"
+          node.completed_at = Date.now()
+          node.answer = seeded
+          node.cached = true
+          persistInScope(active, bridge, db, events)
+          return Promise.resolve({ answer: seeded })
+        }
+        // Live path: persist the open question (emits workflow.run.updated with
+        // pending_question:true) and park on a Deferred + timeout race. The wait
+        // runs through `dispatch` (forked into the run scope) so an external
+        // pause()/cancel() that closes the run scope interrupts it — exactly like
+        // a hung ctx.agent. `answer()` resolves the Deferred to wake it live.
+        const timeout = questionInput.timeout ?? DEFAULT_QUESTION_TIMEOUT_MS
+        const options = questionInput.options ? [...questionInput.options] : undefined
+        return dispatch(
+          Effect.gen(function* () {
+            const deferred = yield* Deferred.make<{ answer: string }>()
+            // Publish the open question and register the Deferred so answer() can
+            // find + resolve it. Set BEFORE persist so a concurrent answer() that
+            // observes the persisted pending_question also sees the live Deferred.
+            active.pendingQuestion = { deferred, node }
+            active.run.pending_question = { question: questionInput.question, options, asked_at: node.started_at }
+            yield* persistRun(db, events, active)
+            // Race the answer against the timeout. `timeoutOption` is interruptible,
+            // so a run-scope close (external pause/cancel) unwinds this wait too.
+            const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(timeout))
+            return result
+          }),
+        ).then((result) => {
+          // Resolve (answer landed) or park (timeout). Either way the question is no
+          // longer pending in-memory.
+          active.pendingQuestion = undefined
+          if (result._tag === "Some") {
+            // Live answer. `answer()` is the authoritative writer (it completes the
+            // node + clears pending_question + persists before resolving the
+            // Deferred), so this branch only needs to hand the reply back to the
+            // body. Idempotently close the node if it was somehow left open, so the
+            // body never proceeds with a still-`running` question node.
+            if (node.status === "running") {
+              active.run.pending_question = undefined
+              node.status = "completed"
+              node.completed_at = Date.now()
+              node.answer = result.value.answer
+              persistInScope(active, bridge, db, events)
+            }
+            return result.value
+          }
+          // Timeout: PARK the run as `paused` via the existing pause machinery.
+          // Keep `pending_question` AND the open question node intact (do NOT
+          // complete the node) so a later answer() can resume. Setting `pausing`
+          // makes the body's matchCauseEffect map this unwind to `paused`, racing
+          // pause()'s own finish idempotently. Throwing CancelledError unwinds the
+          // body the same way an interrupt-driven pause does.
+          active.pausing = true
+          throw new CancelledError()
+        }, (error) => {
+          // An external pause()/cancel() that closed the run scope rejects the
+          // dispatched wait with CancelledError. Drop the dangling in-memory
+          // pending-question reference (the run is unwinding to paused/cancelled via
+          // abortRun's own finish) and let the rejection propagate so the body
+          // unwinds consistently with the rest of the engine.
+          active.pendingQuestion = undefined
+          throw error
+        })
+      }
+
       // Build the run context for the top-level body OR a depth-1 nested workflow.
       // Captured here so `ctx.workflow` (below) can re-enter it with a bumped
       // `depth` and a `logPrefix`, sharing the SAME `active` — and thus the same
@@ -2417,6 +2609,7 @@ export const layer = Layer.effect(
           active,
           agent,
           shell,
+          question,
           workflow: (name, childArgs) => runNested(ctxInput.depth, name, childArgs),
           logPrefix: ctxInput.logPrefix,
           persist: () => void persistInScope(active, bridge, db, events),
@@ -2672,6 +2865,49 @@ export const layer = Layer.effect(
       return finished ?? (yield* persisted())
     })
 
+    const answer: Interface["answer"] = Effect.fn("Workflow.answer")(function* (input) {
+      const id = input.id
+      const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
+      // LIVE run waiting in ctx.question: this is the authoritative writer. Complete
+      // the question node + clear the persisted pending_question + persist, THEN
+      // resolve the Deferred so the parked ctx.question wakes and hands { answer }
+      // to the body. The returned snapshot already reflects the cleared question.
+      if (active && active.run.status === "running" && active.pendingQuestion) {
+        const { deferred, node } = active.pendingQuestion
+        active.pendingQuestion = undefined
+        active.run.pending_question = undefined
+        node.status = "completed"
+        node.completed_at = yield* Clock.currentTimeMillis
+        node.answer = input.answer
+        yield* persistRun(db, events, active)
+        yield* Deferred.succeed(deferred, { answer: input.answer }).pipe(Effect.ignore)
+        return snapshot(active)
+      }
+      // No live open question. Consult the (directory-scoped) DB row: a `paused` run
+      // with a persisted `pending_question` is resumed — start a NEW run keyed off
+      // the source, seeding the answer into the question journal so the replayed
+      // ctx.question returns it instead of asking again. Any other state (no pending
+      // question, terminal, unknown id, foreign directory) ⇒ undefined.
+      const directory = yield* InstanceState.directory
+      const row = yield* db
+        .select()
+        .from(WorkflowRunTable)
+        .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row || row.status !== "paused" || !row.pending_question) return undefined
+      // Resume: re-run the SAME workflow, replaying the agent journal AND serving
+      // the seeded answer to the question node. No prompt ops are threaded here
+      // (answer() has no session identity) — a question-only resume needs none; a
+      // resume with live agent steps after the question is a later (HTTP) track.
+      return yield* start({
+        name: row.workflow,
+        args: row.args ?? undefined,
+        resume_of: id,
+        questionAnswers: { [row.pending_question.question]: input.answer },
+      })
+    })
+
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
       const inst = yield* InstanceState.get(state)
       const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
@@ -2711,7 +2947,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, runs, get, start, wait, cancel, pause, remove, sweep })
+    return Service.of({ list, runs, get, start, wait, cancel, pause, answer, remove, sweep })
   }),
 )
 
