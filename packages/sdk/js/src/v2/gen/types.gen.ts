@@ -2888,6 +2888,35 @@ export type WorkflowRun = {
   }
 }
 
+export type WorkflowSavePayload = {
+  /**
+   * Workflow file base name (becomes /<name>); letters, numbers, underscores, and dashes only.
+   */
+  name: string
+  /**
+   * The complete TypeScript/JavaScript workflow module source.
+   */
+  source: string
+  scope?: "project" | "global"
+}
+
+export type WorkflowSaveResult = {
+  path: string
+}
+
+export type WorkflowApiError = {
+  _tag: "WorkflowApiError"
+  message: string
+  workflow?: string
+  path?: string
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
 export type WorkflowStartPayload = {
   args?: {
     [key: string]: unknown
@@ -2898,25 +2927,12 @@ export type WorkflowStartPayload = {
   invalidate_agents?: Array<number>
 }
 
-export type WorkflowApiError = {
-  _tag: "WorkflowApiError"
-  message: string
-  workflow?: string
-  path?: string
-}
-
 export type WorkflowAnswerPayload = {
   /**
    * The human answer to the run's open question.
    */
   answer: string
   permissionSessionID?: string
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type UnauthorizedError = {
@@ -9723,6 +9739,38 @@ export type WorkflowRunsResponses = {
 }
 
 export type WorkflowRunsResponse = WorkflowRunsResponses[keyof WorkflowRunsResponses]
+
+export type WorkflowSaveData = {
+  body?: WorkflowSavePayload
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/save"
+}
+
+export type WorkflowSaveErrors = {
+  /**
+   * WorkflowApiError | InvalidRequestError
+   */
+  400: WorkflowApiError | InvalidRequestError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowSaveError = WorkflowSaveErrors[keyof WorkflowSaveErrors]
+
+export type WorkflowSaveResponses = {
+  /**
+   * Workflow saved to disk
+   */
+  200: WorkflowSaveResult
+}
+
+export type WorkflowSaveResponse = WorkflowSaveResponses[keyof WorkflowSaveResponses]
 
 export type WorkflowDeleteData = {
   body?: never

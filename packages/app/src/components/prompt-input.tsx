@@ -541,9 +541,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     },
     {
       id: "ultracode.toggle",
-      title: language.t(
-        store.ultracodeSession ? "command.ultracode.disable" : "command.ultracode.enable",
-      ),
+      title: language.t(store.ultracodeSession ? "command.ultracode.disable" : "command.ultracode.enable"),
       category: language.t("command.category.session"),
       slash: "ultracode",
       onSelect: () => {

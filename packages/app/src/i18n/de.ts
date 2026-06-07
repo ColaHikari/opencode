@@ -904,7 +904,8 @@ export const dict = {
   "dialog.workflow.action.save": "Als Befehl speichern",
   "dialog.workflow.save.noSource": "Diese Ausführung hat keinen gespeicherten Quelltext zum Speichern.",
   "dialog.workflow.save.title": "Workflow als Befehl speichern",
-  "dialog.workflow.save.description": "Speichere den Quelltext dieser Ausführung als wiederverwendbaren /<name>-Workflow.",
+  "dialog.workflow.save.description":
+    "Speichere den Quelltext dieser Ausführung als wiederverwendbaren /<name>-Workflow.",
   "dialog.workflow.save.placeholder": "workflow-name",
   "dialog.workflow.save.scope.project": "Projekt",
   "dialog.workflow.save.scope.global": "Global",

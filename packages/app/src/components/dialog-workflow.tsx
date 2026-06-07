@@ -159,9 +159,7 @@ export const DialogWorkflow: Component = () => {
                     <span class="shrink-0 text-text-strong">{statusIcon(run.status)}</span>
                     <div class="flex flex-col min-w-0">
                       <span class="text-14-regular text-text-strong truncate">{run.workflow}</span>
-                      <span class="text-11-regular text-text-weak truncate">
-                        {formatPhase(run, workflowFor(run))}
-                      </span>
+                      <span class="text-11-regular text-text-weak truncate">{formatPhase(run, workflowFor(run))}</span>
                     </div>
                     <div class="ml-auto flex items-center gap-1 shrink-0">
                       <Show when={questionBadge(run)}>
@@ -181,7 +179,9 @@ export const DialogWorkflow: Component = () => {
           <div class="flex-1 min-w-0 overflow-auto no-scrollbar">
             <Show
               when={selected()}
-              fallback={<div class="text-text-weak text-14-regular px-1">{language.t("dialog.workflow.detail.empty")}</div>}
+              fallback={
+                <div class="text-text-weak text-14-regular px-1">{language.t("dialog.workflow.detail.empty")}</div>
+              }
             >
               {(run) => <WorkflowDetail run={run()} phases={phasesFor(run())} cost={totalCost(run())} />}
             </Show>
@@ -406,7 +406,10 @@ const DialogWorkflowSave: Component<{ run: WorkflowRun }> = (props) => {
   }
 
   return (
-    <Dialog title={language.t("dialog.workflow.save.title")} description={language.t("dialog.workflow.save.description")}>
+    <Dialog
+      title={language.t("dialog.workflow.save.title")}
+      description={language.t("dialog.workflow.save.description")}
+    >
       <div class="flex flex-col gap-3 px-1">
         <TextField
           autofocus
@@ -415,16 +418,10 @@ const DialogWorkflowSave: Component<{ run: WorkflowRun }> = (props) => {
           onChange={setName}
         />
         <div class="flex items-center gap-2">
-          <Button
-            variant={scope() === "project" ? "primary" : "secondary"}
-            onClick={() => setScope("project")}
-          >
+          <Button variant={scope() === "project" ? "primary" : "secondary"} onClick={() => setScope("project")}>
             {language.t("dialog.workflow.save.scope.project")}
           </Button>
-          <Button
-            variant={scope() === "global" ? "primary" : "secondary"}
-            onClick={() => setScope("global")}
-          >
+          <Button variant={scope() === "global" ? "primary" : "secondary"} onClick={() => setScope("global")}>
             {language.t("dialog.workflow.save.scope.global")}
           </Button>
         </div>

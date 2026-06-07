@@ -10084,6 +10084,86 @@
         ]
       }
     },
+    "/workflow/save": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.save",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow saved to disk",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowSaveResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "WorkflowApiError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkflowApiError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Save a workflow source string as a discoverable workflow file under the project or global workflows directory.",
+        "summary": "Save workflow",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowSavePayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.save({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/workflow/run/{id}": {
       "get": {
         "tags": ["workflow"],
@@ -21772,6 +21852,72 @@
         "required": ["id", "workflow", "status", "started_at", "logs", "agents"],
         "additionalProperties": false
       },
+      "WorkflowSavePayload": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Workflow file base name (becomes /<name>); letters, numbers, underscores, and dashes only."
+          },
+          "source": {
+            "type": "string",
+            "description": "The complete TypeScript/JavaScript workflow module source."
+          },
+          "scope": {
+            "type": "string",
+            "enum": ["project", "global"]
+          }
+        },
+        "required": ["name", "source"],
+        "additionalProperties": false
+      },
+      "WorkflowSaveResult": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      },
+      "WorkflowApiError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["WorkflowApiError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "ConflictError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["ConflictError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
       "WorkflowStartPayload": {
         "type": "object",
         "properties": {
@@ -21799,26 +21945,6 @@
         },
         "additionalProperties": false
       },
-      "WorkflowApiError": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["WorkflowApiError"]
-          },
-          "message": {
-            "type": "string"
-          },
-          "workflow": {
-            "type": "string"
-          },
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": ["_tag", "message"],
-        "additionalProperties": false
-      },
       "WorkflowAnswerPayload": {
         "type": "object",
         "properties": {
@@ -21832,23 +21958,6 @@
           }
         },
         "required": ["answer"],
-        "additionalProperties": false
-      },
-      "ConflictError": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["ConflictError"]
-          },
-          "message": {
-            "type": "string"
-          },
-          "resource": {
-            "type": "string"
-          }
-        },
-        "required": ["_tag", "message"],
         "additionalProperties": false
       },
       "UnauthorizedError": {

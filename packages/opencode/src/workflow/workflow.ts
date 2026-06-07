@@ -889,8 +889,7 @@ export const __testHooks = {
    * synchronous step of `pause()`/`abortRun`. Returns `true` if a live entry was
    * found and flipped. Used to deterministically drive Finding 10's race.
    */
-  setPausing: (id: string): Effect.Effect<boolean> =>
-    setPausingHook ? setPausingHook(id) : Effect.succeed(false),
+  setPausing: (id: string): Effect.Effect<boolean> => (setPausingHook ? setPausingHook(id) : Effect.succeed(false)),
   /**
    * Register an Effect to run once inside the question() timeout-park window
    * (Finding 4). It fires while the open question is still live in-memory, so a

@@ -81,7 +81,9 @@ describe("saveWorkflowRun status mapping", () => {
     }) as any
 
   test("maps 200 + path → ok", async () => {
-    expect(await saveWorkflowRun(fakePost({ path: "/p/.opencode/workflows/n.ts" }, 200), { name: "n", source: "s" })).toEqual({
+    expect(
+      await saveWorkflowRun(fakePost({ path: "/p/.opencode/workflows/n.ts" }, 200), { name: "n", source: "s" }),
+    ).toEqual({
       type: "ok",
       path: "/p/.opencode/workflows/n.ts",
     })

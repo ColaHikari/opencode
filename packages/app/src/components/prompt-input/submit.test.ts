@@ -459,8 +459,7 @@ const workflowInput = () => ({
   working: () => false,
   editor: () => undefined,
   queueScroll: () => undefined,
-  promptLength: (value: Prompt) =>
-    value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+  promptLength: (value: Prompt) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
   addToHistory: () => undefined,
   resetHistoryNavigation: () => undefined,
   setMode: () => undefined,
@@ -498,7 +497,9 @@ describe("workflow command routing on submit", () => {
 
   test("/workflow <name> starts the run with declared-type-coerced args", async () => {
     params = { id: "session-1" }
-    workflowListData = [{ name: "review", valid: true, meta: { name: "review", arguments: { count: { type: "number" } } } }]
+    workflowListData = [
+      { name: "review", valid: true, meta: { name: "review", arguments: { count: { type: "number" } } } },
+    ]
     promptValue = [{ type: "text", content: "/workflow review count=3 tag=v1.0", start: 0, end: 33 }]
     const submit = createPromptSubmit(workflowInput())
 

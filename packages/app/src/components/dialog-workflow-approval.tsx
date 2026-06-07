@@ -79,7 +79,9 @@ const DialogWorkflowApproval: Component<{
             </h3>
             <Show
               when={phases().length > 0}
-              fallback={<span class="text-12-regular text-text-weak">{language.t("dialog.workflow.approval.noPhases")}</span>}
+              fallback={
+                <span class="text-12-regular text-text-weak">{language.t("dialog.workflow.approval.noPhases")}</span>
+              }
             >
               <For each={phases()}>
                 {(phase, index) => <span class="text-14-regular text-text-strong">{`${index() + 1}. ${phase}`}</span>}

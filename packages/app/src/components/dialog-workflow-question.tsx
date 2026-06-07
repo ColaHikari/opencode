@@ -103,10 +103,6 @@ const DialogWorkflowQuestion: Component<{ run: WorkflowRun; onResolved?: () => v
 
 // Opens the question dialog for a run. `onResolved` refetches the dashboard once
 // the answer lands (the resumed run shows up on the next list fetch).
-export function openWorkflowQuestion(
-  dialog: ReturnType<typeof useDialog>,
-  run: WorkflowRun,
-  onResolved?: () => void,
-) {
+export function openWorkflowQuestion(dialog: ReturnType<typeof useDialog>, run: WorkflowRun, onResolved?: () => void) {
   dialog.show(() => DialogWorkflowQuestion({ run, onResolved }))
 }

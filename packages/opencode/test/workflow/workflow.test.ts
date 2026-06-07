@@ -1650,7 +1650,11 @@ describe("Workflow", () => {
       )
       yield* Effect.addFinalizer(() => unsub)
 
-      const started = yield* workflow.start({ name: EVENTS_AGENTS_FIXTURE, args: {}, prompt: eventsAgentsPromptOps(db) })
+      const started = yield* workflow.start({
+        name: EVENTS_AGENTS_FIXTURE,
+        args: {},
+        prompt: eventsAgentsPromptOps(db),
+      })
       const waited = yield* workflow.wait({ id: started.id })
       const done = waited.run ?? (yield* Effect.fail(new Error("events-agents workflow did not finish")))
       // The body caught the schema failure, so the run completes...

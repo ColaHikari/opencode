@@ -584,7 +584,9 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         // Collapse the body to a single text part when stripping (the keyword span
         // was computed over the joined text) while preserving non-text parts.
         const nonText = stripped ? currentPrompt.filter((part) => part.type !== "text") : []
-        draft.prompt = stripped ? [...directiveParts, { type: "text", content: ultracode.text, start: 0, end: 0 }, ...nonText] : [...directiveParts, ...bodyParts]
+        draft.prompt = stripped
+          ? [...directiveParts, { type: "text", content: ultracode.text, start: 0, end: 0 }, ...nonText]
+          : [...directiveParts, ...bodyParts]
       }
     }
 

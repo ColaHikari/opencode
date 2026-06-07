@@ -135,16 +135,18 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       //   - SaveConflictError (file already exists) → 409 ConflictError.
       // The auth middleware already gates this route, so there is no per-write
       // permission ask here (that is the tool path's concern).
-      return yield* workflow.save({ name: ctx.payload.name, source: ctx.payload.source, scope: ctx.payload.scope }).pipe(
-        Effect.mapError((error) => {
-          if (error._tag === "WorkflowSaveConflictError")
-            return new ConflictError({
-              message: `Workflow already exists: ${error.name}`,
-              resource: error.path,
-            })
-          return new WorkflowApiError({ message: error.message, workflow: ctx.payload.name, path: error.path })
-        }),
-      )
+      return yield* workflow
+        .save({ name: ctx.payload.name, source: ctx.payload.source, scope: ctx.payload.scope })
+        .pipe(
+          Effect.mapError((error) => {
+            if (error._tag === "WorkflowSaveConflictError")
+              return new ConflictError({
+                message: `Workflow already exists: ${error.name}`,
+                resource: error.path,
+              })
+            return new WorkflowApiError({ message: error.message, workflow: ctx.payload.name, path: error.path })
+          }),
+        )
     })
 
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {

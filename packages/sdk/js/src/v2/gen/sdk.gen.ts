@@ -335,6 +335,9 @@ import type {
   WorkflowPauseResponses,
   WorkflowRunsErrors,
   WorkflowRunsResponses,
+  WorkflowSaveErrors,
+  WorkflowSavePayload,
+  WorkflowSaveResponses,
   WorkflowStartErrors,
   WorkflowStartPayload,
   WorkflowStartResponses,
@@ -5109,6 +5112,43 @@ export class Workflow extends HeyApiClient {
       url: "/workflow/run",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Save workflow
+   *
+   * Save a workflow source string as a discoverable workflow file under the project or global workflows directory.
+   */
+  public save<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      workflowSavePayload?: WorkflowSavePayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowSavePayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowSaveResponses, WorkflowSaveErrors, ThrowOnError>({
+      url: "/workflow/save",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
