@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { ConflictError, notFound } from "../errors"
-import { type AnswerPayload, type StartPayload, WorkflowApiError } from "../groups/workflow"
+import { type AnswerPayload, type SavePayload, type StartPayload, WorkflowApiError } from "../groups/workflow"
 
 // Maps the engine's typed start() failures onto the HTTP contract:
 // - a broken/invalid workflow file (load failure) → 400 WorkflowApiError, with
@@ -127,6 +127,26 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       return result
     })
 
+    const save = Effect.fn("WorkflowHttpApi.save")(function* (ctx: { payload: SavePayload }) {
+      // The engine validates the name shape + meta statically and refuses to
+      // overwrite, returning typed failures. Map them onto the HTTP contract:
+      //   - InvalidError (bad name OR statically-invalid meta) → 400 WorkflowApiError,
+      //     with `workflow` carrying the requested name and `path` the failing file;
+      //   - SaveConflictError (file already exists) → 409 ConflictError.
+      // The auth middleware already gates this route, so there is no per-write
+      // permission ask here (that is the tool path's concern).
+      return yield* workflow.save({ name: ctx.payload.name, source: ctx.payload.source, scope: ctx.payload.scope }).pipe(
+        Effect.mapError((error) => {
+          if (error._tag === "WorkflowSaveConflictError")
+            return new ConflictError({
+              message: `Workflow already exists: ${error.name}`,
+              resource: error.path,
+            })
+          return new WorkflowApiError({ message: error.message, workflow: ctx.payload.name, path: error.path })
+        }),
+      )
+    })
+
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
       return yield* workflow.remove(ctx.params.id)
     })
@@ -139,6 +159,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("cancel", cancel)
       .handle("pause", pause)
       .handle("answer", answer)
+      .handle("save", save)
       .handle("remove", remove)
   }),
 )

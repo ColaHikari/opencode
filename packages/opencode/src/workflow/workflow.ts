@@ -372,6 +372,17 @@ export type AnswerInput = {
   budget?: number
 }
 
+// Where save() writes a workflow file. `project` (default) targets the workspace
+// `.opencode/workflows` dir discover() globs first; `global` targets the global
+// config `workflows` dir. Mirrors the TUI save dialog's project/global toggle.
+export type SaveScope = "project" | "global"
+
+export type SaveInput = {
+  name: string
+  source: string
+  scope?: SaveScope
+}
+
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("WorkflowNotFoundError", {
   name: Schema.String,
 }) {}
@@ -379,6 +390,16 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Wor
 export class InvalidError extends Schema.TaggedErrorClass<InvalidError>()("WorkflowInvalidError", {
   path: Schema.String,
   message: Schema.String,
+}) {}
+
+// Raised by save() when a workflow file already exists at the resolved
+// destination. Save NEVER overwrites — it mirrors the create tool's behavior
+// (`Workflow already exists: …`), so an accidental re-save of a run cannot clobber
+// a hand-edited file. The HTTP handler maps this to a 409 ConflictError; `name` is
+// the workflow file base and `path` the colliding file so callers can surface both.
+export class SaveConflictError extends Schema.TaggedErrorClass<SaveConflictError>()("WorkflowSaveConflictError", {
+  name: Schema.String,
+  path: Schema.String,
 }) {}
 
 /**
@@ -713,6 +734,21 @@ export interface Interface {
    *   mapping is a later track).
    */
   readonly answer: (input: AnswerInput) => Effect.Effect<Run | undefined, InvalidError | NotFoundError>
+  /**
+   * Persists a workflow SOURCE string to disk as a discoverable workflow file
+   * (the dashboard's "save a run as a command"). Resolves the destination from
+   * `scope`: `project` writes `<worktree|directory>/.opencode/workflows/<name>.ts`
+   * (the same root discover() globs first), `global` writes
+   * `<config>/workflows/<name>.ts`. The name is sanitized to a single safe path
+   * segment (letters/digits/_/-) and the source is statically validated with the
+   * SAME MetaReader the create tool uses (AST-only, never imports/executes the
+   * module). NEVER overwrites: an existing file at the destination fails with
+   * SaveConflictError. A bad name or invalid meta fails with InvalidError. Returns
+   * the absolute path of the written file. Mirrors the create tool's write logic,
+   * minus the tool-context permission ask (the HTTP route is gated by the auth
+   * middleware; the engine method is the shared write seam for both surfaces).
+   */
+  readonly save: (input: SaveInput) => Effect.Effect<{ path: string }, InvalidError | SaveConflictError>
   readonly remove: (id: RunID) => Effect.Effect<boolean>
   /**
    * Marks every `running` DB row that has no live registry entry as
@@ -1491,6 +1527,24 @@ async function discover(directories: readonly string[]) {
 
 function projectConfigDir(ctx: { directory: string; worktree: string }) {
   return path.join(ctx.worktree === "/" ? ctx.directory : ctx.worktree, ".opencode")
+}
+
+// The legal workflow-file basename charset, identical to the workflow tool's
+// WORKFLOW_NAME_PATTERN (tool/workflow.ts) and the discover()-time name shape: a
+// discovered name is just a file basename, so save() must accept exactly the same
+// shape it writes. Rejecting anything else keeps a save() name from escaping the
+// workflows dir (a `/`/`..` segment) or carrying glob metacharacters.
+const SAVE_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
+
+// Resolves the absolute destination file for save(): `project` → the workspace
+// `.opencode/workflows/<name>.ts` (the dir discover() globs FIRST, so a saved
+// project workflow is immediately discoverable and shadows a same-named global
+// one); `global` → `<config>/workflows/<name>.ts` (where discover() globs global
+// workflows from, via config.directories()). The name is already sanitized by the
+// caller against SAVE_NAME_PATTERN.
+function saveTargetPath(ctx: { directory: string; worktree: string }, scope: SaveScope, name: string) {
+  const base = scope === "global" ? path.join(Global.Path.config) : projectConfigDir(ctx)
+  return path.join(base, "workflows", `${name}.ts`)
 }
 
 function createContext(input: {
@@ -3317,6 +3371,45 @@ export const layer = Layer.effect(
       })
     })
 
+    const save: Interface["save"] = Effect.fn("Workflow.save")(function* (input) {
+      // Sanitize the name to a single safe path segment BEFORE it becomes a path:
+      // a `/`/`..` segment could escape the workflows dir, and a glob metacharacter
+      // would later distort discovery/permission matching. Same shape the create
+      // tool writes, so a saved file is discoverable/startable identically.
+      if (!SAVE_NAME_PATTERN.test(input.name))
+        return yield* Effect.fail(
+          new InvalidError({
+            path: input.name,
+            message: "Workflow names may only contain letters, numbers, underscores, and dashes",
+          }),
+        )
+      const ctx = yield* InstanceState.context
+      const filepath = saveTargetPath(ctx, input.scope ?? "project", input.name)
+      // Validate the source STATICALLY via the meta-reader (AST-only meta
+      // extraction) BEFORE any write — identical to the create tool's gate. This
+      // never imports/executes the module, so saving a run's source can never run
+      // attacker-authored top-level code. A bad meta is a precise InvalidError.
+      const validated = MetaReader.read(input.source, filepath)
+      if (validated.valid === false)
+        return yield* Effect.fail(new InvalidError({ path: filepath, message: validated.error }))
+      // NEVER overwrite: a collision is a hard SaveConflictError (mirrors the create
+      // tool's "Workflow already exists"), so a re-save can't clobber a hand-edited
+      // file. The existence check + write are not atomic, but a save() is a
+      // deliberate single-user action, so a TOCTOU race here is not a real concern.
+      const exists = yield* Effect.promise(() =>
+        fs
+          .access(filepath)
+          .then(() => true)
+          .catch(() => false),
+      )
+      if (exists) return yield* Effect.fail(new SaveConflictError({ name: input.name, path: filepath }))
+      yield* Effect.promise(async () => {
+        await fs.mkdir(path.dirname(filepath), { recursive: true })
+        await Bun.write(filepath, input.source)
+      })
+      return { path: filepath }
+    })
+
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
       const inst = yield* InstanceState.get(state)
       const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
@@ -3356,7 +3449,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, runs, get, start, wait, cancel, pause, answer, remove, sweep })
+    return Service.of({ list, runs, get, start, wait, cancel, pause, answer, save, remove, sweep })
   }),
 )
 

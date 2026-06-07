@@ -1,6 +1,7 @@
 import { Component, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { Dialog } from "@opencode-ai/ui/dialog"
 import { Button } from "@opencode-ai/ui/button"
+import { TextField } from "@opencode-ai/ui/text-field"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import { useSDK } from "@/context/sdk"
@@ -17,6 +18,8 @@ import {
   reanchorSelection,
   statusIcon,
 } from "./dialog-workflow-helpers"
+import { saveWorkflowRun, type SaveScope } from "./dialog-workflow-client"
+import { sanitizeWorkflowFilename } from "./prompt-input/workflow-command"
 import { openWorkflowQuestion } from "./dialog-workflow-question"
 
 const LOG_CAP = 100
@@ -207,20 +210,20 @@ export const DialogWorkflow: Component = () => {
                   {language.t("dialog.workflow.action.resume")}
                 </Button>
               </Show>
-              {/* Save-as-command is deferred on the web app (no file-write path);
-                  shown disabled with a follow-up note. */}
+              {/* Save-as-command: writes the run's captured source as a workflow
+                  file via POST /workflow/save. Disabled when the run carries no
+                  source (older/temporary runs), matching the TUI's hard guard. */}
               <Button
                 variant="secondary"
-                disabled
-                title={language.t("dialog.workflow.action.save.unavailable")}
-                onClick={() =>
-                  showToast({
-                    title: language.t("toast.workflow.save.unavailable.title"),
-                    description: language.t("toast.workflow.save.unavailable.description"),
-                  })
+                disabled={!run().definition?.source}
+                title={
+                  run().definition?.source
+                    ? language.t("dialog.workflow.action.save")
+                    : language.t("dialog.workflow.save.noSource")
                 }
+                onClick={() => openWorkflowSave(dialog, run())}
               >
-                {language.t("dialog.workflow.action.save.unavailable")}
+                {language.t("dialog.workflow.action.save")}
               </Button>
             </div>
           )}
@@ -341,4 +344,102 @@ const WorkflowDetail: Component<{ run: WorkflowRun; phases: string[]; cost: numb
       </Show>
     </div>
   )
+}
+
+// Save-a-run-as-command dialog (web parity with the TUI DialogWorkflowSave): a
+// name field prefilled with the run's workflow name + a project/global
+// destination toggle. The name is sanitized to a single safe path segment before
+// the POST; the server is the source of truth for collisions (409) and meta
+// validity (400), so this never pre-checks the filesystem. A run with no captured
+// source can never reach here (the dashboard button is disabled), but the source
+// is re-guarded defensively.
+const DialogWorkflowSave: Component<{ run: WorkflowRun }> = (props) => {
+  const sdk = useSDK()
+  const dialog = useDialog()
+  const language = useLanguage()
+
+  const [name, setName] = createSignal(props.run.workflow)
+  const [scope, setScope] = createSignal<SaveScope>("project")
+  const [pending, setPending] = createSignal(false)
+
+  const submit = async () => {
+    if (pending()) return
+    const source = props.run.definition?.source
+    if (!source) {
+      showToast({ variant: "error", title: language.t("dialog.workflow.save.noSource") })
+      return
+    }
+    const safe = sanitizeWorkflowFilename(name())
+    if (!safe) {
+      showToast({ variant: "error", title: language.t("toast.workflow.save.invalidName.title") })
+      return
+    }
+    setPending(true)
+    const result = await saveWorkflowRun(sdk, { name: safe, source, scope: scope() })
+    setPending(false)
+    if (result.type === "ok") {
+      showToast({
+        variant: "success",
+        title: language.t("toast.workflow.save.ok.title"),
+        description: language.t("toast.workflow.save.ok.description", { name: safe }),
+      })
+      dialog.close()
+      return
+    }
+    if (result.type === "conflict") {
+      showToast({
+        variant: "error",
+        title: language.t("toast.workflow.save.conflict.title"),
+        description: language.t("toast.workflow.save.conflict.description", { name: safe }),
+      })
+      return
+    }
+    if (result.type === "invalid") {
+      showToast({
+        variant: "error",
+        title: language.t("toast.workflow.save.invalidName.title"),
+        description: result.message,
+      })
+      return
+    }
+    showToast({ variant: "error", title: language.t("toast.workflow.save.failed.title"), description: result.message })
+  }
+
+  return (
+    <Dialog title={language.t("dialog.workflow.save.title")} description={language.t("dialog.workflow.save.description")}>
+      <div class="flex flex-col gap-3 px-1">
+        <TextField
+          autofocus
+          placeholder={language.t("dialog.workflow.save.placeholder")}
+          value={name()}
+          onChange={setName}
+        />
+        <div class="flex items-center gap-2">
+          <Button
+            variant={scope() === "project" ? "primary" : "secondary"}
+            onClick={() => setScope("project")}
+          >
+            {language.t("dialog.workflow.save.scope.project")}
+          </Button>
+          <Button
+            variant={scope() === "global" ? "primary" : "secondary"}
+            onClick={() => setScope("global")}
+          >
+            {language.t("dialog.workflow.save.scope.global")}
+          </Button>
+        </div>
+        <div class="flex items-center justify-end">
+          <Button variant="primary" disabled={pending()} onClick={() => void submit()}>
+            {language.t("dialog.workflow.action.save")}
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  )
+}
+
+// Opens the save dialog for a run. Replaces the dashboard on the stack; on a
+// successful save the dialog closes itself (dialog.close), landing back on the app.
+export function openWorkflowSave(dialog: ReturnType<typeof useDialog>, run: WorkflowRun) {
+  dialog.show(() => DialogWorkflowSave({ run }))
 }

@@ -34,6 +34,28 @@ export const StartPayload = Schema.Struct({
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
+// Save a run's captured source as a discoverable workflow file (the dashboard's
+// "save as command"). `scope` selects the destination dir (project .opencode vs
+// global config), defaulting to project — mirroring the TUI save dialog's Tab
+// toggle. The file is written verbatim after the engine statically validates its
+// meta and rejects a name that is not a single safe path segment.
+export const SavePayload = Schema.Struct({
+  name: Schema.String.annotate({
+    description: "Workflow file base name (becomes /<name>); letters, numbers, underscores, and dashes only.",
+  }),
+  source: Schema.String.annotate({ description: "The complete TypeScript/JavaScript workflow module source." }),
+  scope: Schema.optional(Schema.Literals(["project", "global"])).annotate({
+    description: "Destination: 'project' (.opencode/workflows, default) or 'global' (the global config workflows dir).",
+  }),
+}).annotate({ identifier: "WorkflowSavePayload" })
+export type SavePayload = Schema.Schema.Type<typeof SavePayload>
+
+// The saved file's absolute path, returned on success so a caller can surface it.
+export const SaveResult = Schema.Struct({
+  path: Schema.String,
+}).annotate({ identifier: "WorkflowSaveResult" })
+export type SaveResult = Schema.Schema.Type<typeof SaveResult>
+
 export const AnswerPayload = Schema.Struct({
   answer: Schema.String.annotate({ description: "The human answer to the run's open question." }),
   // Session that should receive permission prompts raised by the resumed run's
@@ -62,6 +84,9 @@ export class WorkflowApiError extends Schema.TaggedErrorClass<WorkflowApiError>(
 export const WorkflowPaths = {
   list: root,
   runs: `${root}/run`,
+  // Save a source string as a discoverable workflow file. A static `/save` segment
+  // (not a `:param`) so it can never collide with the `:name/start` shape.
+  save: `${root}/save`,
   get: `${root}/run/:id`,
   start: `${root}/:name/start`,
   cancel: `${root}/run/:id/cancel`,
@@ -96,6 +121,23 @@ export const WorkflowApi = HttpApi.make("workflow")
             summary: "List workflow runs",
             description:
               "List persisted workflow execution runs for this instance, with live in-memory state overlaid for active runs.",
+          }),
+        ),
+        HttpApiEndpoint.post("save", WorkflowPaths.save, {
+          query: WorkspaceRoutingQuery,
+          payload: SavePayload,
+          // 200 + the written file path on success. A bad name or statically-invalid
+          // meta is a 400 (WorkflowApiError) — the engine validates with the SAME
+          // MetaReader the create tool uses; an existing file at the destination is a
+          // 409 (ConflictError), never an overwrite, matching the create tool.
+          success: described(SaveResult, "Workflow saved to disk"),
+          error: [WorkflowApiError, ConflictError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.save",
+            summary: "Save workflow",
+            description:
+              "Save a workflow source string as a discoverable workflow file under the project or global workflows directory.",
           }),
         ),
         HttpApiEndpoint.get("get", WorkflowPaths.get, {

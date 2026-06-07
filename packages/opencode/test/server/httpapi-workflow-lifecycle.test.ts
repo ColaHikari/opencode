@@ -186,6 +186,48 @@ describe("workflow HTTP lifecycle e2e", () => {
     }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
   )
 
+  it.live("save -> file written + discoverable; duplicate is 409; bad name is 400", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      const source = `export const meta = { name: "http-saved", description: "saved via http" }
+export async function run(args, ctx) { return { ok: true } }
+`
+      // Save a brand-new workflow → 200 + the absolute path.
+      const saveRes = yield* requestInDirectory("/workflow/save", directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "http-saved", source }),
+      })
+      expect(saveRes.status).toBe(200)
+      const saved = yield* bodyJson(saveRes)
+      const expected = path.join(directory, ".opencode", "workflows", "http-saved.ts")
+      expect(saved["path"]).toBe(expected)
+      // The file really exists on disk with the exact source.
+      const onDisk = yield* Effect.promise(() => Bun.file(expected).text())
+      expect(onDisk).toBe(source)
+      // It is now discoverable via the list route.
+      const listRes = yield* requestInDirectory("/workflow", directory)
+      const list = (yield* bodyJson(listRes)) as unknown as Array<{ name: string }>
+      expect(list.some((info) => info.name === "http-saved")).toBe(true)
+
+      // A duplicate save is a 409 (never overwrites).
+      const dupRes = yield* requestInDirectory("/workflow/save", directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "http-saved", source }),
+      })
+      expect(dupRes.status).toBe(409)
+
+      // A bad name (path traversal) is a 400.
+      const badRes = yield* requestInDirectory("/workflow/save", directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "../escape", source }),
+      })
+      expect(badRes.status).toBe(400)
+    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+  )
+
   it.live("start -> cancel (live-waiting question) transitions to cancelled through the httpapi", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true })

@@ -6113,6 +6113,96 @@ export async function run(args, ctx) {
   )
 })
 
+// Track T8 Feature A: the engine save() seam the HTTP /workflow/save route reuses.
+// Mirrors the create tool's write logic (MetaReader validation + sanitized name +
+// project/global dir resolution + no-overwrite conflict), minus the tool-context
+// permission ask.
+const SAVE_SOURCE = `export const meta = { name: "saved-flow", description: "a saved run" }
+export async function run(args, ctx) { return { ok: true } }
+`
+
+describe("Workflow.save", () => {
+  it.instance("writes a project workflow file that is then discoverable", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const saved = yield* workflow.save({ name: "saved-flow", source: SAVE_SOURCE })
+      const expected = path.join(test.directory, ".opencode", "workflows", "saved-flow.ts")
+      expect(saved.path).toBe(expected)
+      // The file really landed on disk with the exact source.
+      const onDisk = yield* Effect.promise(() => Bun.file(expected).text())
+      expect(onDisk).toBe(SAVE_SOURCE)
+      // And it is now discoverable via list() (static meta extraction).
+      const list = yield* workflow.list()
+      const info = list.find((item) => item.name === "saved-flow")
+      expect(info?.valid).toBe(true)
+      expect(info?.path).toBe(expected)
+    }),
+  )
+
+  it.instance("saving with scope:global writes under the global config workflows dir", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      // Use a name unlikely to collide with any real global file in the test home.
+      const name = `t8-global-${Date.now()}`
+      const saved = yield* workflow.save({ name, source: SAVE_SOURCE.replace("saved-flow", name), scope: "global" })
+      const expected = path.join(Global.Path.config, "workflows", `${name}.ts`)
+      expect(saved.path).toBe(expected)
+      const onDisk = yield* Effect.promise(() => Bun.file(expected).text())
+      expect(onDisk).toContain(`name: "${name}"`)
+      // Clean up the global file so it does not leak into other tests.
+      yield* Effect.promise(() => fs.rm(expected).catch(() => {}))
+    }),
+  )
+
+  it.instance("a duplicate save fails with SaveConflictError (never overwrites)", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      yield* workflow.save({ name: "dup-flow", source: SAVE_SOURCE })
+      // A second save with a VALID source (so it clears the meta gate) must still
+      // be refused as a conflict — save never overwrites.
+      const second = yield* Effect.exit(workflow.save({ name: "dup-flow", source: SAVE_SOURCE }))
+      expect(Exit.isFailure(second)).toBe(true)
+      const conflict = Exit.isFailure(second) ? (Cause.squash(second.cause) as { _tag?: string }) : undefined
+      expect(conflict?._tag).toBe("WorkflowSaveConflictError")
+    }),
+  )
+
+  it.instance("a bad name fails with InvalidError before any write", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const result = yield* Effect.exit(workflow.save({ name: "../escape", source: SAVE_SOURCE }))
+      expect(Exit.isFailure(result)).toBe(true)
+      const badName = Exit.isFailure(result) ? (Cause.squash(result.cause) as { _tag?: string }) : undefined
+      expect(badName?._tag).toBe("WorkflowInvalidError")
+      // No traversal file was created.
+      const escaped = yield* Effect.promise(() =>
+        Bun.file(path.join(test.directory, ".opencode", "workflows", "../escape.ts")).exists(),
+      )
+      expect(escaped).toBe(false)
+    }),
+  )
+
+  it.instance("statically-invalid meta fails with InvalidError and writes nothing", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      // Non-literal meta (a call expression) is rejected by the AST-only MetaReader.
+      const result = yield* Effect.exit(
+        workflow.save({ name: "bad-meta", source: "export const meta = makeMeta()\nexport async function run() {}" }),
+      )
+      expect(Exit.isFailure(result)).toBe(true)
+      const badMeta = Exit.isFailure(result) ? (Cause.squash(result.cause) as { _tag?: string }) : undefined
+      expect(badMeta?._tag).toBe("WorkflowInvalidError")
+      const wrote = yield* Effect.promise(() =>
+        Bun.file(path.join(test.directory, ".opencode", "workflows", "bad-meta.ts")).exists(),
+      )
+      expect(wrote).toBe(false)
+    }),
+  )
+})
+
 describe("Workflow.fmt", () => {
   test("fmt renders whenToUse inside the available_workflows block", () => {
     const out = Workflow.fmt([

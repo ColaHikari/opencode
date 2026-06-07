@@ -80,6 +80,77 @@ export async function answerWorkflowRun(sdk: WorkflowAnswerClient, input: Answer
   }
 }
 
+// Where save() writes the workflow file: the project `.opencode/workflows` dir or
+// the global config workflows dir. Mirrors the engine's SaveScope and the TUI save
+// dialog's project/global toggle.
+export type SaveScope = "project" | "global"
+
+export type SaveInput = {
+  name: string
+  source: string
+  scope?: SaveScope
+}
+
+export type SaveResult =
+  | { type: "ok"; path: string }
+  | { type: "invalid"; message: string }
+  | { type: "conflict" }
+  | { type: "error"; message: string }
+
+// Derives the POST /workflow/save request body from the dashboard's save form.
+// `scope` is only included when explicitly set so the server default (project)
+// applies otherwise — pure so it is unit-testable without a client.
+export function saveWorkflowPayload(input: SaveInput): { name: string; source: string; scope?: SaveScope } {
+  const payload: { name: string; source: string; scope?: SaveScope } = { name: input.name, source: input.source }
+  if (input.scope !== undefined) payload.scope = input.scope
+  return payload
+}
+
+// The raw hey-api transport carried by every generated sub-client (they share one
+// `client` instance). Used as the typed-fetch fallback below until the SDK is
+// regenerated with the `workflow.save` method.
+type RawPost = {
+  post: (options: {
+    url: string
+    body: unknown
+    query?: Record<string, unknown>
+  }) => Promise<{ data?: unknown; response: { status: number } }>
+}
+
+// Calls POST /workflow/save and maps the HTTP contract to a small union:
+//   - 200 → ok with the written path;
+//   - 400 (WorkflowApiError: bad name / invalid meta) → invalid;
+//   - 409 (ConflictError: file exists) → conflict;
+//   - anything else / transport failure → error.
+//
+// NOTE (SDK regen): the generated client does not yet expose `workflow.save`, so
+// this reaches the shared raw transport off `sdk.client.workflow` and posts the
+// route directly (the directory is forwarded as a query param exactly like the
+// other workflow calls). Once the controller regenerates the SDK, swap the
+// `rawPost(...)` call for `sdk.client.workflow.save({ directory, workflowSavePayload })`.
+export async function saveWorkflowRun(sdk: WorkflowAnswerClient, input: SaveInput): Promise<SaveResult> {
+  const payload = saveWorkflowPayload(input)
+  try {
+    const workflow = sdk.client.workflow as unknown as {
+      save?: (args: {
+        directory?: string
+        workflowSavePayload: typeof payload
+      }) => Promise<{ data?: { path: string }; response: { status: number } }>
+    } & RawPost
+    const result = workflow.save
+      ? await workflow.save({ directory: sdk.directory, workflowSavePayload: payload })
+      : await workflow.post({ url: "/workflow/save", body: payload, query: { directory: sdk.directory } })
+    const data = result.data as { path?: string } | undefined
+    if (data?.path) return { type: "ok", path: data.path }
+    const status = result.response.status
+    if (status === 409) return { type: "conflict" }
+    if (status === 400) return { type: "invalid", message: `invalid workflow (status ${status})` }
+    return { type: "error", message: `unexpected status ${status}` }
+  } catch (error) {
+    return { type: "error", message: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 // One selectable entry in the question dialog: either a declared option or the
 // trailing free-text sentinel (always last, so a question with no declared
 // options still lets the operator type a custom answer).
