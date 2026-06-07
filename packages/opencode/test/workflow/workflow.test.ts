@@ -3397,6 +3397,17 @@ export async function run() { return { from: "global" } }
     // wieder weg (kein Orphan zurückgelassen).
     expect(await Bun.file(file).exists()).toBe(false)
   })
+
+  // P1 (Claude parity): ctx.parallel now resolves a dropped (rejecting/agent-
+  // erroring) task to `null` at its position, so the deep-research builtin MUST
+  // filter the parallel results before dereferencing them (research findings and
+  // verify verdicts). Source-string assertion only — a live run needs web tools.
+  test("the deep-research builtin filters dropped parallel results before dereferencing", async () => {
+    const { BUILTIN_WORKFLOWS } = await import("@/workflow/builtin")
+    const src = BUILTIN_WORKFLOWS["deep-research"]
+    expect(src).toContain(".filter((f) => f !== null)")
+    expect(src).toContain(".filter((v) => v !== null)")
+  })
   // ===========================================================================
   // Track B — Run-Caps (Concurrency + Lifetime) und Pause/Resume
   // ===========================================================================

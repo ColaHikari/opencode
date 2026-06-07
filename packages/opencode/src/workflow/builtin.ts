@@ -65,7 +65,9 @@ const DEEP_RESEARCH = `export default {
     })
 
     ctx.setPhase("research")
-    const findings = await ctx.parallel(
+    // ctx.parallel drops a rejecting/agent-erroring task to null at its position
+    // (P1 Claude parity) — filter before dereferencing the findings.
+    const findings = (await ctx.parallel(
       plan.data.angles.map((angle) => () =>
         ctx.agent({
           prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "no_web_tools": true} via the schema. Angle: \${angle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
@@ -89,7 +91,7 @@ const DEEP_RESEARCH = `export default {
           },
         }),
       ),
-    )
+    )).filter((f) => f !== null)
     // Gate via the structured schema (a forced-JSON schema makes the old plaintext
     // sentinel unreachable — StructuredOutputError would fire before any reply
     // text could carry it). An agent with no web/search tools instead sets the
@@ -100,7 +102,8 @@ const DEEP_RESEARCH = `export default {
     const claims = findings.flatMap((f) => f.data.claims)
 
     ctx.setPhase("verify")
-    const verified = await ctx.parallel(
+    // Same null-drop contract here — filter the verdicts before dereferencing.
+    const verified = (await ctx.parallel(
       claims.map((c) => () =>
         ctx
           .agent({
@@ -114,7 +117,7 @@ const DEEP_RESEARCH = `export default {
           .then((v) => ({ ...c, verdict: v.data })),
       ),
       { concurrencyLimit: 8 },
-    )
+    )).filter((v) => v !== null)
     const surviving = verified.filter((c) => c.verdict.supported)
     const rejected = verified.filter((c) => !c.verdict.supported)
 

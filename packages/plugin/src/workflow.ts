@@ -79,6 +79,12 @@ export type WorkflowContext = {
   readonly budgetRemaining: number
   setPhase(phase: string): void
   log(message: string): void
+  /**
+   * Run `tasks` concurrently and resolve to their results in task order. A thunk
+   * that throws (or whose `agent()` errors) does NOT fail the whole batch — it
+   * resolves to `null` at its position (the drop is logged); only a run abort
+   * stays fatal. Filter the result before use, e.g. `.filter((x) => x !== null)`.
+   */
   parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<(T | null)[]>
   pipeline: WorkflowPipelineFn
   agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult>
