@@ -42,22 +42,30 @@ export type WorkflowPipelineStage<Prev, Item, Next> = (prev: Prev, item: Item) =
 /** Per-item pipeline. Each item flows through every stage SEQUENTIALLY (stage N+1
  * receives stage N's result for that item), while items run concurrently against
  * each other (no barrier between stages). Result is the last stage's output in
- * item order. Overloaded for 1..4 stages so heterogeneous types flow through. */
+ * item order. A stage that throws does NOT fail the whole pipeline — it drops ONLY
+ * that item to `null` at its position (skipping that item's remaining stages, and
+ * logging the drop); other items keep running. Only a run abort stays fatal.
+ * Filter the result before use, e.g. `.filter((x) => x !== null)`. Overloaded for
+ * 1..4 stages so heterogeneous types flow through. */
 export interface WorkflowPipelineFn {
-  <I, A>(items: readonly I[], s1: WorkflowPipelineStage<I, I, A>, options?: WorkflowPipelineOptions): Promise<A[]>
+  <I, A>(
+    items: readonly I[],
+    s1: WorkflowPipelineStage<I, I, A>,
+    options?: WorkflowPipelineOptions,
+  ): Promise<(A | null)[]>
   <I, A, B>(
     items: readonly I[],
     s1: WorkflowPipelineStage<I, I, A>,
     s2: WorkflowPipelineStage<A, I, B>,
     options?: WorkflowPipelineOptions,
-  ): Promise<B[]>
+  ): Promise<(B | null)[]>
   <I, A, B, C>(
     items: readonly I[],
     s1: WorkflowPipelineStage<I, I, A>,
     s2: WorkflowPipelineStage<A, I, B>,
     s3: WorkflowPipelineStage<B, I, C>,
     options?: WorkflowPipelineOptions,
-  ): Promise<C[]>
+  ): Promise<(C | null)[]>
   <I, A, B, C, D>(
     items: readonly I[],
     s1: WorkflowPipelineStage<I, I, A>,
@@ -65,7 +73,7 @@ export interface WorkflowPipelineFn {
     s3: WorkflowPipelineStage<B, I, C>,
     s4: WorkflowPipelineStage<C, I, D>,
     options?: WorkflowPipelineOptions,
-  ): Promise<D[]>
+  ): Promise<(D | null)[]>
 }
 
 export type WorkflowContext = {

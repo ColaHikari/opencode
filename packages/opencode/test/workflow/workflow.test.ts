@@ -382,6 +382,26 @@ const PARALLEL_ERROR_WORKFLOW = `export default {
 }
 `
 
+// P2 (Claude parity): a throwing stage in ctx.pipeline must NOT kill the whole
+// pipeline — it drops ONLY that item to `null` at its position and skips that
+// item's remaining stages, while the other items run every stage to completion;
+// the drop is LOGGED (never silent). Module uses `export default` so the
+// resolved-object load path is exercised too.
+const PIPELINE_ERROR_FIXTURE = "pipe-err"
+const PIPELINE_ERROR_WORKFLOW = `export default {
+  meta: { name: "${PIPELINE_ERROR_FIXTURE}", description: "pipeline per-item drop" },
+  async run(_args, ctx) {
+    const calls: string[] = []
+    const out = await ctx.pipeline(
+      [1, 2, 3],
+      async (prev) => { if (prev === 2) throw new Error("stage1-boom"); calls.push("s1:" + prev); return prev * 10 },
+      async (prev, item) => { calls.push("s2:" + item); return prev + 1 },
+    )
+    return { out, calls }
+  },
+}
+`
+
 // Pipeline barrier fixture: N items, ONE stage that parks every item on the gate,
 // so the test can observe how many items run that stage concurrently (the
 // pipeline concurrency default / clamp).
@@ -1157,6 +1177,31 @@ describe("Workflow", () => {
       // The drop is logged, never silent — and carries the rejection's message.
       const dropLog = run.logs.find((l) => l.message.includes("parallel task 2 dropped"))
       expect(dropLog?.message).toContain("boom")
+    }),
+  )
+
+  // P2 (Claude parity): a throwing stage in ctx.pipeline must not fail the whole
+  // pipeline — it drops ONLY that item to `null` at its position and skips that
+  // item's remaining stages; the other items run every stage to completion, and
+  // the drop is logged (never silent). Before this change the first throwing item
+  // aborted the whole pipeline and the run ended `failed`.
+  it.instance("pipeline drops only the throwing item to null and skips its remaining stages", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, PIPELINE_ERROR_FIXTURE, PIPELINE_ERROR_WORKFLOW, "ts"),
+      )
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PIPELINE_ERROR_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("pipe-err did not finish")))
+      expect(run.status).toBe("completed")
+      const r = run.result as { out: unknown[]; calls: string[] }
+      expect(r.out).toEqual([11, null, 31]) // only item 2 dropped
+      expect(r.calls).not.toContain("s2:2") // item 2's remaining stages skipped
+      expect(
+        run.logs.some((l) => l.message.includes("pipeline item 2 dropped") && l.message.includes("stage1-boom")),
+      ).toBe(true)
     }),
   )
 

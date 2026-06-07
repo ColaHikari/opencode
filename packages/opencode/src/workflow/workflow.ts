@@ -1207,11 +1207,24 @@ function createContext(input: {
           (item) =>
             Effect.promise(async () => {
               let current: unknown = item
-              for (const stage of stages) {
-                checkpoint()
-                current = await stage(current, item)
+              try {
+                for (const stage of stages) {
+                  checkpoint()
+                  current = await stage(current, item)
+                }
+                return current
+              } catch (error) {
+                // P2: a throwing stage drops ONLY this item (null) and skips its
+                // remaining stages; other items keep running. Abort stays fatal.
+                if (error instanceof CancelledError) throw error
+                input.active.run.logs.push({
+                  time: Date.now(),
+                  phase: input.active.run.current_phase,
+                  message: `pipeline item ${items.indexOf(item) + 1} dropped: ${error instanceof Error ? error.message : String(error)}`,
+                })
+                input.persist()
+                return null
               }
-              return current
             }),
           { concurrency },
         ),
