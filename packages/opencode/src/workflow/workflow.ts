@@ -2,6 +2,8 @@ import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { EffectBridge } from "@/effect/bridge"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { InstanceState } from "@/effect/instance-state"
 import { Identifier } from "@/id/id"
 import { Provider } from "@/provider/provider"
@@ -202,6 +204,31 @@ export const Run = Schema.Struct({
   resume_of: Schema.optional(RunID),
 }).annotate({ identifier: "WorkflowRun" })
 export type Run = DeepMutable<Schema.Schema.Type<typeof Run>>
+
+// Run-lifecycle bus events. Published from `persistRun` (the single choke-point
+// every state write goes through) AFTER the DB upsert commits, so a consumer
+// never observes a state that was not persisted. The payload is intentionally
+// SLIM — the metadata fields plus an `agents` COUNT object — so non-TUI
+// consumers (dashboard, plugins) can render run progress without the heavy
+// logs/agents/result blobs (those stay readable via `get()`). `updated` fires on
+// every non-terminal write; `finished` fires once on the terminal write.
+const RunEventData = {
+  id: Schema.String,
+  workflow: Schema.String,
+  status: Status,
+  current_phase: Schema.NullOr(Schema.String),
+  directory: Schema.String,
+  agents: Schema.Struct({
+    total: Schema.Number,
+    running: Schema.Number,
+    failed: Schema.Number,
+  }),
+  error: Schema.NullOr(Schema.String),
+}
+export const Event = {
+  Updated: EventV2.define({ type: "workflow.run.updated", schema: RunEventData }),
+  Finished: EventV2.define({ type: "workflow.run.finished", schema: RunEventData }),
+}
 
 export const StartInput = Schema.Struct({
   name: Schema.String,
@@ -630,7 +657,22 @@ class TerminalPersistTestError extends Error {
   }
 }
 
-function persistRun(db: Database.Interface["db"], active: Active, options?: { terminal?: boolean }) {
+// The terminal run statuses: a run in one of these has settled and will never
+// transition again, so its persist emits `workflow.run.finished` instead of
+// `workflow.run.updated`. `running`/`paused` are the only non-terminal statuses
+// (a paused run can still resume), so they emit `updated`. This mirrors the
+// terminal/non-terminal split documented on the `Status` literal above.
+const TERMINAL_STATUSES = ["completed", "failed", "cancelled", "interrupted"] as const
+function isTerminalStatus(status: string): boolean {
+  return (TERMINAL_STATUSES as readonly string[]).includes(status)
+}
+
+function persistRun(
+  db: Database.Interface["db"],
+  events: EventV2Bridge.Service["Service"],
+  active: Active,
+  options?: { terminal?: boolean },
+) {
   // The snapshot MUST be built at execution time (inside Effect.suspend), not
   // at effect-construction time: progress writes are forked into the run scope
   // and may execute AFTER the awaited terminal write in `finish`. A snapshot
@@ -681,6 +723,31 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
         set: { ...data, time_updated: Date.now() },
       })
       .run()
+      .pipe(
+        // Publish the run-lifecycle event ONLY after the upsert commits, so a
+        // consumer never observes a state that was not persisted. Sits inside the
+        // write path so it inherits the `active.removed` tombstone and the failing
+        // terminal-persist seam above (both return before reaching here ⇒ no
+        // publish). The event is chosen by terminal status, never by the caller's
+        // `terminal` flag, so any persist that happens to carry a terminal status
+        // (e.g. a forked progress write that races the awaited terminal one) still
+        // reports `finished` consistently. Slim payload — counts, not the arrays.
+        Effect.tap(() =>
+          events.publish(isTerminalStatus(active.run.status) ? Event.Finished : Event.Updated, {
+            id: active.run.id,
+            workflow: active.run.workflow,
+            status: active.run.status,
+            current_phase: active.run.current_phase ?? null,
+            directory: active.directory,
+            agents: {
+              total: active.run.agents.length,
+              running: active.run.agents.filter((a) => a.status === "running").length,
+              failed: active.run.agents.filter((a) => a.status === "failed").length,
+            },
+            error: active.run.error ?? null,
+          }),
+        ),
+      )
   }).pipe(Effect.orDie)
 }
 
@@ -692,8 +759,13 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
  * a removed run, the terminal write in `finish` is awaited inline, and the
  * startup orphan sweep heals any run whose last progress snapshot was cut short.
  */
-function persistInScope(active: Active, bridge: EffectBridge.Shape, db: Database.Interface["db"]) {
-  bridge.fork(persistRun(db, active).pipe(Effect.forkIn(active.runScope)))
+function persistInScope(
+  active: Active,
+  bridge: EffectBridge.Shape,
+  db: Database.Interface["db"],
+  events: EventV2Bridge.Service["Service"],
+) {
+  bridge.fork(persistRun(db, events, active).pipe(Effect.forkIn(active.runScope)))
 }
 
 /**
@@ -1270,6 +1342,7 @@ export const layer = Layer.effect(
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
     const { db } = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* (ctx) {
         const runs = yield* SynchronizedRef.make(new Map<string, Active>())
@@ -1476,7 +1549,7 @@ export const layer = Layer.effect(
       // as the text `"null"`) instead of racing an in-flight progress write. The
       // `Effect.exit` guard keeps this ordering safe for the failing-persist case.
       const result = snapshot(active)
-      yield* persistRun(db, active, { terminal: true }).pipe(Effect.exit)
+      yield* persistRun(db, events, active, { terminal: true }).pipe(Effect.exit)
       yield* Deferred.succeed(active.done, result).pipe(Effect.ignore)
       // N1: evict the terminal run from the in-memory registry so the map does not
       // grow unbounded for a long-lived instance, and so a dead run's heavy
@@ -1629,7 +1702,7 @@ export const layer = Layer.effect(
         resumeOf: input.resume_of,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
-      yield* persistRun(db, active)
+      yield* persistRun(db, events, active)
       if (input.prompt) {
         yield* input.prompt
           .prompt({
@@ -1713,7 +1786,7 @@ export const layer = Layer.effect(
           prompt: agentInput.prompt,
         }
         active.run.agents.push(node)
-        persistInScope(active, bridge, db)
+        persistInScope(active, bridge, db, events)
         const prompt = input.prompt
         if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
         return dispatch(
@@ -1771,7 +1844,7 @@ export const layer = Layer.effect(
                   node.cached = true
                   // The budget decrement is left to the shared `ensuring` below
                   // (node.cost is set), so a cache hit is charged exactly once.
-                  yield* persistRun(db, active)
+                  yield* persistRun(db, events, active)
                   const structured = parsedExit !== undefined ? parsedExit.value : undefined
                   return {
                     data: structured !== undefined ? structured : (cached.output ?? ""),
@@ -1824,7 +1897,7 @@ export const layer = Layer.effect(
             if (active.cancelling || active.removed) {
               if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
             }
-            yield* persistRun(db, active)
+            yield* persistRun(db, events, active)
             const message = yield* prompt.prompt({
               sessionID: session.id,
               permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
@@ -1956,7 +2029,7 @@ export const layer = Layer.effect(
             node.status = "completed"
             node.completed_at = Date.now()
             node.output = result.text
-            persistInScope(active, bridge, db)
+            persistInScope(active, bridge, db, events)
             return result
           },
           (error) => {
@@ -1969,7 +2042,7 @@ export const layer = Layer.effect(
             node.status = "failed"
             node.completed_at = Date.now()
             node.error = errorText(error)
-            persistInScope(active, bridge, db)
+            persistInScope(active, bridge, db, events)
             return Promise.reject(error)
           },
         )
@@ -1994,7 +2067,7 @@ export const layer = Layer.effect(
           createContext({
             active,
             agent,
-            persist: () => void persistInScope(active, bridge, db),
+            persist: () => void persistInScope(active, bridge, db, events),
             signal: () => runSignal,
             dispatch,
           }),
@@ -2235,6 +2308,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Agent.defaultLayer),
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
+  Layer.provide(EventV2Bridge.defaultLayer),
 )
 
 export * as Workflow from "./workflow"

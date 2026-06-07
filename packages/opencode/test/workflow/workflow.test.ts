@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
 import { Agent } from "@/agent/agent"
 import { SessionID } from "@/session/schema"
@@ -32,6 +33,11 @@ const it = testEffect(
     Session.defaultLayer,
     Agent.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
+    // EventV2Bridge.defaultLayer is merged so a test can subscribe to the SAME bus
+    // instance the engine publishes run-lifecycle events on. It is the identical
+    // exported const reference the Workflow layer provides internally, so Effect's
+    // layer memoisation resolves both to ONE instance (exactly as for Database).
+    EventV2Bridge.defaultLayer,
   ),
 )
 
@@ -249,6 +255,14 @@ export async function run(args, ctx) { ctx.setPhase("run"); return null }
 const VOID_RESULT_FIXTURE = "void-result"
 const VOID_RESULT_WORKFLOW = `export const meta = { name: "${VOID_RESULT_FIXTURE}", phases: ["run"] }
 export async function run(args, ctx) { ctx.setPhase("run") }
+`
+
+// A minimal single-phase, zero-agent workflow used by the bus-event test: it sets
+// the phase and returns a value, so the run goes running -> completed through the
+// same persistRun choke-point every state write uses — no provider stubbing needed.
+const EVENTS_FIXTURE = "events"
+const EVENTS_WORKFLOW = `export const meta = { name: "${EVENTS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run"); return { ok: true } }
 `
 
 // N2/N13-Fixture: ein Workflow, dessen Rückgabewert NICHT strukturell klonbar ist
@@ -1091,6 +1105,52 @@ function recordingPromptOps(db: Database.Interface["db"], cost = 0) {
 }
 
 describe("Workflow", () => {
+  // The engine must publish run-lifecycle bus events from persistRun so non-TUI
+  // consumers (dashboard, plugins) can observe a run instead of polling. A run
+  // crosses persistRun at least once while `running` and once at its terminal
+  // transition, so a subscriber must see >=1 `workflow.run.updated` (running)
+  // and a final `workflow.run.finished` (completed). The payload is the SLIM
+  // shape: `agents` is a COUNT object, never the full array.
+  it.instance("publishes workflow.run.updated/finished bus events with a slim payload", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, EVENTS_FIXTURE, EVENTS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const events = yield* EventV2Bridge.Service
+      const seen: Array<{ type: string; data: Record<string, unknown> }> = []
+      const unsub = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === "workflow.run.updated" || event.type === "workflow.run.finished")
+            seen.push({ type: event.type, data: event.data as Record<string, unknown> })
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsub)
+
+      const started = yield* workflow.start({ name: EVENTS_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("events workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // At least one `running` update was seen during the run.
+      const running = seen.filter((e) => e.type === "workflow.run.updated" && e.data["status"] === "running")
+      expect(running.length).toBeGreaterThanOrEqual(1)
+
+      // The final event is the terminal `finished` with status completed.
+      const last = seen.at(-1) ?? (yield* Effect.fail(new Error("no workflow.run events seen")))
+      expect(last.type).toBe("workflow.run.finished")
+      expect(last.data["status"]).toBe("completed")
+
+      // Slim payload: the metadata fields plus an `agents` COUNT object (never the
+      // full agents array).
+      expect(last.data["id"]).toBe(started.id)
+      expect(last.data["workflow"]).toBe(EVENTS_FIXTURE)
+      expect(last.data["current_phase"]).toBe("run")
+      expect(last.data["directory"]).toBe(test.directory)
+      expect(last.data["agents"]).toEqual({ total: 0, running: 0, failed: 0 })
+      expect(Array.isArray(last.data["agents"])).toBe(false)
+    }),
+  )
+
   // Fund 48 (deterministic ordering): the pipeline runs each item's stage SEQUENCE
   // independently — there is NO barrier between stages, so item B can be in stage 2
   // while item A is still in stage 1. Previously proven by sleeping item A 80ms in
