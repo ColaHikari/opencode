@@ -136,6 +136,7 @@ function formatWorkflow(info: Workflow.Info) {
     `<path>${escapeXmlText(info.path)}</path>`,
     `<display_name>${escapeXmlText(info.meta.name)}</display_name>`,
     info.meta.description ? `<description>${escapeXmlText(info.meta.description)}</description>` : undefined,
+    info.meta.whenToUse ? `<when_to_use>${escapeXmlText(info.meta.whenToUse)}</when_to_use>` : undefined,
     info.meta.phases?.length
       ? `<phases>${escapeXmlText(info.meta.phases.map((phase) => phase.title).join(", "))}</phases>`
       : undefined,

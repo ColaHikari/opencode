@@ -146,6 +146,29 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     ),
   )
 
+  it.live("read renders whenToUse from meta (QW4)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "deploy",
+            `export const meta = {
+  name: "Deploy",
+  description: "Deploy the app.",
+  whenToUse: "When the user asks to ship to production."
+}
+export async function run(args, ctx) { return { ok: true } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "read", name: "deploy" }, requestRecorder().ctx)
+        expect(result.output).toContain("<when_to_use>When the user asks to ship to production.</when_to_use>")
+      }),
+    ),
+  )
+
   it.live("starts workflow and asks reusable workflow permission", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
