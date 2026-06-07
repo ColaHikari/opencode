@@ -63,6 +63,14 @@ const Parameters = Schema.Struct({
     description: "Complete TypeScript workflow source for create",
   }),
   overwrite: Schema.optional(Schema.Boolean).annotate({ description: "Overwrite an existing workflow file" }),
+  resume_of: Schema.optional(Schema.String).annotate({
+    description:
+      "Resume a previous (paused/interrupted) workflow run by its run id; the engine replays that run's completed agent journal instead of re-running them.",
+  }),
+  invalidate_agents: Schema.optional(Schema.Array(Schema.Int)).annotate({
+    description:
+      "Agent indices (0-based, in the source run's order) to force live re-execution of during a resume. Only meaningful with resume_of.",
+  }),
 })
 
 type Params = Schema.Schema.Type<typeof Parameters>
@@ -361,6 +369,8 @@ function startWorkflow(input: {
   name: string
   source?: string
   temporary?: boolean
+  resumeOf?: Workflow.RunID
+  invalidateAgents?: number[]
   ctx: Tool.Context
 }) {
   return Effect.gen(function* () {
@@ -378,6 +388,8 @@ function startWorkflow(input: {
         caller: { sessionID: input.ctx.sessionID, agent: input.ctx.agent },
         source: input.source,
         temporary: input.temporary,
+        resume_of: input.resumeOf,
+        invalidate_agents: input.invalidateAgents,
       })
       .pipe(Effect.mapError(workflowError))
 
@@ -518,6 +530,12 @@ export const WorkflowTool = Tool.define(
 
           if (params.action === "start") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
+            // QW3: a malformed resume_of is surfaced as a clean not-found (using the
+            // same prefix guard wait/inspect use) rather than a Schema defect through
+            // the trailing orDie.
+            const resumeOf = params.resume_of ? decodeRunId(params.resume_of) : undefined
+            if (params.resume_of && !resumeOf)
+              return yield* Effect.fail(new Error(`Workflow run not found: ${params.resume_of}`))
             // N15 (security, behavior change): the name reaching the permission
             // pattern/`always` MUST be glob-metacharacter-free. A discovered
             // workflow name is just a file basename (discover() does
@@ -567,6 +585,8 @@ export const WorkflowTool = Tool.define(
               params,
               name: params.name,
               source: source ?? undefined,
+              resumeOf,
+              invalidateAgents: params.invalidate_agents ? [...params.invalidate_agents] : undefined,
               ctx,
             })
           }

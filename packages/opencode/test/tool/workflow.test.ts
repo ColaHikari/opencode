@@ -7,6 +7,7 @@ import path from "path"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { WorkflowTool } from "@/tool/workflow"
+import { Workflow } from "@/workflow/workflow"
 import { Session } from "@/session/session"
 import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
@@ -22,7 +23,14 @@ import { PartID } from "@/session/schema"
 // Session service the ToolRegistry already builds internally, so a session
 // created here is the same one the workflow tool's background completion path
 // reads via `sessions.get(ctx.sessionID)` before delivering its message.
-const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, Session.defaultLayer, CrossSpawnSpawner.defaultLayer))
+// Workflow.defaultLayer is merged so a test can read the engine's run state via
+// `Workflow.Service` (e.g. asserting a started run carries resume_of). Effect
+// layer memoization shares the single Workflow service the ToolRegistry already
+// builds internally, so a run started through the tool is the same run this
+// service reads back — mirroring why Session.defaultLayer is merged here.
+const it = testEffect(
+  Layer.mergeAll(ToolRegistry.defaultLayer, Session.defaultLayer, Workflow.defaultLayer, CrossSpawnSpawner.defaultLayer),
+)
 
 const baseCtx: Omit<Tool.Context, "ask"> = {
   sessionID: SessionID.make("ses_test"),
@@ -161,6 +169,54 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
         expect(recorder.requests[0].always).toEqual(["hello"])
         expect(result.output).toContain(`<workflow_run id="${result.metadata.runId}" state="completed">`)
         expect(result.output).toContain('"value": 42')
+      }),
+    ),
+  )
+
+  it.live("start forwards resume_of + invalidate_agents to workflow.start", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        // The workflow hangs when args.hang is set so we can deterministically catch
+        // the source run `running` and PAUSE it (the engine only resumes paused or
+        // interrupted runs, never completed ones); without the flag it returns
+        // synchronously so the resumed run settles on its own.
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "echo",
+            `export const meta = { name: "Echo", description: "Echo." }
+export async function run(args, ctx) { if (args.hang) await new Promise(() => {}); return { value: args.value } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const workflow = yield* Workflow.Service
+        // Start a hanging source run in the background, then pause it so it parks as
+        // a resumable `paused` source.
+        const first = yield* tool.execute(
+          { action: "start", name: "echo", args: { value: 1, hang: true }, background: true },
+          recorder.ctx,
+        )
+        const sourceId = first.metadata.runId as string
+        const paused = yield* pollWithTimeout(
+          workflow
+            .pause(Workflow.RunID.make(sourceId))
+            .pipe(Effect.map((run) => (run?.status === "paused" ? run : undefined))),
+          "source run never paused",
+        )
+        expect(paused.status).toBe("paused")
+
+        // Resume start: pass resume_of + invalidate_agents. The engine replays the
+        // (directory-scoped) source journal; what we assert is the parameters reached
+        // workflow.start (the new run carries resume_of) and the run still completes.
+        const resumed = yield* tool.execute(
+          { action: "start", name: "echo", args: { value: 1 }, resume_of: sourceId, invalidate_agents: [0] },
+          recorder.ctx,
+        )
+        const run = yield* workflow.get(Workflow.RunID.make(resumed.metadata.runId as string))
+        expect(run?.resume_of).toBe(sourceId)
+        expect(resumed.output).toContain(`state="completed"`)
       }),
     ),
   )
