@@ -15,6 +15,7 @@ import * as Tool from "./tool"
 import { trimDiff } from "./edit"
 import { Workflow } from "@/workflow/workflow"
 import { MetaReader } from "@/workflow/meta-reader"
+import { Agent } from "@/agent/agent"
 
 const WORKFLOW_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT = 60 * 60 * 1000
@@ -63,6 +64,14 @@ const Parameters = Schema.Struct({
     description: "Complete TypeScript workflow source for create",
   }),
   overwrite: Schema.optional(Schema.Boolean).annotate({ description: "Overwrite an existing workflow file" }),
+  resume_of: Schema.optional(Schema.String).annotate({
+    description:
+      "Resume a previous (paused/interrupted) workflow run by its run id; the engine replays that run's completed agent journal instead of re-running them.",
+  }),
+  invalidate_agents: Schema.optional(Schema.Array(Schema.Int)).annotate({
+    description:
+      "Agent indices (0-based, in the source run's order) to force live re-execution of during a resume. Only meaningful with resume_of.",
+  }),
 })
 
 type Params = Schema.Schema.Type<typeof Parameters>
@@ -128,6 +137,7 @@ function formatWorkflow(info: Workflow.Info) {
     `<path>${escapeXmlText(info.path)}</path>`,
     `<display_name>${escapeXmlText(info.meta.name)}</display_name>`,
     info.meta.description ? `<description>${escapeXmlText(info.meta.description)}</description>` : undefined,
+    info.meta.whenToUse ? `<when_to_use>${escapeXmlText(info.meta.whenToUse)}</when_to_use>` : undefined,
     info.meta.phases?.length
       ? `<phases>${escapeXmlText(info.meta.phases.map((phase) => phase.title).join(", "))}</phases>`
       : undefined,
@@ -141,6 +151,26 @@ function formatWorkflow(info: Workflow.Info) {
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n")
+}
+
+// QW7: the live agent roster the engine can dispatch as workflow steps. Surfaced
+// in read/create output so the model authors `ctx.agent({ agent })` steps against
+// agents that actually exist, instead of guessing builtin names.
+function formatAgentRoster(list: Agent.Info[]) {
+  // Only subagents the engine can dispatch via ctx.agent({agent}) — hidden and
+  // primary-only agents are not selectable as workflow steps. Sorted for a
+  // stable, scannable list.
+  const usable = list
+    .filter((agent) => agent.hidden !== true && agent.mode !== "primary")
+    .toSorted((a, b) => a.name.localeCompare(b.name))
+  if (usable.length === 0) return "<available_agents>No dispatchable agents are available.</available_agents>"
+  return [
+    "<available_agents>",
+    ...usable.map(
+      (agent) => `  <agent name="${escapeXmlAttr(agent.name)}">${escapeXmlText(agent.description ?? "")}</agent>`,
+    ),
+    "</available_agents>",
+  ].join("\n")
 }
 
 function formatRunSummary(run: Workflow.Run) {
@@ -358,9 +388,15 @@ function startWorkflow(input: {
   sessions: Session.Interface
   scope: Scope.Scope
   params: Params
-  name: string
+  // The named workflow to start. OMITTED for a P3 inline-source start: the engine
+  // keys its inline source-string load path on `name === undefined` (+ `source`
+  // set), deriving the run's name from the source's meta. A NAMED start (incl. a
+  // named temporary start) always supplies it to select a discovered workflow.
+  name?: string
   source?: string
   temporary?: boolean
+  resumeOf?: Workflow.RunID
+  invalidateAgents?: number[]
   ctx: Tool.Context
 }) {
   return Effect.gen(function* () {
@@ -378,6 +414,8 @@ function startWorkflow(input: {
         caller: { sessionID: input.ctx.sessionID, agent: input.ctx.agent },
         source: input.source,
         temporary: input.temporary,
+        resume_of: input.resumeOf,
+        invalidate_agents: input.invalidateAgents,
       })
       .pipe(Effect.mapError(workflowError))
 
@@ -487,6 +525,7 @@ export const WorkflowTool = Tool.define(
   "workflow",
   Effect.gen(function* () {
     const workflow = yield* Workflow.Service
+    const agents = yield* Agent.Service
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
     const fs = yield* FSUtil.Service
@@ -512,11 +551,65 @@ export const WorkflowTool = Tool.define(
             return {
               title: `Workflow: ${info.name}`,
               metadata: { name: info.name, path: info.path },
-              output: formatWorkflow(info),
+              output: [formatWorkflow(info), formatAgentRoster(yield* agents.list())].join("\n"),
             }
           }
 
           if (params.action === "start") {
+            // P3: inline source is mutually exclusive with name — exactly one selects
+            // the workflow to start.
+            if (params.source && params.name)
+              return yield* Effect.fail(new Error("Provide either name or source for action=start, not both"))
+            if (!params.name && !params.source)
+              return yield* Effect.fail(new Error("name or source is required for action=start"))
+            // QW3: a malformed resume_of is surfaced as a clean not-found (using the
+            // same prefix guard wait/inspect use) rather than a Schema defect through
+            // the trailing orDie.
+            const resumeOf = params.resume_of ? decodeRunId(params.resume_of) : undefined
+            if (params.resume_of && !resumeOf)
+              return yield* Effect.fail(new Error(`Workflow run not found: ${params.resume_of}`))
+
+            if (params.source) {
+              // P3: inline-source start runs as a TEMPORARY run. Statically validate
+              // the source via MetaReader (AST-only, never executes the module) BEFORE
+              // the permission ask — same gate order as create/named-start: a bad meta
+              // fails here, the module LOAD (which runs code) happens later inside the
+              // engine, after the ask.
+              const validated = MetaReader.read(params.source, "inline.ts")
+              if (validated.valid === false)
+                return yield* Effect.fail(new Error(`Invalid workflow inline.ts: ${validated.error}`))
+              // The meta name keys the permission pattern/`always`, so an illegal name
+              // (glob metacharacter/whitespace) is rejected here with a clean fail —
+              // never sanitizeWorkflowName's synchronous throw (which orDie would turn
+              // into a defect) and never an over-broad `always` rule (N15).
+              if (!WORKFLOW_NAME_PATTERN.test(validated.meta.name))
+                return yield* Effect.fail(
+                  new Error("Workflow names may only contain letters, numbers, underscores, and dashes"),
+                )
+              const safeName = validated.meta.name
+              yield* ctx.ask({
+                permission: "workflow",
+                patterns: [safeName],
+                always: [safeName],
+                metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
+              })
+              return yield* startWorkflow({
+                workflow,
+                background,
+                sessions,
+                scope,
+                params,
+                // Omit name: the engine takes its inline source-string load path when
+                // name is undefined and source is set, deriving the run's name from
+                // the source's meta (validated above).
+                source: params.source,
+                temporary: true,
+                resumeOf,
+                invalidateAgents: params.invalidate_agents ? [...params.invalidate_agents] : undefined,
+                ctx,
+              })
+            }
+
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
             // N15 (security, behavior change): the name reaching the permission
             // pattern/`always` MUST be glob-metacharacter-free. A discovered
@@ -567,6 +660,8 @@ export const WorkflowTool = Tool.define(
               params,
               name: params.name,
               source: source ?? undefined,
+              resumeOf,
+              invalidateAgents: params.invalidate_agents ? [...params.invalidate_agents] : undefined,
               ctx,
             })
           }
@@ -680,6 +775,7 @@ export const WorkflowTool = Tool.define(
                 "Workflow file created and validated.",
                 "",
                 formatWorkflow({ name: params.name, path: filepath, meta: validated.meta, valid: true }),
+                formatAgentRoster(yield* agents.list()),
               ].join("\n"),
             }
           }

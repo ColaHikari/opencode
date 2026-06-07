@@ -7,6 +7,7 @@ import path from "path"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { WorkflowTool } from "@/tool/workflow"
+import { Workflow } from "@/workflow/workflow"
 import { Session } from "@/session/session"
 import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
@@ -22,7 +23,14 @@ import { PartID } from "@/session/schema"
 // Session service the ToolRegistry already builds internally, so a session
 // created here is the same one the workflow tool's background completion path
 // reads via `sessions.get(ctx.sessionID)` before delivering its message.
-const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, Session.defaultLayer, CrossSpawnSpawner.defaultLayer))
+// Workflow.defaultLayer is merged so a test can read the engine's run state via
+// `Workflow.Service` (e.g. asserting a started run carries resume_of). Effect
+// layer memoization shares the single Workflow service the ToolRegistry already
+// builds internally, so a run started through the tool is the same run this
+// service reads back — mirroring why Session.defaultLayer is merged here.
+const it = testEffect(
+  Layer.mergeAll(ToolRegistry.defaultLayer, Session.defaultLayer, Workflow.defaultLayer, CrossSpawnSpawner.defaultLayer),
+)
 
 const baseCtx: Omit<Tool.Context, "ask"> = {
   sessionID: SessionID.make("ses_test"),
@@ -138,6 +146,51 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     ),
   )
 
+  it.live("read renders whenToUse from meta (QW4)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "deploy",
+            `export const meta = {
+  name: "Deploy",
+  description: "Deploy the app.",
+  whenToUse: "When the user asks to ship to production."
+}
+export async function run(args, ctx) { return { ok: true } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "read", name: "deploy" }, requestRecorder().ctx)
+        expect(result.output).toContain("<when_to_use>When the user asks to ship to production.</when_to_use>")
+      }),
+    ),
+  )
+
+  it.live("read output includes the live agent roster (QW7)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello", description: "Say hi." }
+export async function run(args, ctx) { return { ok: true } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "read", name: "hello" }, requestRecorder().ctx)
+        // The roster block exists and lists at least the always-present "general"
+        // subagent the engine can dispatch (agent.ts default subagents).
+        expect(result.output).toContain("<available_agents>")
+        expect(result.output).toContain(`<agent name="general"`)
+      }),
+    ),
+  )
+
   it.live("starts workflow and asks reusable workflow permission", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
@@ -161,6 +214,106 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
         expect(recorder.requests[0].always).toEqual(["hello"])
         expect(result.output).toContain(`<workflow_run id="${result.metadata.runId}" state="completed">`)
         expect(result.output).toContain('"value": 42')
+      }),
+    ),
+  )
+
+  it.live("start forwards resume_of + invalidate_agents to workflow.start", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        // The workflow hangs when args.hang is set so we can deterministically catch
+        // the source run `running` and PAUSE it (the engine only resumes paused or
+        // interrupted runs, never completed ones); without the flag it returns
+        // synchronously so the resumed run settles on its own.
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "echo",
+            `export const meta = { name: "Echo", description: "Echo." }
+export async function run(args, ctx) { if (args.hang) await new Promise(() => {}); return { value: args.value } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const workflow = yield* Workflow.Service
+        // Start a hanging source run in the background, then pause it so it parks as
+        // a resumable `paused` source.
+        const first = yield* tool.execute(
+          { action: "start", name: "echo", args: { value: 1, hang: true }, background: true },
+          recorder.ctx,
+        )
+        const sourceId = first.metadata.runId as string
+        const paused = yield* pollWithTimeout(
+          workflow
+            .pause(Workflow.RunID.make(sourceId))
+            .pipe(Effect.map((run) => (run?.status === "paused" ? run : undefined))),
+          "source run never paused",
+        )
+        expect(paused.status).toBe("paused")
+
+        // Resume start: pass resume_of + invalidate_agents. The engine replays the
+        // (directory-scoped) source journal; what we assert is the parameters reached
+        // workflow.start (the new run carries resume_of) and the run still completes.
+        const resumed = yield* tool.execute(
+          { action: "start", name: "echo", args: { value: 1 }, resume_of: sourceId, invalidate_agents: [0] },
+          recorder.ctx,
+        )
+        const run = yield* workflow.get(Workflow.RunID.make(resumed.metadata.runId as string))
+        expect(run?.resume_of as string | undefined).toBe(sourceId)
+        expect(resumed.output).toContain(`state="completed"`)
+      }),
+    ),
+  )
+
+  it.live("start with inline source runs as a temporary run and asks permission by meta name (P3)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Inline", description: "Inline run." }
+export async function run(args, ctx) { return { value: args.value } }
+`
+        const result = yield* tool.execute({ action: "start", source, args: { value: 9 } }, recorder.ctx)
+        // Permission ask used the meta name from the inline source.
+        expect(recorder.requests.length).toBe(1)
+        expect(recorder.requests[0].permission).toBe("workflow")
+        expect(recorder.requests[0].patterns).toEqual(["Inline"])
+        expect(result.output).toContain(`state="completed"`)
+        expect(result.output).toContain('"value": 9')
+        // The run is flagged temporary in its definition.
+        expect(result.output).toContain("<temporary>true</temporary>")
+      }),
+    ),
+  )
+
+  it.live("start with invalid inline source fails statically before the permission ask (P3)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        // Non-literal meta name → MetaReader rejects it statically.
+        const source = `export const meta = { name: someVar }
+export async function run() {}
+`
+        const exit = yield* Effect.exit(tool.execute({ action: "start", source }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        // No permission ask fired — the static gate ran first.
+        expect(recorder.requests.length).toBe(0)
+      }),
+    ),
+  )
+
+  it.live("start rejects both name and source supplied together (P3)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const exit = yield* Effect.exit(
+          tool.execute({ action: "start", name: "x", source: 'export const meta = { name: "X" }' }, recorder.ctx),
+        )
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(recorder.requests.length).toBe(0)
       }),
     ),
   )
@@ -210,6 +363,21 @@ export async function run(args, ctx) { return "ok" }
         // The created file is discoverable and valid through the read action.
         const read = yield* tool.execute({ action: "read", name: "made" }, recorder.ctx)
         expect(read.output).toContain("Created by test.")
+      }),
+    ),
+  )
+
+  it.live("create output includes the live agent roster (QW7)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Made", description: "Created by test." }
+export async function run(args, ctx) { return "ok" }
+`
+        const result = yield* tool.execute({ action: "create", name: "made", source }, recorder.ctx)
+        expect(result.output).toContain("<available_agents>")
+        expect(result.output).toContain(`<agent name="general"`)
       }),
     ),
   )

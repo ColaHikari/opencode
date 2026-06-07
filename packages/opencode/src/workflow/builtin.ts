@@ -38,6 +38,23 @@ export function isBuiltinPath(path: string) {
   return path.startsWith(BUILTIN_PATH_PREFIX)
 }
 
+// The synthetic path marker for an INLINE-source workflow is `inline:<metaName>`
+// (P3). Like `builtin:`, it is never a real filesystem path: an inline start
+// supplies the module source directly, loaded through the SAME source-string
+// import path builtins use (loadModule materializes a randomized temp module
+// under the global workflows dir). Discovery globs real `*.ts` files only, so an
+// `inline:` marker — exactly like `builtin:` — can never be picked up as a
+// discovered workflow.
+export const INLINE_PATH_PREFIX = "inline:"
+
+export function inlinePath(name: string) {
+  return `${INLINE_PATH_PREFIX}${name}`
+}
+
+export function isInlinePath(path: string) {
+  return path.startsWith(INLINE_PATH_PREFIX)
+}
+
 // deep-research: fan out a question into distinct search angles, research each
 // in parallel, adversarially verify every claim against its cited sources, then
 // synthesize a cited report from only the surviving claims. The meta fields are

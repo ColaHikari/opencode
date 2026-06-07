@@ -82,6 +82,22 @@ function seedWorkflow(ctx: { file: (name: string, content: string) => Effect.Eff
   return ctx.file(`.opencode/workflows/${WORKFLOW_FIXTURE_NAME}.ts`, workflowFixtureSource)
 }
 
+const WORKFLOW_QUESTION_NAME = "httpapi-question"
+// Asks a question with a tiny timeout: unanswered, the run PARKS as `paused`
+// with a persisted pending_question, so the answer route's resume branch can be
+// driven deterministically over HTTP. The body returns the answer (no LLM).
+const workflowQuestionSource = [
+  `export const meta = { name: "${WORKFLOW_QUESTION_NAME}", description: "httpapi question fixture", phases: ["run"] }`,
+  `export async function run(args, ctx) {`,
+  `  const a = await ctx.question({ question: "go?", options: ["yes", "no"], timeout: 50 })`,
+  `  return { answer: a.answer }`,
+  `}`,
+  ``,
+].join("\n")
+function seedQuestionWorkflow(ctx: { file: (name: string, content: string) => Effect.Effect<void> }) {
+  return ctx.file(`.opencode/workflows/${WORKFLOW_QUESTION_NAME}.ts`, workflowQuestionSource)
+}
+
 function isWorkflowRun(value: any): { id: string; status: string } {
   object(value)
   check(typeof value.id === "string" && value.id.startsWith("job"), `run id should start with "job"`)
@@ -1679,6 +1695,99 @@ const scenarios: Scenario[] = [
             if (resumedStatus !== "completed") yield* Effect.sleep("50 millis")
           }
           check(resumedStatus === "completed", `resumed run should complete, got "${resumedStatus}"`)
+        }),
+      "status",
+    ),
+  // Answer happy path keyed to the answer route: seed a question workflow, start
+  // it, let it PARK as `paused` with a persisted pending_question, then answer the
+  // parked run → a NEW resumed run, 200. The answer body carries
+  // permissionSessionID (threaded into workflow.answer so a parked run resumed
+  // here can dispatch its post-question agent steps); the resumed run references
+  // the source via resume_of.
+  http.protected
+    .post("/workflow/run/{id}/answer", "workflow.answer")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        yield* seedQuestionWorkflow(ctx)
+        const session = yield* ctx.session({ title: "Workflow answer owner" })
+        return { session }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_QUESTION_NAME }),
+      headers: ctx.headers(),
+      body: { permissionSessionID: ctx.state.session.id },
+    }))
+    .jsonEffect(
+      200,
+      (body, ctx) =>
+        Effect.gen(function* () {
+          const started = isRecord(body) ? body : {}
+          const id = String(started.id)
+          const headers = ctx.headers()
+          // Poll get until the run has parked as paused with a persisted question.
+          let status = ""
+          for (let attempt = 0; attempt < 60 && status !== "paused"; attempt++) {
+            const got = yield* request({ method: "GET", path: route("/workflow/run/{id}", { id }), headers })
+            status = isRecord(got.body) && typeof got.body.status === "string" ? got.body.status : ""
+            // The parked run exposes pending_question on the bare Run payload (no
+            // serializer filtering — Grounding-Delta 3).
+            if (status === "paused")
+              check(
+                isRecord(got.body) && isRecord(got.body.pending_question),
+                "paused run should expose pending_question",
+              )
+            if (status !== "paused") yield* Effect.sleep("50 millis")
+          }
+          check(status === "paused", `question run should park as paused, got "${status}"`)
+          // Answer the parked run → a NEW resumed run, 200. permissionSessionID is
+          // threaded into workflow.answer (mirrors the start route's payload field).
+          const answered = yield* request({
+            method: "POST",
+            path: route("/workflow/run/{id}/answer", { id }),
+            headers,
+            body: { answer: "yes", permissionSessionID: ctx.state.session.id },
+          })
+          check(answered.status === 200, `answer of a parked run should be 200, got ${answered.status}`)
+          const resumed = isRecord(answered.body) ? answered.body : {}
+          check(typeof resumed.id === "string" && resumed.id !== id, "answer should return the NEW resumed run id")
+          check(resumed.resume_of === id, "resumed run should reference the source run")
+        }),
+      "status",
+    ),
+  http.protected
+    .post("/workflow/run/{id}/answer", "workflow.answer.missing")
+    .at((ctx) => ({
+      path: route("/workflow/run/{id}/answer", { id: "job_httpapi_missing" }),
+      headers: ctx.headers(),
+      body: { answer: "x" },
+    }))
+    .status(404),
+  // 409: a known run with NO open question — the non-hanging fixture runs to
+  // `completed` synchronously, so there is nothing to answer.
+  http.protected
+    .post("/workflow/run/{id}/answer", "workflow.answer.noQuestion")
+    .mutating()
+    .seeded((ctx) => seedWorkflow(ctx))
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: {},
+    }))
+    .jsonEffect(
+      200,
+      (body, ctx) =>
+        Effect.gen(function* () {
+          const id = String((isRecord(body) ? body : {}).id)
+          const headers = ctx.headers()
+          const answered = yield* request({
+            method: "POST",
+            path: route("/workflow/run/{id}/answer", { id }),
+            headers,
+            body: { answer: "x" },
+          })
+          check(answered.status === 409, `answering a run with no open question should be 409, got ${answered.status}`)
         }),
       "status",
     ),

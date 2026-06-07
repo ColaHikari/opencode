@@ -2,7 +2,7 @@ import { SessionID } from "@/session/schema"
 import { Workflow } from "@/workflow/workflow"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiError, OpenApi } from "effect/unstable/httpapi"
-import { ApiNotFoundError } from "../errors"
+import { ApiNotFoundError, ConflictError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -34,6 +34,16 @@ export const StartPayload = Schema.Struct({
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
+export const AnswerPayload = Schema.Struct({
+  answer: Schema.String.annotate({ description: "The human answer to the run's open question." }),
+  // Session that should receive permission prompts raised by the resumed run's
+  // subagents (a parked run answered here re-runs its post-question ctx.agent
+  // steps). Mirrors StartPayload.permissionSessionID: headless default when
+  // omitted, branded at the schema boundary like the session endpoints.
+  permissionSessionID: Schema.optional(SessionID),
+}).annotate({ identifier: "WorkflowAnswerPayload" })
+export type AnswerPayload = Schema.Schema.Type<typeof AnswerPayload>
+
 // 400 for a bad request against a workflow (a workflow file that fails to load:
 // bad meta / missing run / syntax error). `workflow` ALWAYS carries the workflow
 // NAME so a single field has one stable meaning; the failing file's `path` is a
@@ -56,6 +66,7 @@ export const WorkflowPaths = {
   start: `${root}/:name/start`,
   cancel: `${root}/run/:id/cancel`,
   pause: `${root}/run/:id/pause`,
+  answer: `${root}/run/:id/answer`,
   remove: `${root}/run/:id`,
 } as const
 
@@ -156,6 +167,29 @@ export const WorkflowApi = HttpApi.make("workflow")
             identifier: "workflow.pause",
             summary: "Pause workflow run",
             description: "Pause a running workflow execution run, keeping its journal so it can be resumed.",
+          }),
+        ),
+        HttpApiEndpoint.post("answer", WorkflowPaths.answer, {
+          // Branded at the schema boundary like cancel/pause: a malformed id is a 400
+          // at decode time, never a defect in the handler.
+          params: { id: Workflow.RunID },
+          query: WorkspaceRoutingQuery,
+          payload: AnswerPayload,
+          // 200 + the run: a LIVE answer returns the SAME run (question resolved); a
+          // PARKED (paused) run returns the NEW resumed run. A run not known to this
+          // workspace is a 404; a known run with no open question is a 409.
+          success: described(Workflow.Run, "Workflow run after answering its open question"),
+          // WorkflowApiError (400): answering a PARKED run starts a resume, which can
+          // fail to load the (now resumed) workflow file the same way start does — the
+          // handler maps that engine InvalidError to WorkflowApiError, so it must be a
+          // declared channel here too.
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError, WorkflowApiError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.answer",
+            summary: "Answer workflow question",
+            description:
+              "Answer a run's open human-in-the-loop question. A live run resolves in place; a parked run is resumed.",
           }),
         ),
         HttpApiEndpoint.delete("remove", WorkflowPaths.remove, {
