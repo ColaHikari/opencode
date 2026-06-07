@@ -1035,6 +1035,33 @@ function costPromptOps(db: Database.Interface["db"], cost: number) {
   return ops
 }
 
+// Finding 2 fake: an externally-aborted subagent. The prompt RESOLVES (does not
+// reject) with an abort-marked assistant message that ALSO carries a real cost —
+// exactly what the production runner returns when a child session is aborted out
+// of band (POST /session/:id/abort, internal session timeout) while the workflow
+// run itself is NOT cancelling/pausing/removed. The cost is persisted into the
+// MessageTable (where the engine's per-session cost sum reads from) so the abort
+// artifact carries a charge, and the returned WithParts is abort-marked
+// (MessageAbortedError) so `isAbortedMessage` fires with no run-level flag set.
+// No cancel() is wired — the abort is purely message-level.
+function abortedCostPromptOps(db: Database.Interface["db"], cost: number) {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        return yield* persistTurns(db, input.sessionID, [
+          {
+            cost,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            error: { name: "MessageAbortedError", data: {} },
+          },
+        ])
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
 // Multi-turn fake (Fund N12): a SINGLE ctx.agent step whose underlying session
 // runs several provider turns (the normal case when the subagent uses tools),
 // each persisting its own assistant message with its own cost/tokens. Production
@@ -3256,6 +3283,46 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(result.remaining).toBe(0.7)
       // Und der Agent-Node ist als failed verbucht.
       expect(done.run?.agents.some((a) => a.status === "failed")).toBe(true)
+    }),
+  )
+
+  // Finding 2 (HIGH): an externally-aborted subagent — a session abort/timeout that
+  // is NOT a run-level cancel/pause — RESOLVES with an abort-marked assistant message
+  // that carries the abort-artifact cost (0.4 USD here). The run itself never enters
+  // cancelling/pausing/removed, so the spend-skip guard used to charge that cost,
+  // leaving a `cancelled` run whose budget/costSpent were debited (an internally
+  // inconsistent terminal state the comment explicitly forbids). The fix adds the
+  // message-level `aborted` flag to the spend-skip guard. We capture the live spend
+  // accumulators at the terminal transition (they are never persisted) via the
+  // captureSpend seam: the run finishes `cancelled` (the abort propagates) but its
+  // budget must be UNTOUCHED (full 1.0 remaining, 0 spent). The per-node telemetry
+  // cost is still recorded — only the budget charge is skipped.
+  it.instance("an externally-aborted subagent does not charge its abort-artifact cost to the budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const spend = new Map<string, { budgetRemaining: number; costSpent: number }>()
+      Workflow.__testHooks.captureSpend((id, s) => spend.set(id, s))
+      try {
+        const run = yield* workflow.start({
+          name: SINGLE_AGENT_FIXTURE,
+          args: {},
+          prompt: abortedCostPromptOps(db, 0.4),
+          budget: 1,
+        })
+        const done = yield* workflow.wait({ id: run.id })
+        // The abort propagates: the run finishes `cancelled` (not completed).
+        expect(done.run?.status).toBe("cancelled")
+        const captured = spend.get(run.id)
+        expect(captured).toBeDefined()
+        // The abort-artifact cost was NOT charged: budget intact, nothing spent.
+        expect(captured!.budgetRemaining).toBe(1)
+        expect(captured!.costSpent).toBe(0)
+      } finally {
+        Workflow.__testHooks.captureSpend(() => {})
+      }
     }),
   )
 

@@ -835,6 +835,12 @@ let setPausingHook: ((id: string) => Effect.Effect<boolean>) | undefined
 // still live — so a test can deterministically land an answer() in the
 // timeout-vs-answer race window. `Effect.void` in production (no-op).
 let questionTimeoutParkHook: Effect.Effect<unknown> = Effect.void
+// Finding 2 test seam: records the live spend accumulators (`budgetRemaining` /
+// `costSpent`) of each run AS IT REACHES its terminal transition in finish().
+// These are in-memory `active` fields that are never persisted to the row, so a
+// test cannot read them back after the run is evicted; this captures them at the
+// exact moment the run settles. Inert in production (never set).
+let captureSpendHook: ((id: string, spend: { budgetRemaining: number; costSpent: number }) => void) | undefined
 export const __testHooks = {
   failNextTerminalPersist: () => {
     failNextTerminalPersist = true
@@ -863,6 +869,15 @@ export const __testHooks = {
         }),
       ),
     )
+  },
+  /**
+   * Capture the live spend accumulators (`budgetRemaining`/`costSpent`) of each
+   * run as it settles in finish(). Used by Finding 2's test to prove an
+   * externally-aborted subagent's abort-artifact cost is NOT charged to the
+   * budget even though the run terminates `cancelled`.
+   */
+  captureSpend: (sink: (id: string, spend: { budgetRemaining: number; costSpent: number }) => void) => {
+    captureSpendHook = sink
   },
 }
 
@@ -1879,6 +1894,10 @@ export const layer = Layer.effect(
       // as the text `"null"`) instead of racing an in-flight progress write. The
       // `Effect.exit` guard keeps this ordering safe for the failing-persist case.
       const result = snapshot(active)
+      // Finding 2 test seam: surface the in-memory spend accumulators at the
+      // terminal transition (never persisted, so otherwise unobservable post-run).
+      if (captureSpendHook)
+        captureSpendHook(id, { budgetRemaining: active.budgetRemaining, costSpent: active.costSpent })
       yield* persistRun(db, events, active, { terminal: true }).pipe(Effect.exit)
       yield* Deferred.succeed(active.done, result).pipe(Effect.ignore)
       // N1: evict the terminal run from the in-memory registry so the map does not
@@ -2174,6 +2193,15 @@ export const layer = Layer.effect(
         persistInScope(active, bridge, db, events)
         const prompt = input.prompt
         if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
+        // Finding 2: an externally-aborted subagent (a session abort/timeout that is
+        // NOT a run-level cancel/pause) RESOLVES with an abort-marked assistant
+        // message that carries the abort-artifact cost. That cost must NOT be charged
+        // to the budget/costSpent (the comment in the `ensuring` below says so), but
+        // the run-level flags it gated on (cancelling/removed/pausing) are all false
+        // in this case. We capture `aborted` at the abort-detection point so the
+        // `ensuring` settlement can skip the charge for it too. Lives in the handler
+        // scope (shared by the gen and its `ensuring`).
+        let aborted = false
         return dispatch(
           Effect.gen(function* () {
             const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
@@ -2528,7 +2556,8 @@ export const layer = Layer.effect(
             // OR the message itself is abort-marked, this step did not succeed:
             // fail it as cancelled so the body unwinds as `cancelled` and the
             // settlement callbacks below never flip the node to `completed`.
-            if (active.cancelling || active.removed || isAbortedMessage(message)) {
+            aborted = isAbortedMessage(message)
+            if (active.cancelling || active.removed || aborted) {
               return yield* Effect.die(new CancelledError())
             }
             const structured = message.info.role === "assistant" ? message.info.structured : undefined
@@ -2575,7 +2604,11 @@ export const layer = Layer.effect(
                 // A step with no cost leaves the budget untouched; unset stays Infinity.
                 // A pausing run is treated like a cancelling one: an interrupted
                 // step did not really spend, so it must not be charged.
-                if (active.cancelling || active.removed || active.pausing) return
+                // Finding 2: ALSO skip when the resolved message was abort-marked
+                // (`aborted`), even with NO run-level flag set — an externally
+                // aborted subagent's cost is the abort artifact, not real spend, so
+                // charging it would leave a `cancelled` run with a debited budget.
+                if (active.cancelling || active.removed || active.pausing || aborted) return
                 // Charge the SAME cost to BOTH the live remaining budget (gated)
                 // and the lifetime spend accumulator. costSpent accrues regardless
                 // of whether a budget was set, so `ctx.budget.spent()` works without
