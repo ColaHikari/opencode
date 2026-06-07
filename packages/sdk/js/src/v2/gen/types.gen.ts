@@ -2051,6 +2051,11 @@ export type Config = {
     preserve_recent_tokens?: number
     reserved?: number
   }
+  workflows?: {
+    ultracode_keyword?: boolean
+    approval?: "always" | "first-run" | "never"
+    approved?: Array<string>
+  }
   experimental?: {
     disable_paste_summary?: boolean
     batch_tool?: boolean
@@ -2484,6 +2489,7 @@ export type ProjectCopyError = {
   name: "ProjectCopyError"
   data: {
     message: string
+    forceRequired?: boolean
   }
 }
 
@@ -2588,6 +2594,26 @@ export type ProviderAuthError1 = {
     kind?: string
   }
 }
+
+export type ReferenceDescriptor =
+  | {
+      name: string
+      kind: "local"
+      path: string
+    }
+  | {
+      name: string
+      kind: "git"
+      repository: string
+      path: string
+      branch?: string
+    }
+  | {
+      name: string
+      kind: "invalid"
+      repository?: string
+      message: string
+    }
 
 export type NotFoundError = {
   name: "NotFoundError"
@@ -2747,12 +2773,7 @@ export type WorkflowInfo = {
   meta: WorkflowMeta
   valid: boolean
   error?: string
-}
-
-export type WorkflowApiError = {
-  _tag: "WorkflowApiError"
-  message: string
-  workflow?: string
+  source_kind?: "builtin"
 }
 
 export type WorkflowDefinition = {
@@ -2764,7 +2785,7 @@ export type WorkflowDefinition = {
 }
 
 export type WorkflowLogEntry = {
-  time: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  time: number
   phase?: string
   message: string
 }
@@ -2772,8 +2793,8 @@ export type WorkflowLogEntry = {
 export type WorkflowAgentRun = {
   id: string
   status: "running" | "completed" | "failed"
-  started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  started_at: number
+  completed_at?: number
   phase?: string
   agent?: string
   model?: string
@@ -2793,6 +2814,7 @@ export type WorkflowAgentRun = {
     }
   }
   error?: string
+  cached?: boolean
 }
 
 export type WorkflowRun = {
@@ -2803,7 +2825,7 @@ export type WorkflowRun = {
     [key: string]: unknown
   }
   definition?: WorkflowDefinition
-  status: "running" | "completed" | "failed" | "cancelled" | "interrupted"
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
   started_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   completed_at?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   current_phase?: string
@@ -2811,6 +2833,7 @@ export type WorkflowRun = {
   agents: Array<WorkflowAgentRun>
   result?: unknown
   error?: string
+  resume_of?: string
 }
 
 export type WorkflowStartPayload = {
@@ -2819,6 +2842,15 @@ export type WorkflowStartPayload = {
   }
   budget?: number
   permissionSessionID?: string
+  resume_of?: string
+  invalidate_agents?: Array<number>
+}
+
+export type WorkflowApiError = {
+  _tag: "WorkflowApiError"
+  message: string
+  workflow?: string
+  path?: string
 }
 
 export type UnauthorizedError = {
@@ -2826,7 +2858,7 @@ export type UnauthorizedError = {
   message: string
 }
 
-export type V2SessionsResponse = {
+export type SessionsResponse = {
   data: Array<SessionV2Info>
   cursor: {
     previous?: string
@@ -2863,7 +2895,7 @@ export type UnknownError1 = {
   ref?: string
 }
 
-export type V2SessionMessagesResponse = {
+export type SessionMessagesResponse = {
   data: Array<SessionMessage>
   cursor: {
     previous?: string
@@ -7066,12 +7098,12 @@ export type ProjectDirectoriesResponse = ProjectDirectoriesResponses[keyof Proje
 export type ExperimentalProjectCopyRemoveData = {
   body?: {
     directory: string
+    force: boolean
   }
   path: {
     projectID: string
   }
   query?: {
-    directory?: string
     workspace?: string
   }
   url: "/experimental/project/{projectID}/copy"
@@ -7714,6 +7746,34 @@ export type ProviderOauthCallbackResponses = {
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
 
+export type ReferenceListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/reference"
+}
+
+export type ReferenceListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ReferenceListError = ReferenceListErrors[keyof ReferenceListErrors]
+
+export type ReferenceListResponses = {
+  /**
+   * Resolved configured references
+   */
+  200: Array<ReferenceDescriptor>
+}
+
+export type ReferenceListResponse = ReferenceListResponses[keyof ReferenceListResponses]
+
 export type SessionListData = {
   body?: never
   path?: never
@@ -8067,7 +8127,7 @@ export type SessionMessagesResponses = {
   }>
 }
 
-export type SessionMessagesResponse = SessionMessagesResponses[keyof SessionMessagesResponses]
+export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMessagesResponses]
 
 export type SessionPromptData = {
   body?: {
@@ -9522,9 +9582,9 @@ export type WorkflowListData = {
 
 export type WorkflowListErrors = {
   /**
-   * WorkflowApiError | InvalidRequestError
+   * Bad request
    */
-  400: WorkflowApiError | InvalidRequestError
+  400: BadRequestError
 }
 
 export type WorkflowListError = WorkflowListErrors[keyof WorkflowListErrors]
@@ -9610,9 +9670,13 @@ export type WorkflowGetData = {
 
 export type WorkflowGetErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
 }
 
 export type WorkflowGetError = WorkflowGetErrors[keyof WorkflowGetErrors]
@@ -9643,6 +9707,10 @@ export type WorkflowStartErrors = {
    * WorkflowApiError | InvalidRequestError
    */
   400: WorkflowApiError | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
 }
 
 export type WorkflowStartError = WorkflowStartErrors[keyof WorkflowStartErrors]
@@ -9670,9 +9738,13 @@ export type WorkflowCancelData = {
 
 export type WorkflowCancelErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
 }
 
 export type WorkflowCancelError = WorkflowCancelErrors[keyof WorkflowCancelErrors]
@@ -9685,6 +9757,40 @@ export type WorkflowCancelResponses = {
 }
 
 export type WorkflowCancelResponse = WorkflowCancelResponses[keyof WorkflowCancelResponses]
+
+export type WorkflowPauseData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/pause"
+}
+
+export type WorkflowPauseErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowPauseError = WorkflowPauseErrors[keyof WorkflowPauseErrors]
+
+export type WorkflowPauseResponses = {
+  /**
+   * Workflow run paused
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowPauseResponse = WorkflowPauseResponses[keyof WorkflowPauseResponses]
 
 export type V2HealthGetData = {
   body?: never
@@ -9788,9 +9894,9 @@ export type V2SessionListError = V2SessionListErrors[keyof V2SessionListErrors]
 
 export type V2SessionListResponses = {
   /**
-   * V2SessionsResponse
+   * SessionsResponse
    */
-  200: V2SessionsResponse
+  200: SessionsResponse
 }
 
 export type V2SessionListResponse = V2SessionListResponses[keyof V2SessionListResponses]
@@ -9999,12 +10105,12 @@ export type V2SessionMessagesError = V2SessionMessagesErrors[keyof V2SessionMess
 
 export type V2SessionMessagesResponses = {
   /**
-   * V2SessionMessagesResponse
+   * SessionMessagesResponse
    */
-  200: V2SessionMessagesResponse
+  200: SessionMessagesResponse
 }
 
-export type V2SessionMessagesResponse2 = V2SessionMessagesResponses[keyof V2SessionMessagesResponses]
+export type V2SessionMessagesResponse = V2SessionMessagesResponses[keyof V2SessionMessagesResponses]
 
 export type V2ModelListData = {
   body?: never
@@ -10172,83 +10278,6 @@ export type V2PermissionRequestListResponses = {
 
 export type V2PermissionRequestListResponse = V2PermissionRequestListResponses[keyof V2PermissionRequestListResponses]
 
-export type V2SessionPermissionListData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: never
-  url: "/api/session/{sessionID}/permission/request"
-}
-
-export type V2SessionPermissionListErrors = {
-  /**
-   * InvalidRequestError
-   */
-  400: InvalidRequestError
-  /**
-   * UnauthorizedError
-   */
-  401: UnauthorizedError
-  /**
-   * SessionNotFoundError
-   */
-  404: SessionNotFoundError
-}
-
-export type V2SessionPermissionListError = V2SessionPermissionListErrors[keyof V2SessionPermissionListErrors]
-
-export type V2SessionPermissionListResponses = {
-  /**
-   * Success
-   */
-  200: {
-    data: Array<PermissionV2Request>
-  }
-}
-
-export type V2SessionPermissionListResponse = V2SessionPermissionListResponses[keyof V2SessionPermissionListResponses]
-
-export type V2SessionPermissionReplyData = {
-  body: {
-    reply: PermissionV2Reply
-    message?: string
-  }
-  path: {
-    sessionID: string
-    requestID: string
-  }
-  query?: never
-  url: "/api/session/{sessionID}/permission/request/{requestID}/reply"
-}
-
-export type V2SessionPermissionReplyErrors = {
-  /**
-   * InvalidRequestError
-   */
-  400: InvalidRequestError
-  /**
-   * UnauthorizedError
-   */
-  401: UnauthorizedError
-  /**
-   * SessionNotFoundError | PermissionNotFoundError
-   */
-  404: SessionNotFoundError | PermissionNotFoundError
-}
-
-export type V2SessionPermissionReplyError = V2SessionPermissionReplyErrors[keyof V2SessionPermissionReplyErrors]
-
-export type V2SessionPermissionReplyResponses = {
-  /**
-   * <No Content>
-   */
-  204: void
-}
-
-export type V2SessionPermissionReplyResponse =
-  V2SessionPermissionReplyResponses[keyof V2SessionPermissionReplyResponses]
-
 export type V2PermissionSavedListData = {
   body?: never
   path?: never
@@ -10312,6 +10341,83 @@ export type V2PermissionSavedRemoveResponses = {
 }
 
 export type V2PermissionSavedRemoveResponse = V2PermissionSavedRemoveResponses[keyof V2PermissionSavedRemoveResponses]
+
+export type V2SessionPermissionListData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/permission"
+}
+
+export type V2SessionPermissionListErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type V2SessionPermissionListError = V2SessionPermissionListErrors[keyof V2SessionPermissionListErrors]
+
+export type V2SessionPermissionListResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: Array<PermissionV2Request>
+  }
+}
+
+export type V2SessionPermissionListResponse = V2SessionPermissionListResponses[keyof V2SessionPermissionListResponses]
+
+export type V2SessionPermissionReplyData = {
+  body: {
+    reply: PermissionV2Reply
+    message?: string
+  }
+  path: {
+    sessionID: string
+    requestID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/permission/{requestID}/reply"
+}
+
+export type V2SessionPermissionReplyErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError | PermissionNotFoundError
+   */
+  404: PermissionNotFoundError | SessionNotFoundError
+}
+
+export type V2SessionPermissionReplyError = V2SessionPermissionReplyErrors[keyof V2SessionPermissionReplyErrors]
+
+export type V2SessionPermissionReplyResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type V2SessionPermissionReplyResponse =
+  V2SessionPermissionReplyResponses[keyof V2SessionPermissionReplyResponses]
 
 export type V2FsReadData = {
   body?: never
@@ -10543,7 +10649,7 @@ export type V2SessionQuestionReplyData = {
     requestID: string
   }
   query?: never
-  url: "/api/session/{sessionID}/question/request/{requestID}/reply"
+  url: "/api/session/{sessionID}/question/{requestID}/reply"
 }
 
 export type V2SessionQuestionReplyErrors = {
@@ -10558,7 +10664,7 @@ export type V2SessionQuestionReplyErrors = {
   /**
    * SessionNotFoundError | QuestionNotFoundError
    */
-  404: SessionNotFoundError | QuestionNotFoundError
+  404: QuestionNotFoundError | SessionNotFoundError
 }
 
 export type V2SessionQuestionReplyError = V2SessionQuestionReplyErrors[keyof V2SessionQuestionReplyErrors]
@@ -10579,7 +10685,7 @@ export type V2SessionQuestionRejectData = {
     requestID: string
   }
   query?: never
-  url: "/api/session/{sessionID}/question/request/{requestID}/reject"
+  url: "/api/session/{sessionID}/question/{requestID}/reject"
 }
 
 export type V2SessionQuestionRejectErrors = {
@@ -10594,7 +10700,7 @@ export type V2SessionQuestionRejectErrors = {
   /**
    * SessionNotFoundError | QuestionNotFoundError
    */
-  404: SessionNotFoundError | QuestionNotFoundError
+  404: QuestionNotFoundError | SessionNotFoundError
 }
 
 export type V2SessionQuestionRejectError = V2SessionQuestionRejectErrors[keyof V2SessionQuestionRejectErrors]

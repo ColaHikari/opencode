@@ -3,12 +3,22 @@ import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
+import { notFound } from "../errors"
 import { type StartPayload, WorkflowApiError } from "../groups/workflow"
 
-function apiError(error: Workflow.InvalidError | Workflow.NotFoundError) {
-  if (error._tag === "WorkflowInvalidError")
-    return new WorkflowApiError({ message: error.message, workflow: error.path })
-  return new WorkflowApiError({ message: `Workflow not found: ${error.name}`, workflow: error.name })
+// Maps the engine's typed start() failures onto the HTTP contract:
+// - a broken/invalid workflow file (load failure) → 400 WorkflowApiError, with
+//   `workflow` carrying the requested NAME and `path` the failing file (Fund 44).
+// - an unknown workflow name → 404 ApiNotFoundError, matching the repo-wide
+//   *NotFound → 404 convention (Fund 21).
+// The requested name is threaded in because the engine's InvalidError only
+// carries the file `path`, not the workflow name.
+function apiError(name: string) {
+  return (error: Workflow.InvalidError | Workflow.NotFoundError) => {
+    if (error._tag === "WorkflowInvalidError")
+      return new WorkflowApiError({ message: error.message, workflow: name, path: error.path })
+    return notFound(`Workflow not found: ${error.name}`)
+  }
 }
 
 export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow", (handlers) =>
@@ -28,8 +38,12 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
 
     const get = Effect.fn("WorkflowHttpApi.get")(function* (ctx: { params: { id: Workflow.RunID } }) {
       // The route param is validated/branded by the params schema (RunID), so a
-      // malformed id is a 400 at decode time and never reaches this handler.
-      return (yield* workflow.get(ctx.params.id)) ?? null
+      // malformed id is a 400 at decode time and never reaches this handler. An
+      // unknown id is a 404 (id-addressed, like the session endpoints) rather
+      // than a 200 + null.
+      const run = yield* workflow.get(ctx.params.id)
+      if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return run
     })
 
     const start = Effect.fn("WorkflowHttpApi.start")(function* (ctx: {
@@ -43,13 +57,38 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
           budget: ctx.payload?.budget,
           // Already branded by the StartPayload schema decode (SessionID).
           permissionSessionID: ctx.payload?.permissionSessionID,
+          // Resume the named source run's journal when supplied (already branded
+          // by the StartPayload decode). Absent ⇒ an ordinary fresh start.
+          resume_of: ctx.payload?.resume_of,
+          // Copy to a mutable array: the engine's StartOptions takes `number[]`
+          // while the decoded schema yields a `readonly number[]`.
+          invalidate_agents: ctx.payload?.invalidate_agents ? [...ctx.payload.invalidate_agents] : undefined,
+          // When the HTTP caller supplied a session identity, derive subagent
+          // permission inheritance from it (parent-session deny/external_directory
+          // rules). The HTTP payload carries no caller-agent, so the agent-level
+          // edit denies (Plan Mode) are only inherited on the tool path; without a
+          // session id this is the documented fallback (no inherited ruleset).
+          caller: ctx.payload?.permissionSessionID ? { sessionID: ctx.payload.permissionSessionID } : undefined,
           prompt,
         })
-        .pipe(Effect.mapError(apiError))
+        .pipe(Effect.mapError(apiError(ctx.params.name)))
     })
 
     const cancel = Effect.fn("WorkflowHttpApi.cancel")(function* (ctx: { params: { id: Workflow.RunID } }) {
-      return (yield* workflow.cancel(ctx.params.id)) ?? null
+      // The engine returns undefined ONLY when the run is unknown to this
+      // workspace (not in the live registry and no persisted row) → 404. A known
+      // run (running or already-terminal) returns its snapshot → 200.
+      const run = yield* workflow.cancel(ctx.params.id)
+      if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return run
+    })
+
+    const pause = Effect.fn("WorkflowHttpApi.pause")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      // Same contract as cancel: undefined ⇒ unknown id → 404; a known run returns
+      // its snapshot (paused on success) → 200.
+      const run = yield* workflow.pause(ctx.params.id)
+      if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return run
     })
 
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
@@ -62,6 +101,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("get", get)
       .handle("start", start)
       .handle("cancel", cancel)
+      .handle("pause", pause)
       .handle("remove", remove)
   }),
 )

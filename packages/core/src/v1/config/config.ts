@@ -160,6 +160,21 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  workflows: Schema.optional(
+    Schema.Struct({
+      ultracode_keyword: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Detect the standalone `ultracode` keyword in the prompt and highlight it; on submit it opts the turn into workflow orchestration (default: true)",
+      }),
+      approval: Schema.optional(Schema.Literals(["always", "first-run", "never"])).annotate({
+        description:
+          "When to ask before an interactive workflow start. 'first-run' (default) asks once per workflow until approved, 'always' asks every time, 'never' starts without asking.",
+      }),
+      approved: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
+        description: "Workflow names that have been approved via 'Yes, always' in the interactive start dialog.",
+      }),
+    }),
+  ).annotate({ description: "Workflow orchestration options" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),

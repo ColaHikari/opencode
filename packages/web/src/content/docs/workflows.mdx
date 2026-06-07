@@ -3,7 +3,7 @@ title: Workflows
 description: Create repeatable multi-step workflows with phases, arguments, and agent fan-out.
 ---
 
-Workflows let you define repeatable, project-specific automation that runs from the TUI. A workflow can collect arguments, report progress through phases, run steps in sequence, fan out work in parallel, and call agents for model-generated results.
+Workflows let you define repeatable, project-specific automation. A workflow can collect arguments, report progress through phases, run steps in sequence, fan out work in parallel, and call agents for model-generated results. You can start one interactively from the TUI, or let an agent start one through the `workflow` tool.
 
 ## Run a workflow
 
@@ -25,7 +25,7 @@ You can also open the workflow dashboard:
 /workflows
 ```
 
-The dashboard shows recent runs, their status, current phase, logs, and per-agent telemetry.
+The dashboard shows recent runs, their status, current phase, per-agent usage (tokens and cost), and — in the run detail view — phase logs.
 
 ---
 
@@ -124,7 +124,34 @@ export default workflow({
 - `phases` defines the progress matrix shown in the run detail view.
 - `arguments` powers autocomplete for workflow parameters.
 
-Arguments support `type`, `default`, and `description`.
+Arguments support `type`, `default`, and `description`. `type` is one of `string`,
+`number`, or `boolean`.
+
+### Metadata must be statically analyzable
+
+Discovery (listing, autocomplete, reading, the dashboard, and the HTTP/tool
+`read` action) **never executes your workflow file** — it extracts metadata
+purely from the source text. The `name`, `description`, `phases`, and `arguments`
+values must therefore be literals (strings, numbers, booleans, arrays, and object
+literals). A computed value — a function call, an imported constant, a
+`process.env` lookup, or a template string with substitutions — cannot be read
+without running code, so the file is reported as invalid and cannot be started
+until the metadata is made literal. Only the `run` body may contain arbitrary
+logic; it runs at start time, after the permission gate.
+
+```ts
+// Good — literal metadata
+export default workflow({
+  name: "Release Notes",
+  phases: ["collect", "draft"],
+})
+
+// Bad — metadata cannot be read without executing the module
+export default workflow({
+  name: `Release Notes ${process.env.VERSION}`,
+  phases: derivePhases(),
+})
+```
 
 ---
 
@@ -164,6 +191,29 @@ export default workflow({
 })
 ```
 
+### Type coercion and defaults
+
+Arguments arrive as strings from the command line and the HTTP/tool boundary.
+Before `run` is called, every declared argument is coerced to its declared
+`type` at the engine boundary — identically across every start path (the TUI
+`/workflow` command, the HTTP API, and the `workflow` tool):
+
+- **`number`** — a numeric string is converted with `Number()` semantics, so
+  `"42"` becomes `42` (decimal, hex like `"0x10"`, and exponent like `"1e3"` are
+  all accepted). The result must be finite: an empty/whitespace-only string or a
+  non-numeric value such as `"abc"`, `"Infinity"`, or a non-string/non-number is
+  rejected and the run fails to start.
+- **`boolean`** — only the strings `"true"` / `"false"` (or an actual boolean)
+  are accepted; anything else is rejected.
+- **`string`** — a primitive number or boolean is stringified via `String(...)`;
+  objects and arrays are left unchanged.
+
+A declared `default` fills in any argument the caller omitted, and the default is
+run through the **same** coercion — so a `default: "7"` on a `number` argument
+reaches `run` as the number `7`. An explicitly supplied value always wins over
+the default. Arguments with no declared `type`, or that are not declared in
+`arguments` at all, are passed through unchanged.
+
 ---
 
 ## Context API
@@ -196,10 +246,35 @@ const result = await ctx.agent({
 ctx.log(result.text)
 ```
 
+`ctx.agent` accepts:
+
+- `prompt` - the prompt to send (required).
+- `agent` - the agent to use. Omit to use the default agent.
+- `model` - an explicit `provider/model` override for this step.
+- `schema` - a JSON Schema for structured output (see below).
+- `permissionSessionID` - the session that should receive any permission prompts
+  raised by this step.
+
 The returned value contains:
 
 - `text` - the model response as text.
-- `data` - the response payload. Currently this is the same text value unless structured output is added by the workflow runtime.
+- `data` - the parsed structured object when a `schema` was requested; otherwise
+  it is the same value as `text`.
+
+#### Structured output
+
+Pass a `schema` to require the agent to return structured data. On success,
+`data` is the parsed object matching the schema. If the agent produces no
+structured result, the step fails with a structured-output error rather than
+silently falling back to plaintext — the failure propagates like any other agent
+error (the run fails unless your `run` body catches it).
+
+#### Usage tracking
+
+Each agent step records its cost (USD) and token usage on the run, visible in the
+dashboard. A single step can drive several model turns (when the agent uses
+tools); the recorded cost and tokens **sum across all of those turns**, not just
+the final message.
 
 ---
 
@@ -215,6 +290,23 @@ const results = await ctx.parallel([
 ```
 
 This is useful for fan-out phases where multiple agents can inspect the same input from different perspectives.
+
+By default `ctx.parallel` runs at most **20** tasks at once. Pass an optional
+`{ concurrencyLimit }` to change the cap:
+
+```ts
+const results = await ctx.parallel(tasks, { concurrencyLimit: 4 })
+```
+
+A limit of `0` or a negative number is clamped to `1` (sequential). The default
+limit applies only to `parallel`; `pipeline` is unbounded unless you set a limit.
+
+On top of any per-call `concurrencyLimit`, every run also has a **run-wide**
+ceiling on how many `ctx.agent` dispatches may execute at once, shared across the
+whole run (all `parallel` and `pipeline` work combined). It is derived from the
+host CPU count as `min(16, max(2, cpuCores − 2))` — so a tiny box never serializes
+down to one agent and a huge box never fans out unbounded. The narrower of the
+run-wide cap and a per-call limit always wins.
 
 ---
 
@@ -246,13 +338,109 @@ const results = await ctx.pipeline(
 ```
 
 Here each topic is drafted then reviewed independently; `results` is an array of
-`{ topic, review }` in input order. Pass an optional final
-`{ concurrencyLimit }` argument to cap how many items run at once.
+`{ topic, review }` in input order. By default a pipeline runs all items
+concurrently (unbounded). Pass an optional final `{ concurrencyLimit }` argument
+to cap how many items run at once; a limit of `0` or negative is clamped to `1`.
 
 For a single-stage pipeline you must annotate the stage parameter
 (`async (item: string) => …`), otherwise TypeScript infers nothing and reports
 `TS7006: Parameter 'item' implicitly has an 'any' type`. Multi-stage pipelines
 infer the parameter types automatically, so no annotation is needed.
+
+---
+
+### Budget
+
+A run can be started with a cost cap in USD via the `budget` option (on the HTTP
+start payload and the `workflow` tool's `start` action). Once the cumulative
+agent-step cost reaches the cap, the next `ctx.agent` call fails with a budget
+error and the run fails (unless your `run` body catches it). Read the live
+remaining budget inside a workflow with `ctx.budgetRemaining` (it is `Infinity`
+when no budget was set):
+
+```ts
+if (ctx.budgetRemaining < 0.5) {
+  ctx.log("Low on budget, skipping the extra review pass")
+}
+```
+
+The cap is enforced per step and is a **soft cap**: it is checked before each
+agent step and the spend is settled afterward. Steps launched concurrently via
+`ctx.parallel` / `ctx.pipeline` all pass the gate while the budget is still
+positive, so a run can overshoot by up to the combined cost of the steps already
+in flight when the budget runs out.
+
+---
+
+### Agent limit
+
+Independently of the budget, each run also carries a **lifetime cap** on the total
+number of agent dispatches it may start — **1,000** by default. Once a run has
+started that many agents, the next `ctx.agent` call fails with an agent-limit
+error (and the run fails unless your `run` body catches it), so a runaway workflow
+— for example an unbounded loop of `ctx.agent` calls — can never spawn unbounded
+subagent sessions. The limit counts dispatches over the life of the run, not
+concurrent ones, and is a hard safety ceiling rather than a tunable knob.
+
+---
+
+## Run statuses
+
+Every run carries one of the following statuses, visible in the dashboard and
+returned by the HTTP/tool APIs:
+
+- **running** - the run is in progress.
+- **completed** - the run finished successfully and returned a result.
+- **failed** - the run threw (an agent error, a budget error, a structured-output
+  error, or an uncaught error in `run`).
+- **cancelled** - the run was cancelled (from the dashboard, by a turn abort, or
+  by deleting it while running).
+- **interrupted** - the run was orphaned by a process crash or restart. On the
+  next start, a sweep rewrites any run still marked `running` that no live fiber
+  owns to `interrupted`, so a lost run is reported honestly instead of appearing
+  to run forever.
+- **paused** - the run was suspended by the user (see [Pause and resume](#pause-and-resume)).
+  This is the only non-terminal status besides `running`: every in-flight agent
+  session is aborted and the run fiber interrupted (exactly like a cancel), but
+  the persisted agent journal is kept intact so the run can later be resumed. The
+  orphan sweep deliberately leaves paused rows alone — they are parked by design,
+  not lost.
+
+Any terminal status other than `completed` is treated as a failure by the
+`workflow` tool, so a `failed`, `cancelled`, or `interrupted` run is never
+reported as a success. (`paused` is non-terminal, so it is not a result the
+`workflow` tool ever returns — a tool-started run runs to a terminal status.)
+
+---
+
+## Pause and resume
+
+A running workflow can be **paused** and later **resumed**. Pausing aborts the
+run's in-flight agents and parks it at the non-terminal `paused` status, keeping
+its persisted agent journal intact. Resuming starts a **fresh** run that replays
+that journal: every agent step whose call the journal already has a completed
+entry for is served from the cache instead of being re-prompted.
+
+From the dashboard, **p** pauses the selected running run and resumes a selected
+`paused` (or `interrupted`) one. In a run's detail view, **r** resumes while
+forcing the _selected_ agent back to a live re-run — useful for re-doing one step
+without re-running the whole pipeline.
+
+A replayed (cached) agent step:
+
+- copies the source step's output, structured data, cost, and token usage
+  verbatim, and is marked **cached** in the dashboard;
+- still **counts toward the resumed run's budget** (the cached cost is charged
+  once, exactly as if the step had run live), so a resume cannot quietly exceed a
+  budget the original run was already approaching.
+
+Because the journal lives in the database, not in memory, resume works **even
+after the app or process has been restarted** — you can pause a run, quit
+opencode, come back later, and resume it. (This differs from Claude Code, where
+resuming a paused run only works within the same session.) Only a `paused` or
+`interrupted` run can be the source of a resume; resuming a `completed`,
+`cancelled`, `failed`, or still-`running` run is rejected, and an unknown source
+id simply degrades to a normal run (every step runs live).
 
 ---
 
@@ -274,20 +462,20 @@ export default workflow({
   name: "Fan Out Summary",
   phases: ["brief", "parallel", "summary"],
   async run(args, ctx) {
-  ctx.setPhase("brief")
-  const brief = await ctx.agent({ agent: "build", prompt: "Create a task brief." })
+    ctx.setPhase("brief")
+    const brief = await ctx.agent({ agent: "build", prompt: "Create a task brief." })
 
-  ctx.setPhase("parallel")
-  const findings = await ctx.parallel([
-    () => ctx.agent({ agent: "plan", prompt: `Check risks:\n${brief.text}` }),
-    () => ctx.agent({ agent: "general", prompt: `Check opportunities:\n${brief.text}` }),
-  ])
+    ctx.setPhase("parallel")
+    const findings = await ctx.parallel([
+      () => ctx.agent({ agent: "plan", prompt: `Check risks:\n${brief.text}` }),
+      () => ctx.agent({ agent: "general", prompt: `Check opportunities:\n${brief.text}` }),
+    ])
 
-  ctx.setPhase("summary")
-  return await ctx.agent({
-    agent: "build",
-    prompt: findings.map((item) => item.text).join("\n\n"),
-  })
+    ctx.setPhase("summary")
+    return await ctx.agent({
+      agent: "build",
+      prompt: findings.map((item) => item.text).join("\n\n"),
+    })
   },
 })
 ```
@@ -298,18 +486,262 @@ export default workflow({
 
 Use `/workflows` to inspect previous runs.
 
-From a workflow run detail view:
+In the runs list:
 
-- **Enter** opens telemetry for the selected phase.
-- **Esc** or **B** goes back.
-- **Up** and **Down** select phases.
+- **Up** / **Down** (or **k** / **j**) select a run.
+- **Enter** opens the selected run's detail view.
+- **R** refreshes the discovered workflow definitions.
+- **X** kills (cancels) the selected running run.
+- **P** pauses the selected running run, or resumes a selected `paused` /
+  `interrupted` one (see [Pause and resume](#pause-and-resume)).
+- **D** deletes the selected run from history, after a confirmation prompt.
+- **Esc** or **B** closes the dashboard.
 
-The dashboard persists workflow run history, so completed and failed runs remain visible after they finish.
+In a run's detail view:
+
+- **Up** / **Down** (or **k** / **j**) select a phase.
+- **Left** / **Right** (or **h** / **l**) move between the selected phase's agents
+  and its result.
+- **Enter** or **O** opens the selected subagent's session.
+- **Y** copies the selected response to the clipboard.
+- **X** kills (cancels) the run if it is still running.
+- **P** pauses the run, or resumes it if it is `paused` / `interrupted` (see
+  [Pause and resume](#pause-and-resume)).
+- **R** resumes the run while forcing the _selected_ agent back to a live re-run,
+  replaying every other completed agent from the journal.
+- **S** saves the run's workflow script as a command (see
+  [Save a run as a command](#save-a-run-as-a-command)).
+- **PageUp** / **PageDown** scroll the detail panel.
+- **Esc** or **B** returns to the runs list.
+
+The detail view also renders the run's `ctx.log` entries for the selected phase,
+capped to the most recent entries (older ones are summarized as a hidden count).
+
+The dashboard persists workflow run history, so completed, failed, cancelled, and
+interrupted runs remain visible after they finish.
+
+### Save a run as a command
+
+Press **S** in a run's detail view to save that run's workflow script as a
+reusable workflow file. A small dialog lets you pick the destination with **Tab**:
+the **project** `.opencode/workflows/` directory or your **global** config
+directory. This is handy for promoting an agent-generated (temporary) workflow
+into a permanent, discoverable one.
+
+---
+
+## Discovery
+
+Workflow files are discovered from `workflows/` subdirectories of the standard
+config locations, consistent with how skills and commands are discovered:
+
+- the project's `.opencode/workflows/` (searched up to the worktree root), and
+- the global / home config directories (`~/.config/opencode/workflows/` and
+  `~/.opencode/workflows/`).
+
+opencode also ships a small set of **built-in** workflows (currently
+[`deep-research`](#deep-research)). These have no file on disk — their source
+travels inside the binary — and they are the lowest-precedence source.
+
+When the same workflow **name** is found in more than one location, precedence is
+**project > global > built-in**: a project file shadows a global file of the same
+name, and either shadows a built-in of that name. The file name (without
+extension) becomes the workflow command name.
+
+### Direct commands
+
+Discovered workflows also appear as direct `/<name>` slash commands in the prompt
+autocomplete, alongside the built-in slash commands — so a `release_notes`
+workflow can be started by typing `/release_notes` instead of
+`/workflow release_notes`. Selecting one routes exactly like
+`/workflow <name>`. Real commands always win a name collision: if a workflow's
+name matches an existing command (a built-in, project, or MCP command), the real
+command keeps the `/<name>` slot and the workflow stays reachable via
+`/workflow <name>`.
+
+Discovery globs `*.ts` / `*.js` files **without following symlinks**: a symlink
+whose real target escapes the workflows directory is dropped, so it can never be
+listed or started. This keeps what a reviewer sees in the directory honest — a
+symlink that points outside it is ignored.
+
+Crucially, discovery **never executes workflow files**. Listing, autocomplete,
+reading metadata, and the dashboard all extract metadata statically from the
+source text (see [Metadata must be statically analyzable](#metadata-must-be-statically-analyzable)).
+Module code only runs at **start** time, after the permission gate below.
+
+---
+
+## Built-in workflows
+
+opencode ships a few workflows in the binary. They are listed, started, and gated
+exactly like file-based workflows, and a project or global file of the same name
+shadows them (see [Discovery](#discovery)).
+
+### deep-research
+
+`deep-research` researches a question across multiple angles with adversarial
+claim verification. It takes a single `question` argument and runs four phases:
+
+```bash frame="none"
+/workflow deep-research question="What changed in HTTP/3 congestion control?"
+```
+
+- **plan** — break the question into 3–5 distinct search angles.
+- **research** — fan out (in parallel) to research each angle, returning claims
+  with source URLs.
+- **verify** — adversarially check each claim against its cited sources and keep
+  only the supported ones.
+- **synthesize** — write a cited report from the surviving claims, listing the
+  rejected ones briefly at the end.
+
+Its research agents need **web / search tools** to be available. If the agents
+have no such tools, the run fails with a clear error rather than fabricating an
+answer from nothing.
+
+---
+
+## Ultracode
+
+Ultracode tells the agent to **orchestrate a task as a workflow** — designing and
+starting one with the `workflow` tool — instead of working turn by turn. It comes
+in two forms.
+
+### The `ultracode` keyword
+
+When the standalone word `ultracode` appears in your prompt, it is highlighted as
+you type and, on submit, opts that single turn into workflow orchestration: the
+keyword is stripped from the message and a directive is added asking the agent to
+author and run a workflow for the task (using parallel/pipeline fan-out and
+adversarial verification where they fit), skipping the workflow only for trivial
+or purely conversational requests.
+
+The keyword only matches as a whole word — `ultracodex`, `ultracode2`, or
+`ultracode_mode` do not trigger it. It is on by default; set
+`workflows.ultracode_keyword` to `false` to disable detection and highlighting:
+
+```json title="opencode.json"
+{
+  "workflows": {
+    "ultracode_keyword": false
+  }
+}
+```
+
+### The `/ultracode` session toggle
+
+`/ultracode` toggles ultracode **for the whole session**. While it is on, every
+substantial turn defaults to planning and running workflows — chaining
+_understand → change → verify_ runs when the task has phases — and only trivial or
+conversational turns are handled directly. The footer shows an **ULTRACODE** badge
+while the toggle is on.
+
+Turning the toggle on also makes a best-effort attempt to boost the model's
+reasoning to its strongest available variant; turning it off (or starting a new
+session) restores the previous variant. The toggle is session-scoped, so it
+resets automatically whenever you switch to a new session.
 
 ---
 
 ## Security & trust
 
-Workflow files are code. Anything in `.opencode/workflows/` is executed via dynamic import with the same trust level as a [plugin](/docs/plugins) — there is no sandbox. Only place files there that you trust, and review workflow files that arrive with a cloned repository before running them.
+Workflow files are code. When a workflow is started, its file is executed via
+dynamic import with the same trust level as a [plugin](/docs/plugins) — there is
+no sandbox. Only place files there that you trust, and review workflow files that
+arrive with a cloned repository before running them.
 
-Note that the `workflow` tool's `create` action writes model-generated TypeScript into this directory. The `workflow` permission is the control point: it gates both creating and starting workflows, so keep it on `ask` if you want to review each run.
+### Who can start a workflow
+
+How a start is gated depends on who initiated it:
+
+- **Interactively** — starting a workflow with the `/workflow` command in the TUI,
+  or via the authenticated HTTP API, is **principal-initiated** (it is you asking).
+  These paths do not raise the `workflow` permission prompt; the HTTP API is
+  protected by its own authorization.
+- **Agent-initiated** — when a model uses the `workflow` tool to **start** or
+  **create** a workflow, both actions are gated by the `workflow` permission.
+  Discovery runs no code, so the gate fires before any line of the workflow
+  executes. Keep `workflow` on `ask` if you want to review each agent-driven run.
+  (Creating a workflow also requires the `edit` permission for the file write.)
+
+The `workflow` tool's `create` action writes model-generated TypeScript into the
+project's `.opencode/workflows/`. The freshly written file is validated
+**statically** — it is never imported to validate it, so creating a workflow
+cannot execute the generated code.
+
+### Interactive start approval
+
+Starting a workflow interactively with `/workflow` opens an approval dialog before
+the file runs, with four choices:
+
+- **Yes** — start this run.
+- **Yes, always** — start, and remember this workflow so it is not asked about
+  again (the name is saved to `workflows.approved`).
+- **View script** — open a read-only pager of the workflow's source, then return
+  to the choices.
+- **No** — cancel the start.
+
+How often the dialog appears is controlled by `workflows.approval`:
+
+```json title="opencode.json"
+{
+  "workflows": {
+    "approval": "first-run"
+  }
+}
+```
+
+- **`first-run`** (default) — ask once per workflow, until you approve it with
+  "Yes, always"; after that it starts without asking.
+- **`always`** — ask before every interactive start.
+- **`never`** — never ask; interactive starts run immediately.
+
+This gate is the interactive (`/workflow`) counterpart only. Agent-initiated
+starts through the `workflow` tool keep their own `workflow` permission gate
+(above) regardless of `workflows.approval`.
+
+### Subagent permissions
+
+A workflow step's subagent (`ctx.agent`) inherits the caller's permission rules,
+exactly like the task tool's subagents. When a workflow is started from the
+`workflow` tool, every subagent inherits the calling session's deny and
+`external_directory` rules **and** the calling agent's edit-class denies — so a
+workflow started from within Plan Mode cannot edit files. When a workflow is
+started over HTTP with a session identity, the session-level rules are inherited;
+the agent-level edit denies are only inherited on the tool path. A purely
+programmatic start with no session identity falls back to no inherited ruleset.
+
+### HTTP status codes
+
+The workflow HTTP endpoints are id-addressed like the session endpoints: getting,
+cancelling, pausing, or starting against an unknown run or workflow returns
+**404**, not a `200` with a null body or a `400`. A workflow file that fails to
+load (bad metadata, missing `run`, or a syntax error) is a **400**.
+
+---
+
+## HTTP API
+
+The workflow HTTP endpoints are rooted at `/workflow`:
+
+- `GET /workflow` — list discovered workflows.
+- `GET /workflow/run` — list runs.
+- `GET /workflow/run/{id}` — get one run.
+- `POST /workflow/{name}/start` — start a run (body: the start payload below).
+- `POST /workflow/run/{id}/cancel` — cancel a run.
+- `POST /workflow/run/{id}/pause` — pause a running run, parking it at the
+  non-terminal `paused` status with its journal kept (see
+  [Pause and resume](#pause-and-resume)). Idempotent on an already
+  terminal/paused run; **404** for an unknown id.
+- `DELETE /workflow/run/{id}` — delete a run from history.
+
+The start payload accepts:
+
+- `args` — the workflow's arguments (coerced to their declared types).
+- `budget` — a non-negative cost cap in USD (see [Budget](#budget)).
+- `permissionSessionID` — the session that should receive any permission prompts
+  raised by the run's subagents.
+- `resume_of` — the id of a `paused` / `interrupted` run to resume. The engine
+  replays that run's persisted agent journal, re-using every matchable completed
+  agent verbatim instead of re-prompting (see [Pause and resume](#pause-and-resume)).
+- `invalidate_agents` — source-journal agent indices (0-based) to force back to a
+  live re-run during a resume; only meaningful together with `resume_of`.
