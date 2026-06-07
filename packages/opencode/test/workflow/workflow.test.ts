@@ -3045,6 +3045,45 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
     }),
   )
 
+  // T5 budget-race AUDIT (verdict: benign soft cap, no fix). The review asked
+  // specifically: "2 parallel agents, budget for exactly 1 — does the second
+  // double-spend BEYOND the documented soft cap?" Deterministic proof via the
+  // same Deferred barrier as the Fund-23 test: 2 agents à 1.0, budget 1.0. The
+  // barrier holds BOTH until both have passed the synchronous gate, so both
+  // charge ⇒ overspend to -1.0 (exactly one extra step's worth, the cost already
+  // in flight). This is the DOCUMENTED soft cap — NOT an unbounded race: the gate
+  // refuses any FURTHER step once the budget is non-positive. This test pins that
+  // boundary so a future refactor that turns the soft cap into either a hard limit
+  // OR an unbounded leak fails here.
+  it.instance("budget-race audit: 2 parallel agents with budget for 1 overspend by exactly one step (soft cap, bounded)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_PARALLEL_FIXTURE, BUDGET_PARALLEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const run = yield* workflow.start({
+        name: BUDGET_PARALLEL_FIXTURE,
+        args: { count: 2 },
+        prompt: budgetBarrierPromptOps(db, 1, 2),
+        budget: 1,
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { overspent: number; nextStarted: boolean; nextFailed: boolean }
+      // Exactly one extra step's worth of overspend: 2 * 1.0 charged against a 1.0
+      // budget ⇒ remaining -1.0. Bounded, not unbounded.
+      expect(result.overspent).toBeCloseTo(-1, 10)
+      // Both parallel steps charged (the in-flight cost), and exactly two nodes
+      // exist — no third step slipped past the gate.
+      const completed = done.run?.agents.filter((a) => a.status === "completed") ?? []
+      expect(completed.length).toBe(2)
+      expect(done.run?.agents.length).toBe(2)
+      // The NEXT sequential step after exhaustion is refused (bounded soft cap).
+      expect(result.nextStarted).toBe(true)
+      expect(result.nextFailed).toBe(true)
+    }),
+  )
+
   it.instance("budgetRemaining reflects real spend during the run", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

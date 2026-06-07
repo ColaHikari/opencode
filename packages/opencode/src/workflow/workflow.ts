@@ -2087,6 +2087,13 @@ export const layer = Layer.effect(
         // Once the prior steps have consumed the whole budget we refuse to spend
         // again: fail the step with a BudgetExceededError, which propagates like
         // any other agent failure (node `failed`, run `failed` unless caught).
+        // AUDITED soft cap (T5): this gate + the post-step spend (ensuring, below)
+        // run on SEPARATE turns, so N parallel ctx.parallel tasks can all pass this
+        // synchronous check before any of them charges ⇒ a run may overspend by the
+        // combined cost of the steps already in flight. That overspend is BOUNDED
+        // (the next step after exhaustion is refused here), so it is best-effort by
+        // design, not an unbounded leak — no atomic reservation is needed. Pinned by
+        // "budget-race audit: 2 parallel agents with budget for 1 …".
         if (active.budgetRemaining <= 0) {
           const spent = active.budget - active.budgetRemaining
           throw new BudgetExceededError({
