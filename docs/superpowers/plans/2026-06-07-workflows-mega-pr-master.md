@@ -120,3 +120,27 @@ gh pr create --repo VasyaYovbak/opencode --base feat/workflows --head mguttmann:
 PR-Body: aktualisiertes Showcase-Material (Stats neu messen wie am 2026-06-07, Matrix + Mermaid um question/shell/events/nesting/isolation erweitern; Vorlage `/tmp/final-pr29789.md`-Struktur).
 - [ ] **Step 2:** Showcase-Kommentar auf anomalyco/opencode#29789 aktualisieren (neuer Kommentar mit Delta-Zusammenfassung + Verweis auf PR #3).
 - [ ] **Step 3:** Worktrees aufräumen (`git worktree remove /Users/manuelguttmann/Projekte/oc-mega-*` nach Merge), Handoff (`.remember/remember.md`) aktualisieren.
+
+---
+
+## Phase-1-Kontrakt (FROZEN, 2026-06-07 — Input für T2–T6-Plan-Generierung)
+
+**AgentInput / WorkflowAgentInput:** `{ agent?, prompt, model?: "provider/model" | "small", variant?, tools?: Record<string,boolean>, skills?: string[], files?: string[], isolation?: "worktree", schema?, permissionSessionID? }`
+- tools/skills komponieren mit vererbten Permission-Denies (per-Step-Rules FIRST, derived Denies LAST; last-match-wins) — niemals via PromptInput.tools, wenn ein Caller-Ruleset existiert
+- isolation via InstanceRef-Override (directory+worktree → frisches git worktree), Cleanup via Scope.addFinalizer(active.runScope)
+
+**ContextApi / WorkflowContext:** `budgetRemaining` (legacy) · `budget {total: number|null, spent(), remaining()}` · `setPhase` (warnt bei undeklarierter Phase; setzt Phase-Default-Model auf Active.currentPhaseModel) · `log` · `parallel → Promise<(T|null)[]>` (Reject → null + Drop-Log; CancelledError fatal) · `pipeline → Promise<(Last|null)[]>` (werfende Stage droppt nur das Item) · `agent → {data, text}` · `shell(cmd, {timeout?, cwd?}) → {output, exitCode}` (echter Wall-Clock-Timeout via AbortController; non-zero wirft nicht; kein Budget-Touch) · `workflow(name, args?)` (Tiefe 1, inline, geteiltes active; Phase-Snapshot/Restore) · `question({question, options?, timeout?=10min}) → {answer}`
+
+**Events (EventV2):** `workflow.run.updated` / `workflow.run.finished` — Payload `{id, workflow, status, current_phase, directory, agents:{total,running,failed}, pending_question: boolean, error}`; Emission in persistRun NACH Upsert; finished bei Terminal-Status; updated-nach-finished unmöglich (Status-Keying)
+
+**Run-Schema:** + `pending_question?: {question, options?: string[], asked_at: number}`; AgentRun-Nodes: + `kind?: "agent"|"question"`, + `answer?: string` (JSON, keine Migration)
+
+**Service:** `answer({id, answer, prompt?, permissionSessionID?, caller?, budget?}) → Run | undefined` — live: Deferred resolved (gleicher Run); paused+pending_question: NEUER Resume-Run (Journal-Replay liefert answer; question-Key = [kind, question, phase]); unbekannt/keine Frage: undefined
+
+**Meta:** `phases: (string | {title, detail?, model?})[]` ENCODED (back-compat); DECODED normalisiert `{title, detail?, model?}[]`; Model-Präzedenz: explicit (inkl. "small") > phase.model > agent-default. `whenToUse` kommt erst in T-Tool.
+
+**Migration:** `20260607000000_workflow_run_pending_question` (pending_question TEXT)
+
+**OTel:** Spans `workflow.run` + `workflow.agent` (Attribute workflow.run_id/name/agent.id/agent.name/agent.model/phase)
+
+**SDK:** openapi/types BEWUSST noch nicht regeneriert (zentral in Phase 3); encoded-Union hält den Public-Contract back-compat.
