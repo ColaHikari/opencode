@@ -2325,13 +2325,26 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             const cfg = yield* config.get()
             const sh = Shell.preferred(cfg.shell)
-            const result = yield* Effect.tryPromise(() =>
-              Process.run([sh, ...Shell.args(sh, command, cwd)], {
+            const result = yield* Effect.tryPromise(() => {
+              // Real wall-clock timeout: Process.run only uses `timeout` as the
+              // SIGKILL grace AFTER an abort fires, so a hung command needs an
+              // explicit AbortController to be killed at all. When `opts.timeout`
+              // is set we arm a timer that aborts the signal; Process.run then
+              // SIGTERMs the child (and SIGKILLs it after its own default grace),
+              // and `nothrow` resolves the killed run with a non-zero exitCode
+              // (1) instead of hanging or throwing. The timer is always cleared.
+              const controller = opts?.timeout ? new AbortController() : undefined
+              const timer = controller
+                ? setTimeout(() => controller.abort(), opts!.timeout)
+                : undefined
+              return Process.run([sh, ...Shell.args(sh, command, cwd)], {
                 cwd,
                 nothrow: true,
-                timeout: opts?.timeout,
-              }),
-            ).pipe(Effect.orDie)
+                abort: controller?.signal,
+              }).finally(() => {
+                if (timer) clearTimeout(timer)
+              })
+            }).pipe(Effect.orDie)
             const output = Buffer.concat([result.stdout, result.stderr]).toString()
             return { output, exitCode: result.code }
           }),
@@ -2362,7 +2375,11 @@ export const layer = Layer.effect(
       // already approved (its own start went through the permission gate), so the
       // child loads with NO additional permission ask. A nested call (the child
       // itself calling ctx.workflow) is refused: nesting is limited to depth 1.
-      const runNested = async (parentDepth: number, name: string, childArgs?: Record<string, unknown>) => {
+      //
+      // A hoisted `function` declaration (not a `const` arrow) so `buildContext`
+      // above can reference it without a temporal-dead-zone smell, even though
+      // the reference is only invoked lazily once `ctx.workflow` is called.
+      async function runNested(parentDepth: number, name: string, childArgs?: Record<string, unknown>) {
         if (parentDepth >= 1) {
           throw new InvalidError({
             path: active.run.workflow,
@@ -2383,7 +2400,17 @@ export const layer = Layer.effect(
         // Child context shares `active`; depth+1 closes the nesting at 1 and the
         // logPrefix attributes the child's logs/phases without a second run row.
         const childCtx = buildContext({ depth: parentDepth + 1, logPrefix: `${name}: ` })
-        return childModule.run(coerced ?? {}, childCtx)
+        // The child writes its (prefixed) phase into the SHARED
+        // `active.run.current_phase`. Snapshot the parent's phase and restore it
+        // after the child returns (resolve OR throw) so a parent log/agent
+        // dispatched after the nested call is attributed to the parent's phase,
+        // not the child's leftover one.
+        const parentPhase = active.run.current_phase
+        try {
+          return await childModule.run(coerced ?? {}, childCtx)
+        } finally {
+          active.run.current_phase = parentPhase
+        }
       }
 
       // Fund 5 (TOCTOU): a cancel/remove can land during the startup window —

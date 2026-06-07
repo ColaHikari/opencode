@@ -325,6 +325,21 @@ export async function run(_args, ctx) {
 }
 `
 
+// Task 11a (real timeout): ctx.shell with a short timeout kills a hung command and
+// resolves PROMPTLY with a non-zero exitCode (not a hang, not a throw). The fixture
+// records elapsed wall-clock so the test can prove the timeout fired well before
+// the command's natural duration.
+const SHELL_TIMEOUT_FIXTURE = "shell-timeout-step"
+const SHELL_TIMEOUT_WORKFLOW = `export const meta = { name: "${SHELL_TIMEOUT_FIXTURE}", phases: ["run"] }
+export async function run(_args, ctx) {
+  ctx.setPhase("run")
+  const started = Date.now()
+  const r = await ctx.shell("sleep 5", { timeout: 100 })
+  const elapsed = Date.now() - started
+  return { exitCode: r.exitCode, elapsed }
+}
+`
+
 // Task 11b (depth-1 nesting): a parent workflow runs a DISCOVERED child workflow
 // inline via ctx.workflow under the SAME run (no second run row). The child's
 // logs are prefixed (`child: ...`) and its result flows back to the parent.
@@ -340,6 +355,28 @@ const NEST_PARENT_WORKFLOW = `export const meta = { name: "${NEST_PARENT_FIXTURE
 export async function run(_a, ctx) {
   const r = await ctx.workflow("child", { n: 21 })
   return { fromChild: r.doubled }
+}
+`
+
+// Task 11b (phase restore): a child that sets its own phase must NOT leak it back
+// to the parent. The parent sets "plan", runs a child that sets "research", then
+// logs again — that final parent log must carry the parent's "plan" phase, not the
+// child's leftover "child-phase: research".
+const NEST_PHASE_CHILD_FIXTURE = "phase-child"
+const NEST_PHASE_CHILD_WORKFLOW = `export const meta = { name: "${NEST_PHASE_CHILD_FIXTURE}", description: "pc" }
+export async function run(args, ctx) {
+  ctx.setPhase("research")
+  ctx.log("inside-child")
+  return { ok: true }
+}
+`
+const NEST_PHASE_PARENT_FIXTURE = "phase-parent"
+const NEST_PHASE_PARENT_WORKFLOW = `export const meta = { name: "${NEST_PHASE_PARENT_FIXTURE}", description: "pp" }
+export async function run(_a, ctx) {
+  ctx.setPhase("plan")
+  await ctx.workflow("phase-child", {})
+  ctx.log("after-nested")
+  return { ok: true }
 }
 `
 
@@ -4779,6 +4816,57 @@ export async function run() { return { from: "global" } }
       // One run row only — the child never created its own run.
       const runs = yield* workflow.runs()
       expect(runs.length).toBe(1)
+    }),
+  )
+
+  // Task 11a (real timeout): ctx.shell("sleep 5", { timeout: 100 }) must kill the
+  // hung command and resolve PROMPTLY with a non-zero exitCode — never hang for the
+  // full 5s and never throw. The fixture records elapsed wall-clock so we can prove
+  // the timeout actually fired (well under the command's 5s natural duration).
+  it.instance("ctx.shell enforces a real wall-clock timeout: a hung command resolves promptly with non-zero exit", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_TIMEOUT_FIXTURE, SHELL_TIMEOUT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: SHELL_TIMEOUT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("shell-timeout workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      const result = done.result as { exitCode: number; elapsed: number }
+      // A timed-out command is killed -> non-zero exit (mapped, not thrown).
+      expect(result.exitCode).not.toBe(0)
+      // It resolved promptly: well before the command's natural 5s duration.
+      expect(result.elapsed).toBeLessThan(3000)
+    }),
+  )
+
+  // Task 11b (phase restore): a child's setPhase must not bleed into the parent.
+  // Parent sets "plan", the nested child sets "research" (recorded prefixed as
+  // "phase-child: research" on its own log), and the parent's log AFTER the nested
+  // call must carry the parent's "plan" phase again — not the child's leftover.
+  it.instance("ctx.workflow restores the parent's phase after a nested child changes it", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_PHASE_CHILD_FIXTURE, NEST_PHASE_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_PHASE_PARENT_FIXTURE, NEST_PHASE_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: NEST_PHASE_PARENT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("phase-parent workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      // The child's own log was attributed to its (prefixed) phase...
+      const childLog = done.logs.find((l) => l.message === "phase-child: inside-child")
+      expect(childLog?.phase).toBe("phase-child: research")
+      // ...and the parent's log AFTER the nested call carries the parent's phase,
+      // NOT the child's leftover "phase-child: research".
+      const parentLog = done.logs.find((l) => l.message === "after-nested")
+      expect(parentLog?.phase).toBe("plan")
+      // The run's terminal phase is the parent's, not the child's leftover.
+      expect(done.current_phase).toBe("plan")
     }),
   )
 })
