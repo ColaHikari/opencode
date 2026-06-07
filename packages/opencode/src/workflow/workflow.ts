@@ -70,7 +70,8 @@ export type RunID = Schema.Schema.Type<typeof RunID>
 // static meta reader can share them without forming an import cycle. Re-exported
 // here so the engine's public `Workflow.Meta` / `Workflow.Argument` API is
 // unchanged.
-export { Argument, Meta } from "./meta"
+export { Argument, Meta, Phase } from "./meta"
+import { Phase } from "./meta"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -660,6 +661,16 @@ type Active = {
    * a run that did not resume a question.
    */
   questionJournal?: Map<string, string>
+  /**
+   * Per-phase DEFAULT model (Task 15). Resolved AT `setPhase` time from the
+   * workflow's declared phases (`run.definition.meta.phases`) — the matched
+   * phase's `model`, or `undefined` when the phase is undeclared or declares no
+   * model. Stored here rather than re-parsed from `run.current_phase` so a nested
+   * workflow's prefixed phase string never needs decoding: the value is set by the
+   * SAME context's `setPhase`, and `ctx.agent` reads it as the middle tier of model
+   * resolution (explicit input.model > this phase model > selected agent's model).
+   */
+  currentPhaseModel?: string
 }
 
 type State = {
@@ -1142,7 +1153,9 @@ function mutableMeta(meta: Meta): Definition["meta"] {
   return {
     name: meta.name,
     description: meta.description,
-    phases: meta.phases ? [...meta.phases] : undefined,
+    // Phases are normalized objects (Task 15); deep-copy each so the mutable
+    // Definition does not alias the (readonly) decoded meta's phase objects.
+    phases: meta.phases ? meta.phases.map((phase) => ({ ...phase })) : undefined,
     arguments: meta.arguments
       ? Object.fromEntries(Object.entries(meta.arguments).map(([name, argument]) => [name, { ...argument }]))
       : undefined,
@@ -1392,6 +1405,15 @@ function createContext(input: {
    */
   logPrefix?: string
   /**
+   * The NORMALIZED declared phases of THIS context's module (Task 15) — the
+   * top-level run's `module.meta.phases` or, for a nested ctx.workflow child, the
+   * CHILD module's phases. `setPhase` resolves a phase's default model and detects
+   * an undeclared phase against THIS list, so a nested child looks up its OWN
+   * phases (not the parent's), and the prefixed `current_phase` string never needs
+   * decoding. Omitted ⇒ no declared phases (every setPhase is "undeclared").
+   */
+  phases?: readonly Phase[]
+  /**
    * Runs the parallel/pipeline task graph as a child of the run scope (not as a
    * detached root fiber): closing the run scope on cancel/remove propagates
    * Interrupt into the in-flight graph. An interrupted graph rejects as
@@ -1428,6 +1450,25 @@ function createContext(input: {
     },
     setPhase(phase: string) {
       input.active.run.current_phase = (input.logPrefix ?? "") + phase
+      // Task 15: resolve this phase against THIS context's declared phases (the
+      // raw `phase` name, never the prefixed string), keyed by `title`. A declared
+      // phase's `model` becomes the active per-phase default model that ctx.agent
+      // uses when a call gives no explicit model; an undeclared phase clears the
+      // default AND logs a warning (never an error — an undeclared phase is allowed,
+      // it simply has no default model). The lookup uses the SAME context's phases
+      // so a nested child resolves against its own declarations and the parent's
+      // restored on return (runNested snapshots/restores currentPhaseModel too).
+      const declared = input.phases?.find((entry) => entry.title === phase)
+      if (declared) {
+        input.active.currentPhaseModel = declared.model
+      } else {
+        input.active.currentPhaseModel = undefined
+        input.active.run.logs.push({
+          time: Date.now(),
+          phase: input.active.run.current_phase,
+          message: `${input.logPrefix ?? ""}phase "${phase}" is not declared`,
+        })
+      }
       input.persist()
     },
     log(message: string) {
@@ -1546,7 +1587,9 @@ export function fmt(list: Info[]) {
         `    <name>${workflow.name}</name>`,
         `    <description>${workflow.meta.description}</description>`,
         `    <path>${pathToFileURL(workflow.path).href}</path>`,
-        ...(workflow.meta.phases?.length ? [`    <phases>${workflow.meta.phases.join(", ")}</phases>`] : []),
+        ...(workflow.meta.phases?.length
+          ? [`    <phases>${workflow.meta.phases.map((phase) => phase.title).join(", ")}</phases>`]
+          : []),
         ...(workflow.meta.arguments
           ? [
               "    <arguments>",
@@ -2027,6 +2070,12 @@ export const layer = Layer.effect(
           })
         }
         active.agentStarted += 1
+        // Task 15: snapshot the active per-phase default model SYNCHRONOUSLY here
+        // (alongside `node.phase`), not inside the dispatched gen — concurrent
+        // parallel/pipeline steps may move the phase before this fiber runs, so
+        // capturing it at call time keeps each step bound to the phase it was
+        // dispatched under (matching how `node.phase` snapshots current_phase).
+        const phaseModel = active.currentPhaseModel
         const node: AgentRun = {
           id: `${active.run.agents.length + 1}`,
           status: "running",
@@ -2043,13 +2092,16 @@ export const layer = Layer.effect(
         return dispatch(
           Effect.gen(function* () {
             const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
-            // Model resolution: the magic `model: "small"` routes to the
-            // configured `small_model` (read from the already-injected
-            // Config.Service — the same config the engine resolves for
-            // discovery). An explicit `model` string is parsed as-is; otherwise
-            // the selected agent's model is used. Requesting "small" without a
-            // configured `small_model` is an authoring error, so fail the step
-            // with a clear WorkflowInvalidError rather than silently falling back.
+            // Model resolution (precedence, highest first):
+            //   1. EXPLICIT per-call `agentInput.model` — including the magic
+            //      `model: "small"`, which routes to the configured `small_model`
+            //      (read from the already-injected Config.Service). Requesting
+            //      "small" with no `small_model` configured is an authoring error
+            //      (fail the step, never silently fall back).
+            //   2. The active PHASE'S default `model` (Task 15) — captured at call
+            //      time as `phaseModel`; used only when the call gave no explicit
+            //      model, so an explicit model always wins over the phase default.
+            //   3. The selected agent's own model.
             const smallModel = agentInput.model === "small" ? (yield* config.get()).small_model : undefined
             if (agentInput.model === "small" && !smallModel) {
               return yield* new InvalidError({
@@ -2061,7 +2113,9 @@ export const layer = Layer.effect(
               ? Provider.parseModel(smallModel)
               : agentInput.model
                 ? Provider.parseModel(agentInput.model)
-                : selected.model
+                : phaseModel
+                  ? Provider.parseModel(phaseModel)
+                  : selected.model
             // OTel: enrich the enclosing `workflow.agent` span with the RESOLVED
             // agent name and model now that both are known (the boundary above set
             // only the static/requested attributes). Purely observational.
@@ -2646,7 +2700,11 @@ export const layer = Layer.effect(
       // Captured here so `ctx.workflow` (below) can re-enter it with a bumped
       // `depth` and a `logPrefix`, sharing the SAME `active` — and thus the same
       // concurrency semaphore, budget, abort scope, and agent-lifetime cap.
-      const buildContext = (ctxInput: { depth: number; logPrefix?: string }): ContextApi =>
+      const buildContext = (ctxInput: {
+        depth: number
+        logPrefix?: string
+        phases?: readonly Phase[]
+      }): ContextApi =>
         createContext({
           active,
           agent,
@@ -2654,6 +2712,11 @@ export const layer = Layer.effect(
           question,
           workflow: (name, childArgs) => runNested(ctxInput.depth, name, childArgs),
           logPrefix: ctxInput.logPrefix,
+          // Task 15: each context carries ITS OWN module's declared phases so
+          // setPhase resolves the per-phase default model (and undeclared warning)
+          // against the right list — the top-level run's phases, or a nested
+          // child's own phases.
+          phases: ctxInput.phases,
           persist: () => void persistInScope(active, bridge, db, events),
           signal: () => runSignal,
           dispatch,
@@ -2691,17 +2754,24 @@ export const layer = Layer.effect(
         if (coerced instanceof InvalidError) throw coerced
         // Child context shares `active`; depth+1 closes the nesting at 1 and the
         // logPrefix attributes the child's logs/phases without a second run row.
-        const childCtx = buildContext({ depth: parentDepth + 1, logPrefix: `${name}: ` })
+        const childCtx = buildContext({
+          depth: parentDepth + 1,
+          logPrefix: `${name}: `,
+          phases: childModule.meta.phases,
+        })
         // The child writes its (prefixed) phase into the SHARED
-        // `active.run.current_phase`. Snapshot the parent's phase and restore it
-        // after the child returns (resolve OR throw) so a parent log/agent
-        // dispatched after the nested call is attributed to the parent's phase,
-        // not the child's leftover one.
+        // `active.run.current_phase` and its per-phase default model into the SHARED
+        // `active.currentPhaseModel`. Snapshot BOTH parent values and restore them
+        // after the child returns (resolve OR throw) so a parent log/agent dispatched
+        // after the nested call is attributed to the parent's phase AND resolves the
+        // parent's phase-default model, not the child's leftover ones.
         const parentPhase = active.run.current_phase
+        const parentPhaseModel = active.currentPhaseModel
         try {
           return await childModule.run(coerced ?? {}, childCtx)
         } finally {
           active.run.current_phase = parentPhase
+          active.currentPhaseModel = parentPhaseModel
         }
       }
 
@@ -2719,7 +2789,7 @@ export const layer = Layer.effect(
 
       active.fiber = yield* Effect.promise((signal) => {
         runSignal = signal
-        return module.run(args ?? {}, buildContext({ depth: 0 }))
+        return module.run(args ?? {}, buildContext({ depth: 0, phases: module.meta.phases }))
       }).pipe(
         Effect.matchCauseEffect({
           onSuccess: (result) => finish(id, "completed", { result }),

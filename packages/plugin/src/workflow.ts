@@ -119,6 +119,13 @@ export type WorkflowContext = {
   readonly budgetRemaining: number
   /** Cost budget (USD) in Claude-Code API shape: `total` (null when unlimited), `spent()` so far, `remaining()` (Infinity when unlimited). */
   readonly budget: { readonly total: number | null; spent(): number; remaining(): number }
+  /**
+   * Switch the run's current phase. When the named phase is declared in
+   * `meta.phases` as a structured object with a `model`, that model becomes the
+   * DEFAULT for subsequent `ctx.agent` calls that omit an explicit `model` (an
+   * explicit per-call model still wins). Setting an UNDECLARED phase is allowed —
+   * it clears any phase-default model and logs a warning, never an error.
+   */
   setPhase(phase: string): void
   log(message: string): void
   /**
@@ -157,10 +164,18 @@ export type WorkflowContext = {
   question(input: { question: string; options?: readonly string[]; timeout?: number }): Promise<{ answer: string }>
 }
 
+/**
+ * A workflow phase. Authors may list a phase as a plain string (the title) or as
+ * a structured object. `model` is a per-phase DEFAULT model: a `ctx.agent` call
+ * made while that phase is active and given no explicit `model` resolves to it
+ * (an explicit per-call model still wins). `detail` is optional human copy.
+ */
+export type WorkflowPhase = string | { title: string; detail?: string; model?: string }
+
 export function workflow<const Args extends WorkflowArguments | undefined = undefined>(input: {
   name: string
   description?: string
-  phases?: readonly string[]
+  phases?: readonly WorkflowPhase[]
   arguments?: Args
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
 }) {

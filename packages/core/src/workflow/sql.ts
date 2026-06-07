@@ -22,7 +22,12 @@ export type WorkflowDefinitionRow = {
   meta: {
     name: string
     description?: string
-    phases?: string[]
+    // Phases are persisted in their NORMALIZED (decoded) shape — always objects
+    // (`{ title, detail?, model? }`), never bare strings. The engine normalizes a
+    // workflow's authored phases (which may be strings OR objects on the public
+    // contract) the moment meta is decoded, and `mutableMeta` writes that decoded
+    // form into the definition JSON, so the row only ever holds objects.
+    phases?: { title: string; detail?: string; model?: string }[]
     arguments?: Record<string, { type?: string; default?: unknown; description?: string }>
   }
   source?: string

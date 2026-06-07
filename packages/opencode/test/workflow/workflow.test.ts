@@ -236,6 +236,33 @@ export async function run(args, ctx) {
 }
 `
 
+// Per-phase default model fixture (Task 15): a structured phase declares a
+// default `model`. The first ctx.agent call (no explicit model) must resolve to
+// that phase default; the second call passes an EXPLICIT model that must win over
+// the phase default.
+const PHASE_MODEL_FIXTURE = "phase-model"
+const PHASE_MODEL_WORKFLOW = `export const meta = {
+  name: "${PHASE_MODEL_FIXTURE}",
+  phases: ["plan", { title: "verify", model: "stub/mini" }]
+}
+export async function run(args, ctx) {
+  ctx.setPhase("verify")
+  await ctx.agent({ prompt: "hi" })
+  await ctx.agent({ prompt: "hi", model: "other/explicit" })
+  return { ok: true }
+}
+`
+
+// Undeclared-phase fixture (Task 15): setPhase on a phase NOT in meta.phases is
+// allowed (no error) but logs a warning. The run still completes.
+const UNDECLARED_PHASE_FIXTURE = "undeclared-phase"
+const UNDECLARED_PHASE_WORKFLOW = `export const meta = { name: "${UNDECLARED_PHASE_FIXTURE}", phases: ["plan"] }
+export async function run(args, ctx) {
+  ctx.setPhase("undeclared")
+  return { ok: true }
+}
+`
+
 // Per-step tools-scoping fixture (Task 8): a single agent step that passes a
 // `tools` whitelist/blacklist. The engine must thread that Record<string,boolean>
 // through to the prompt run (PromptInput.tools) unchanged so the session scopes
@@ -3831,7 +3858,13 @@ export async function run() { return { ok: true } }
       expect(info.path).toBe("builtin:deep-research")
       // Meta wurde rein statisch (ohne Modul-Ausführung) gelesen.
       expect(info.meta.name).toBe("deep-research")
-      expect(info.meta.phases).toEqual(["plan", "research", "verify", "synthesize"])
+      // Phases normalize to the internal object shape (Task 15): strings → { title }.
+      expect(info.meta.phases).toEqual([
+        { title: "plan" },
+        { title: "research" },
+        { title: "verify" },
+        { title: "synthesize" },
+      ])
       expect(info.meta.arguments?.question?.type).toBe("string")
     }),
   )
@@ -5074,6 +5107,51 @@ export async function run() { return { from: "global" } }
       expect(done.agents.length).toBe(1)
       expect(done.agents[0]?.status).toBe("completed")
       expect(inputs.length).toBe(1)
+    }),
+  )
+
+  // Task 15(b): a structured phase declares a default `model`. While that phase is
+  // active, a ctx.agent call with NO explicit model resolves to the phase default;
+  // an explicit per-call model still wins over the phase default.
+  it.instance("a phase default model is used when ctx.agent gives no model; explicit model wins", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PHASE_MODEL_FIXTURE, PHASE_MODEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: PHASE_MODEL_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("phase-model workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // Two dispatches. The first (no explicit model) resolved to the "verify"
+      // phase's default `stub/mini`; the second's explicit model won over it.
+      expect(inputs.length).toBe(2)
+      expect(String(inputs[0]?.model?.providerID)).toBe("stub")
+      expect(String(inputs[0]?.model?.modelID)).toBe("mini")
+      expect(String(inputs[1]?.model?.providerID)).toBe("other")
+      expect(String(inputs[1]?.model?.modelID)).toBe("explicit")
+    }),
+  )
+
+  // Task 15(c): setPhase on a phase NOT declared in meta.phases is allowed — the
+  // run completes — but a run log records a warning naming the undeclared phase.
+  it.instance("setPhase on an undeclared phase completes the run and logs a warning", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, UNDECLARED_PHASE_FIXTURE, UNDECLARED_PHASE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: UNDECLARED_PHASE_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("undeclared-phase workflow did not finish")))
+
+      // No error: an undeclared phase is allowed.
+      expect(done.status).toBe("completed")
+      // A run log warns about the undeclared phase.
+      const warning = done.logs.find((l) => l.message.includes('phase "undeclared" is not declared'))
+      expect(warning).toBeTruthy()
     }),
   )
 })

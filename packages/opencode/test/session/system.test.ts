@@ -55,7 +55,7 @@ const it = testEffect(
                 meta: {
                   name: "Release Notes",
                   description: "Draft release notes.",
-                  phases: ["draft", "review"],
+                  phases: [{ title: "draft" }, { title: "review" }],
                   arguments: {
                     version: { type: "string", description: "Version to summarize." },
                   },
