@@ -79,7 +79,7 @@ export type WorkflowContext = {
   readonly budgetRemaining: number
   setPhase(phase: string): void
   log(message: string): void
-  parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<T[]>
+  parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<(T | null)[]>
   pipeline: WorkflowPipelineFn
   agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult>
 }

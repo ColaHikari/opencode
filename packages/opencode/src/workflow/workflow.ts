@@ -393,7 +393,7 @@ export type ContextApi = {
   readonly budgetRemaining: number
   readonly setPhase: (phase: string) => void
   readonly log: (message: string) => void
-  readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<T[]>
+  readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<(T | null)[]>
   readonly pipeline: PipelineFn
   readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
 }
@@ -1153,10 +1153,26 @@ function createContext(input: {
       return input.dispatch(
         Effect.forEach(
           tasks,
-          (task) =>
+          (task, index) =>
             Effect.promise(() => {
               checkpoint()
-              return task()
+              // P1 (Claude parity): a rejecting task resolves to `null` at its
+              // position instead of failing the whole batch. CancelledError stays
+              // fatal (an abort is not a task failure). The drop is logged — never
+              // silent.
+              return task().then(
+                (value) => value as T | null,
+                (error) => {
+                  if (error instanceof CancelledError) throw error
+                  input.active.run.logs.push({
+                    time: Date.now(),
+                    phase: input.active.run.current_phase,
+                    message: `parallel task ${index + 1} dropped: ${error instanceof Error ? error.message : String(error)}`,
+                  })
+                  input.persist()
+                  return null
+                },
+              )
             }),
           { concurrency },
         ),

@@ -364,6 +364,24 @@ export async function run(args, ctx) {
 }
 `
 
+// P1 (Claude parity): a rejecting task in ctx.parallel must NOT kill the whole
+// batch — it resolves to `null` at its position, the surviving tasks keep their
+// values, and the drop is LOGGED (never silent). Module uses `export default`
+// so the resolved-object load path is exercised too.
+const PARALLEL_ERROR_FIXTURE = "par-err"
+const PARALLEL_ERROR_WORKFLOW = `export default {
+  meta: { name: "${PARALLEL_ERROR_FIXTURE}", description: "parallel error tolerance" },
+  async run(_args, ctx) {
+    const out = await ctx.parallel([
+      () => Promise.resolve("ok-1"),
+      () => Promise.reject(new Error("boom")),
+      () => Promise.resolve("ok-3"),
+    ])
+    return { out }
+  },
+}
+`
+
 // Pipeline barrier fixture: N items, ONE stage that parks every item on the gate,
 // so the test can observe how many items run that stage concurrently (the
 // pipeline concurrency default / clamp).
@@ -1116,6 +1134,29 @@ describe("Workflow", () => {
       // accidental over-clamp to 1).
       expect(result.peak).toBe(2)
       delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // P1 (Claude parity): a rejecting parallel task must not fail the whole batch.
+  // It resolves to `null` at its position, the surviving tasks keep their values,
+  // and the drop is logged (never silent). Before this change the first rejection
+  // killed the batch and the run ended `failed`.
+  it.instance("parallel drops a rejecting task to null and logs it instead of failing the batch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, PARALLEL_ERROR_FIXTURE, PARALLEL_ERROR_WORKFLOW, "ts"),
+      )
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PARALLEL_ERROR_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("par-err did not finish")))
+      // The batch survives the rejection.
+      expect(run.status).toBe("completed")
+      expect((run.result as { out: unknown[] }).out).toEqual(["ok-1", null, "ok-3"])
+      // The drop is logged, never silent — and carries the rejection's message.
+      const dropLog = run.logs.find((l) => l.message.includes("parallel task 2 dropped"))
+      expect(dropLog?.message).toContain("boom")
     }),
   )
 
