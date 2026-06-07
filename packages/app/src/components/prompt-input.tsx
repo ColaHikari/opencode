@@ -730,6 +730,18 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onSelect: handleAtSelect,
   })
 
+  // Discovered workflows for the `/<name>` slash entries (Claude-Code parity).
+  // Fetched lazily — only once the slash popover opens — and cached by the
+  // resource so reopening the popover does not refetch on every keystroke.
+  const [workflowList] = createResource(
+    () => (store.popover === "slash" ? sdk.directory : undefined),
+    (directory) =>
+      sdk.client.workflow
+        .list({ directory })
+        .then((response) => response.data ?? [])
+        .catch(() => []),
+  )
+
   const slashCommands = createMemo<SlashCommand[]>(() => {
     const builtin = command.options
       .filter((opt) => !opt.disabled && !opt.id.startsWith("suggested.") && opt.slash)
@@ -751,7 +763,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       source: cmd.source,
     }))
 
-    return [...custom, ...builtin]
+    // A workflow that collides with any built-in slash trigger or any server
+    // command name is dropped (workflowCommandOptions filter) so a workflow never
+    // shadows a real command. Each surviving workflow surfaces as `/<name>` and
+    // routes through the /workflow path on select (handleSlashSelect).
+    const existingNames = new Set<string>([...builtin.map((b) => b.trigger), ...custom.map((c) => c.trigger)])
+    const workflow = workflowCommandOptions(workflowList() ?? [], existingNames).map((option) => ({
+      id: `workflow.run.${option.name}`,
+      trigger: option.name,
+      title: option.name,
+      description: option.description,
+      type: "workflow" as const,
+      source: "workflow" as const,
+    }))
+
+    return [...workflow, ...custom, ...builtin]
   })
 
   const handleSlashSelect = (cmd: SlashCommand | undefined) => {
