@@ -160,6 +160,17 @@ export const AgentRun = Schema.Struct({
   // the source run's matching completed agent). Omitted (⇒ undefined) for a live
   // step. Lets the dashboard mark a cheap, re-used step apart from a fresh one.
   cached: Schema.optional(Schema.Boolean),
+  // The journal node KIND (Tasks 12/13). `"question"` marks a human-in-the-loop
+  // `ctx.question` step (its `prompt` is the question text, `answer` is filled in
+  // on reply); `"agent"` (or absent — old rows) is an ordinary LLM step. The field
+  // is optional so rows written before it existed decode cleanly (undefined ⇒ an
+  // agent node), which is the decode-tolerance the persistence contract relies on.
+  kind: Schema.optional(Schema.Literals(["agent", "question"])),
+  // The answer recorded on a `kind:"question"` node once the question is answered
+  // (live) or replayed from a resumed run's journal. Omitted while open / for an
+  // agent node. Resume replay matches a question node on [kind, question, phase]
+  // and copies this answer back to the body, mirroring the agent-journal replay.
+  answer: Schema.optional(Schema.String),
 }).annotate({ identifier: "WorkflowAgentRun" })
 export type AgentRun = DeepMutable<Schema.Schema.Type<typeof AgentRun>>
 
@@ -205,6 +216,18 @@ export const Run = Schema.Struct({
   // run: the id of that source run, whose persisted journal was replayed.
   // Omitted for an ordinary (non-resume) run.
   resume_of: Schema.optional(RunID),
+  // The open human-in-the-loop question this run is currently waiting on
+  // (Tasks 12/13). Set while `ctx.question` is awaited and not yet answered;
+  // cleared once the answer lands (live) or the question node is replayed during a
+  // resume. A timed-out question parks the run as `paused` with this still set, so
+  // the open question survives across restarts. Omitted when no question pends.
+  pending_question: Schema.optional(
+    Schema.Struct({
+      question: Schema.String,
+      options: Schema.optional(Schema.Array(Schema.String)),
+      asked_at: Schema.Number,
+    }),
+  ),
 }).annotate({ identifier: "WorkflowRun" })
 export type Run = DeepMutable<Schema.Schema.Type<typeof Run>>
 
@@ -226,6 +249,12 @@ const RunEventData = {
     running: Schema.Number,
     failed: Schema.Number,
   }),
+  // `true` while this run is waiting on an open human-in-the-loop question
+  // (`ctx.question` awaited, not yet answered — Tasks 12/13), so a non-TUI
+  // consumer can surface the prompt without reading the full run. The detail
+  // (question text/options) stays on `get()`'s `pending_question`; the event
+  // only flags THAT one pends, keeping the payload slim.
+  pending_question: Schema.Boolean,
   error: Schema.NullOr(Schema.String),
 }
 export const Event = {
@@ -646,6 +675,11 @@ function snapshot(active: Active): Run {
     result: active.run.result === undefined ? undefined : jsonClone(active.run.result),
     logs: active.run.logs.map((item) => ({ ...item })),
     agents: active.run.agents.map((item) => jsonClone(item)),
+    // Detach the pending question from the live run so a caller mutating the
+    // returned snapshot cannot reach into engine state (mirrors the nested-value
+    // defensiveness above). `options` is a plain string array, JSON-safe.
+    pending_question:
+      active.run.pending_question === undefined ? undefined : jsonClone(active.run.pending_question),
   }
 }
 
@@ -675,6 +709,17 @@ function fromRow(row: Row): Run {
     // DB->engine brand boundary: the source-run id is an opaque `text` column in
     // core; re-brand it here like the row id above. Nullable column → undefined.
     resume_of: row.resume_of ? RunID.make(row.resume_of) : undefined,
+    // The open question (Tasks 12/13). A `mode: "json"` column, so the driver has
+    // already parsed it to an object (or SQL NULL → JS null → undefined here). The
+    // shape mirrors the engine schema; `options` is copied so the engine value is
+    // detached from the row's array.
+    pending_question: row.pending_question
+      ? {
+          question: row.pending_question.question,
+          options: row.pending_question.options ? [...row.pending_question.options] : undefined,
+          asked_at: row.pending_question.asked_at,
+        }
+      : undefined,
   }
 }
 
@@ -762,6 +807,17 @@ function persistRun(
       result: active.run.result === undefined ? null : JSON.stringify(active.run.result),
       error: active.run.error ?? null,
       resume_of: active.run.resume_of ?? null,
+      // The open question (Tasks 12/13). Persisted as a JSON object so a paused
+      // run that timed out keeps it across restarts; `undefined` ⇒ SQL NULL (no
+      // pending question). `options` is normalized to a mutable array for the row
+      // type (the engine schema declares it `readonly`).
+      pending_question: active.run.pending_question
+        ? {
+            question: active.run.pending_question.question,
+            options: active.run.pending_question.options ? [...active.run.pending_question.options] : undefined,
+            asked_at: active.run.pending_question.asked_at,
+          }
+        : null,
     }
     return db
       .insert(WorkflowRunTable)
@@ -792,6 +848,7 @@ function persistRun(
               running: active.run.agents.filter((a) => a.status === "running").length,
               failed: active.run.agents.filter((a) => a.status === "failed").length,
             },
+            pending_question: active.run.pending_question !== undefined,
             error: active.run.error ?? null,
           }),
         ),

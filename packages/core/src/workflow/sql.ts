@@ -69,6 +69,18 @@ export type WorkflowAgentRow = {
   // journal rather than executed live. Omitted for a live step. Keep this in
   // lockstep with the engine's `AgentRun` schema (asserted at compile time).
   cached?: boolean
+  // The journal node KIND (Tasks 12/13). `"agent"` (or undefined, for rows
+  // written before this field existed) is a normal LLM agent step; `"question"`
+  // is a human-in-the-loop `ctx.question` step whose `prompt` holds the question
+  // text and whose `answer` (below) is filled in once the user replies. Old rows
+  // decode with `kind` absent, which the engine reads as `"agent"`. Keep this in
+  // lockstep with the engine's `AgentRun` schema (asserted at compile time).
+  kind?: "agent" | "question"
+  // The answer recorded on a `kind:"question"` node once the question was
+  // answered (live) or replayed from a resumed run's journal. Omitted while the
+  // question is still open / for non-question nodes. Keep in lockstep with the
+  // engine's `AgentRun` schema.
+  answer?: string
 }
 
 export const WorkflowRunTable = sqliteTable(
@@ -121,6 +133,15 @@ export const WorkflowRunTable = sqliteTable(
     // (non-resume) start. Purely a provenance/audit field on the row; the engine
     // reads it back as `resume_of` on the public Run.
     resume_of: text(),
+    // The open human-in-the-loop question a running run is currently waiting on
+    // (Tasks 12/13). Set when `ctx.question` is awaited and the answer has not yet
+    // arrived; cleared the moment the answer lands (live) or the question node is
+    // replayed during a resume. A JSON object `{ question, options?, asked_at }` so
+    // a paused run that timed out keeps the open question persisted across restarts
+    // (the journal also keeps the matching `kind:"question"` agent node). NULL when
+    // no question is pending — the common case. Distinct from the agent journal:
+    // this is the SINGLE in-flight question, the journal is the audit trail.
+    pending_question: text({ mode: "json" }).$type<{ question: string; options?: string[]; asked_at: number }>(),
     ...Timestamps,
   },
   (table) => [
