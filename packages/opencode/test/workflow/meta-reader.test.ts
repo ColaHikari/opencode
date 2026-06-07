@@ -20,7 +20,8 @@ export async function run(args, ctx) { return { ok: true } }
     if (!result.valid) throw new Error("expected valid")
     expect(result.meta.name).toBe("Hello")
     expect(result.meta.description).toBe("Test workflow")
-    expect(result.meta.phases).toEqual(["start", "end"])
+    // Phases normalize to the internal object shape (Task 15): strings → { title }.
+    expect(result.meta.phases).toEqual([{ title: "start" }, { title: "end" }])
     expect(result.meta.arguments).toEqual({ value: { type: "number", description: "A value" } })
   })
 
@@ -34,7 +35,7 @@ export async function run(args, ctx) { return { ok: true } }
     expect(result.valid).toBe(true)
     if (!result.valid) throw new Error("expected valid")
     expect(result.meta.name).toBe("Typed Workflow")
-    expect(result.meta.phases).toEqual(["run"])
+    expect(result.meta.phases).toEqual([{ title: "run" }])
   })
 
   test("extracts literal meta from an export default workflow({ ... }) call", () => {
@@ -52,7 +53,7 @@ export default workflow({
     if (!result.valid) throw new Error("expected valid")
     expect(result.meta.name).toBe("Called")
     expect(result.meta.description).toBe("Built via helper")
-    expect(result.meta.phases).toEqual(["one"])
+    expect(result.meta.phases).toEqual([{ title: "one" }])
     expect(result.meta.arguments).toEqual({ x: { type: "string" } })
   })
 
@@ -140,7 +141,7 @@ export async function run(args, ctx) { return { ok: true } }
     expect(result.valid).toBe(true)
     if (!result.valid) throw new Error("expected valid")
     expect(result.meta.name).toBe("Const")
-    expect(result.meta.phases).toEqual(["a", "b"])
+    expect(result.meta.phases).toEqual([{ title: "a" }, { title: "b" }])
     expect(result.meta.arguments).toEqual({ x: { type: "string" } })
   })
 
@@ -155,7 +156,7 @@ export async function run(args, ctx) { return { ok: true } }
     expect(result.valid).toBe(true)
     if (!result.valid) throw new Error("expected valid")
     expect(result.meta.name).toBe("Sat")
-    expect(result.meta.phases).toEqual(["one"])
+    expect(result.meta.phases).toEqual([{ title: "one" }])
   })
 
   test("more than one default export is reported invalid (ambiguous)", () => {
@@ -185,5 +186,43 @@ export async function run(args, ctx) { return { ok: true } }
     expect(result.valid).toBe(false)
     if (result.valid) throw new Error("expected invalid")
     expect(result.error).toContain("statically analyzable")
+  })
+
+  // Task 15: structured phases. A phase entry may be an object literal
+  // `{ title, detail?, model? }` alongside plain strings. The reader extracts it
+  // statically (object literals only — same static-analyzability rule) and the
+  // schema NORMALIZES every phase to the internal object shape on decode, so a
+  // string phase reads back as `{ title }` and an object phase keeps its fields.
+  test("structured phase objects are read statically and normalized to objects", () => {
+    const source = `export const meta = {
+  name: "Structured",
+  phases: ["plan", { title: "verify", detail: "x", model: "stub/mini" }]
+}
+export async function run(args, ctx) { return { ok: true } }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(true)
+    if (!result.valid) throw new Error("expected valid")
+    // Always objects internally: the string "plan" normalizes to { title: "plan" },
+    // and the object phase keeps title/detail/model.
+    expect(result.meta.phases?.[0]).toEqual({ title: "plan" })
+    expect(result.meta.phases?.[1].title).toBe("verify")
+    expect(result.meta.phases?.[1]).toEqual({ title: "verify", detail: "x", model: "stub/mini" })
+  })
+
+  // A phase OBJECT missing the required `title` is invalid meta. The rule is
+  // statically analyzable (the object literal is read, then rejected by the same
+  // Meta schema the engine uses), so it reports invalid rather than throwing.
+  test("a phase object without a title is reported invalid meta", () => {
+    const source = `export const meta = {
+  name: "BadPhase",
+  phases: ["ok", { detail: "no title here", model: "x/y" }]
+}
+export async function run(args, ctx) { return { ok: true } }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(false)
+    if (result.valid) throw new Error("expected invalid")
+    expect(result.error).toBeTruthy()
   })
 })

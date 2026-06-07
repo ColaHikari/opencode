@@ -2,7 +2,10 @@ import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { EffectBridge } from "@/effect/bridge"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
 import { Identifier } from "@/id/id"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
@@ -45,6 +48,8 @@ import { WorkflowRunTable } from "./workflow.sql"
 import { MetaReader } from "./meta-reader"
 import { Meta } from "./meta"
 import { BUILTIN_WORKFLOWS, builtinPath } from "./builtin"
+import { Process } from "@/util/process"
+import { Shell } from "@/shell/shell"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
 // / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a
@@ -65,7 +70,8 @@ export type RunID = Schema.Schema.Type<typeof RunID>
 // static meta reader can share them without forming an import cycle. Re-exported
 // here so the engine's public `Workflow.Meta` / `Workflow.Argument` API is
 // unchanged.
-export { Argument, Meta } from "./meta"
+export { Argument, Meta, Phase } from "./meta"
+import { Phase } from "./meta"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -155,6 +161,17 @@ export const AgentRun = Schema.Struct({
   // the source run's matching completed agent). Omitted (⇒ undefined) for a live
   // step. Lets the dashboard mark a cheap, re-used step apart from a fresh one.
   cached: Schema.optional(Schema.Boolean),
+  // The journal node KIND (Tasks 12/13). `"question"` marks a human-in-the-loop
+  // `ctx.question` step (its `prompt` is the question text, `answer` is filled in
+  // on reply); `"agent"` (or absent — old rows) is an ordinary LLM step. The field
+  // is optional so rows written before it existed decode cleanly (undefined ⇒ an
+  // agent node), which is the decode-tolerance the persistence contract relies on.
+  kind: Schema.optional(Schema.Literals(["agent", "question"])),
+  // The answer recorded on a `kind:"question"` node once the question is answered
+  // (live) or replayed from a resumed run's journal. Omitted while open / for an
+  // agent node. Resume replay matches a question node on [kind, question, phase]
+  // and copies this answer back to the body, mirroring the agent-journal replay.
+  answer: Schema.optional(Schema.String),
 }).annotate({ identifier: "WorkflowAgentRun" })
 export type AgentRun = DeepMutable<Schema.Schema.Type<typeof AgentRun>>
 
@@ -200,8 +217,51 @@ export const Run = Schema.Struct({
   // run: the id of that source run, whose persisted journal was replayed.
   // Omitted for an ordinary (non-resume) run.
   resume_of: Schema.optional(RunID),
+  // The open human-in-the-loop question this run is currently waiting on
+  // (Tasks 12/13). Set while `ctx.question` is awaited and not yet answered;
+  // cleared once the answer lands (live) or the question node is replayed during a
+  // resume. A timed-out question parks the run as `paused` with this still set, so
+  // the open question survives across restarts. Omitted when no question pends.
+  pending_question: Schema.optional(
+    Schema.Struct({
+      question: Schema.String,
+      options: Schema.optional(Schema.Array(Schema.String)),
+      asked_at: Schema.Number,
+    }),
+  ),
 }).annotate({ identifier: "WorkflowRun" })
 export type Run = DeepMutable<Schema.Schema.Type<typeof Run>>
+
+// Run-lifecycle bus events. Published from `persistRun` (the single choke-point
+// every state write goes through) AFTER the DB upsert commits, so a consumer
+// never observes a state that was not persisted. The payload is intentionally
+// SLIM — the metadata fields plus an `agents` COUNT object — so non-TUI
+// consumers (dashboard, plugins) can render run progress without the heavy
+// logs/agents/result blobs (those stay readable via `get()`). `updated` fires on
+// every non-terminal write; `finished` fires once on the terminal write.
+const RunEventData = {
+  id: Schema.String,
+  workflow: Schema.String,
+  status: Status,
+  current_phase: Schema.NullOr(Schema.String),
+  directory: Schema.String,
+  agents: Schema.Struct({
+    total: Schema.Number,
+    running: Schema.Number,
+    failed: Schema.Number,
+  }),
+  // `true` while this run is waiting on an open human-in-the-loop question
+  // (`ctx.question` awaited, not yet answered — Tasks 12/13), so a non-TUI
+  // consumer can surface the prompt without reading the full run. The detail
+  // (question text/options) stays on `get()`'s `pending_question`; the event
+  // only flags THAT one pends, keeping the payload slim.
+  pending_question: Schema.Boolean,
+  error: Schema.NullOr(Schema.String),
+}
+export const Event = {
+  Updated: EventV2.define({ type: "workflow.run.updated", schema: RunEventData }),
+  Finished: EventV2.define({ type: "workflow.run.finished", schema: RunEventData }),
+}
 
 export const StartInput = Schema.Struct({
   name: Schema.String,
@@ -265,6 +325,16 @@ export type StartOptions = StartInput & {
    * replay, so its `ctx.agent` call runs live and re-prompts.
    */
   invalidate_agents?: number[]
+  /**
+   * Seeded answers for a resume that picks up a run parked on a `ctx.question`
+   * (Tasks 12/13). A map of question TEXT → answer. During the resume the engine
+   * builds a question journal from the source run's `kind:"question"` nodes; on
+   * reaching the matching `ctx.question` the body is served the seeded answer
+   * (and the node is marked `cached`) instead of asking the user again. Only
+   * meaningful together with `resume_of`. Set by `answer()` on a paused run;
+   * unused by an ordinary resume.
+   */
+  questionAnswers?: Record<string, string>
 }
 
 export type WaitInput = {
@@ -275,6 +345,27 @@ export type WaitInput = {
 export type WaitResult = {
   run?: Run
   timedOut: boolean
+}
+
+export type AnswerInput = {
+  id: RunID
+  answer: string
+  /**
+   * Execution options forwarded UNCHANGED into the resume that `answer()` starts
+   * when the target run is `paused` on a question (Tasks 12/13). These mirror the
+   * subset of `StartOptions` the resume path consumes, so a workflow that asks a
+   * question and then dispatches more `ctx.agent` steps can run those steps on the
+   * resumed run. Ignored on the live-answer path (no resume happens). All optional
+   * for backward compatibility:
+   * - `prompt`: the prompt-ops vector (dispatch + abort) the agent steps need.
+   * - `permissionSessionID`: where interactive permission prompts surface.
+   * - `caller`: identity used to derive each subagent's inherited permission ruleset.
+   * - `budget`: cost cap (USD) for the resumed run.
+   */
+  prompt?: PromptOps
+  permissionSessionID?: SessionID
+  caller?: { sessionID: SessionID; agent?: string }
+  budget?: number
 }
 
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("WorkflowNotFoundError", {
@@ -375,8 +466,20 @@ export type AgentInput = {
   agent?: string
   prompt: string
   model?: string
+  variant?: string
+  tools?: Record<string, boolean>
+  skills?: string[]
+  files?: string[]
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
+  /**
+   * Run this step's subagent in a FRESH `git worktree` instead of the run's
+   * workspace, so parallel agents that mutate files do not conflict. The
+   * worktree is created on first dispatch and auto-removed when the run finishes
+   * or is cancelled (registered on the run scope). Requires the workspace to be
+   * a git repository; otherwise the step fails with a WorkflowInvalidError.
+   */
+  isolation?: "worktree"
 }
 
 // Pipeline/parallel option and stage shapes are the public workflow-authoring
@@ -391,11 +494,47 @@ export type PipelineFn = WorkflowPipelineFn
 
 export type ContextApi = {
   readonly budgetRemaining: number
+  /** Cost budget (USD) in Claude-Code API shape: `total` (null when unlimited), `spent()` so far, `remaining()` (Infinity when unlimited). */
+  readonly budget: { readonly total: number | null; spent(): number; remaining(): number }
   readonly setPhase: (phase: string) => void
   readonly log: (message: string) => void
-  readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<T[]>
+  readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<(T | null)[]>
   readonly pipeline: PipelineFn
   readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  /**
+   * Deterministic non-LLM step: run a shell command in the run's workspace and
+   * resolve to `{ output, exitCode }`. Does NOT consume an LLM turn or the run's
+   * budget (`ctx.budget.spent()` is unaffected). A non-zero exit is mapped to the
+   * returned `exitCode`, NOT thrown.
+   */
+  readonly shell: (
+    command: string,
+    opts?: { timeout?: number; cwd?: string },
+  ) => Promise<{ output: string; exitCode: number }>
+  /**
+   * Run another DISCOVERED workflow inline under the SAME run (no separate run
+   * row), sharing this run's concurrency, budget, abort scope, and agent-lifetime
+   * cap. Returns the child workflow's `run()` result. Nesting is limited to depth
+   * 1: a workflow invoked via `ctx.workflow` cannot itself call `ctx.workflow`
+   * (the nested call throws a WorkflowInvalidError).
+   */
+  readonly workflow: (name: string, args?: Record<string, unknown>) => Promise<unknown>
+  /**
+   * Human-in-the-loop step (Tasks 12/13): persist a pending question on the run,
+   * emit a `workflow.run.updated` event carrying `pending_question: true`, then
+   * wait LIVE for an answer (a Deferred resolved by the service `answer()` method),
+   * racing a timeout (default 10 minutes). On answer it resolves to `{ answer }`
+   * and clears the pending question; the question is also recorded as a
+   * `kind:"question"` journal node so a resumed run can replay the answer instead
+   * of asking again. If the timeout elapses unanswered the run PARKS as `paused`
+   * (the same pause machinery), keeping the open question so a later `answer()`
+   * resumes it.
+   */
+  readonly question: (input: {
+    question: string
+    options?: readonly string[]
+    timeout?: number
+  }) => Promise<{ answer: string }>
 }
 
 // `ContextApi` is the engine-side view of the run context handed to a workflow
@@ -465,6 +604,19 @@ type Active = {
    */
   budgetRemaining: number
   /**
+   * Original cost cap (USD) the run was started with, or `undefined` when no
+   * budget was set. Distinct from `budget` (which coerces "unset" to `Infinity`
+   * for the gate): this keeps the unset case as `undefined` so `ctx.budget.total`
+   * can report `null`. Read-only after `start()`.
+   */
+  budgetTotal?: number
+  /**
+   * Total cost (USD) actually spent so far, accumulated at the same site that
+   * decrements `budgetRemaining` — but ALWAYS, even with no budget set, so
+   * `ctx.budget.spent()` works regardless. Starts at 0. Read by `ctx.budget`.
+   */
+  costSpent: number
+  /**
    * Run-wide concurrency gate over EVERY `ctx.agent` dispatch (agent/parallel/
    * pipeline all funnel through ctx.agent). Sized to the host CPU count clamped
    * to [2, 16] at run start. A per-call `concurrencyLimit` still applies on top
@@ -492,6 +644,33 @@ type Active = {
   journalCursor?: Map<string, number>
   /** Id of the source run this run resumed from; mirrored onto `run.resume_of` and the row. */
   resumeOf?: RunID
+  /**
+   * The open human-in-the-loop question this run is currently parked on inside
+   * `ctx.question` (Tasks 12/13). `deferred` is resolved by `answer()` on a LIVE
+   * run to hand the reply back to the body; `node` is the `kind:"question"`
+   * journal node so `answer()` can stamp the answer onto it. Set while a question
+   * is awaited, cleared the instant it resolves (live) or times out (park).
+   */
+  pendingQuestion?: { deferred: Deferred.Deferred<{ answer: string }>; node: AgentRun }
+  /**
+   * Resume answer journal (Tasks 12/13): when this run resumed a source run that
+   * was parked on a question, the answer supplied to `answer()` keyed by the
+   * question node's call shape ([question, phase]). On reaching the matching
+   * `ctx.question` the body is served this answer from the journal instead of
+   * asking again — the SAME journal-replay seam the agent journal uses. Absent on
+   * a run that did not resume a question.
+   */
+  questionJournal?: Map<string, string>
+  /**
+   * Per-phase DEFAULT model (Task 15). Resolved AT `setPhase` time from the
+   * workflow's declared phases (`run.definition.meta.phases`) — the matched
+   * phase's `model`, or `undefined` when the phase is undeclared or declares no
+   * model. Stored here rather than re-parsed from `run.current_phase` so a nested
+   * workflow's prefixed phase string never needs decoding: the value is set by the
+   * SAME context's `setPhase`, and `ctx.agent` reads it as the middle tier of model
+   * resolution (explicit input.model > this phase model > selected agent's model).
+   */
+  currentPhaseModel?: string
 }
 
 type State = {
@@ -518,6 +697,18 @@ export interface Interface {
    * returned as-is (idempotent); a non-live but persisted row is returned verbatim.
    */
   readonly pause: (id: RunID) => Effect.Effect<Run | undefined>
+  /**
+   * Answers the open human-in-the-loop question on a run (Tasks 12/13):
+   * - a LIVE run waiting in `ctx.question` → resolve the Deferred so the body
+   *   receives `{ answer }`, clear the pending question, persist, and return the
+   *   updated run.
+   * - a `paused` run with a persisted `pending_question` → START a resume
+   *   (`resume_of`) whose journal replay serves this answer to the question node
+   *   instead of asking again, and return the NEW run.
+   * - an unknown id, or a run with no open question → `undefined` (the HTTP
+   *   mapping is a later track).
+   */
+  readonly answer: (input: AnswerInput) => Effect.Effect<Run | undefined, InvalidError | NotFoundError>
   readonly remove: (id: RunID) => Effect.Effect<boolean>
   /**
    * Marks every `running` DB row that has no live registry entry as
@@ -571,6 +762,11 @@ function snapshot(active: Active): Run {
     result: active.run.result === undefined ? undefined : jsonClone(active.run.result),
     logs: active.run.logs.map((item) => ({ ...item })),
     agents: active.run.agents.map((item) => jsonClone(item)),
+    // Detach the pending question from the live run so a caller mutating the
+    // returned snapshot cannot reach into engine state (mirrors the nested-value
+    // defensiveness above). `options` is a plain string array, JSON-safe.
+    pending_question:
+      active.run.pending_question === undefined ? undefined : jsonClone(active.run.pending_question),
   }
 }
 
@@ -600,6 +796,17 @@ function fromRow(row: Row): Run {
     // DB->engine brand boundary: the source-run id is an opaque `text` column in
     // core; re-brand it here like the row id above. Nullable column → undefined.
     resume_of: row.resume_of ? RunID.make(row.resume_of) : undefined,
+    // The open question (Tasks 12/13). A `mode: "json"` column, so the driver has
+    // already parsed it to an object (or SQL NULL → JS null → undefined here). The
+    // shape mirrors the engine schema; `options` is copied so the engine value is
+    // detached from the row's array.
+    pending_question: row.pending_question
+      ? {
+          question: row.pending_question.question,
+          options: row.pending_question.options ? [...row.pending_question.options] : undefined,
+          asked_at: row.pending_question.asked_at,
+        }
+      : undefined,
   }
 }
 
@@ -630,7 +837,22 @@ class TerminalPersistTestError extends Error {
   }
 }
 
-function persistRun(db: Database.Interface["db"], active: Active, options?: { terminal?: boolean }) {
+// The terminal run statuses: a run in one of these has settled and will never
+// transition again, so its persist emits `workflow.run.finished` instead of
+// `workflow.run.updated`. `running`/`paused` are the only non-terminal statuses
+// (a paused run can still resume), so they emit `updated`. This mirrors the
+// terminal/non-terminal split documented on the `Status` literal above.
+const TERMINAL_STATUSES = ["completed", "failed", "cancelled", "interrupted"] as const
+function isTerminalStatus(status: string): boolean {
+  return (TERMINAL_STATUSES as readonly string[]).includes(status)
+}
+
+function persistRun(
+  db: Database.Interface["db"],
+  events: EventV2Bridge.Service["Service"],
+  active: Active,
+  options?: { terminal?: boolean },
+) {
   // The snapshot MUST be built at execution time (inside Effect.suspend), not
   // at effect-construction time: progress writes are forked into the run scope
   // and may execute AFTER the awaited terminal write in `finish`. A snapshot
@@ -672,6 +894,17 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
       result: active.run.result === undefined ? null : JSON.stringify(active.run.result),
       error: active.run.error ?? null,
       resume_of: active.run.resume_of ?? null,
+      // The open question (Tasks 12/13). Persisted as a JSON object so a paused
+      // run that timed out keeps it across restarts; `undefined` ⇒ SQL NULL (no
+      // pending question). `options` is normalized to a mutable array for the row
+      // type (the engine schema declares it `readonly`).
+      pending_question: active.run.pending_question
+        ? {
+            question: active.run.pending_question.question,
+            options: active.run.pending_question.options ? [...active.run.pending_question.options] : undefined,
+            asked_at: active.run.pending_question.asked_at,
+          }
+        : null,
     }
     return db
       .insert(WorkflowRunTable)
@@ -681,6 +914,32 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
         set: { ...data, time_updated: Date.now() },
       })
       .run()
+      .pipe(
+        // Publish the run-lifecycle event ONLY after the upsert commits, so a
+        // consumer never observes a state that was not persisted. Sits inside the
+        // write path so it inherits the `active.removed` tombstone and the failing
+        // terminal-persist seam above (both return before reaching here ⇒ no
+        // publish). The event is chosen by terminal status, never by the caller's
+        // `terminal` flag, so any persist that happens to carry a terminal status
+        // (e.g. a forked progress write that races the awaited terminal one) still
+        // reports `finished` consistently. Slim payload — counts, not the arrays.
+        Effect.tap(() =>
+          events.publish(isTerminalStatus(active.run.status) ? Event.Finished : Event.Updated, {
+            id: active.run.id,
+            workflow: active.run.workflow,
+            status: active.run.status,
+            current_phase: active.run.current_phase ?? null,
+            directory: active.directory,
+            agents: {
+              total: active.run.agents.length,
+              running: active.run.agents.filter((a) => a.status === "running").length,
+              failed: active.run.agents.filter((a) => a.status === "failed").length,
+            },
+            pending_question: active.run.pending_question !== undefined,
+            error: active.run.error ?? null,
+          }),
+        ),
+      )
   }).pipe(Effect.orDie)
 }
 
@@ -692,8 +951,13 @@ function persistRun(db: Database.Interface["db"], active: Active, options?: { te
  * a removed run, the terminal write in `finish` is awaited inline, and the
  * startup orphan sweep heals any run whose last progress snapshot was cut short.
  */
-function persistInScope(active: Active, bridge: EffectBridge.Shape, db: Database.Interface["db"]) {
-  bridge.fork(persistRun(db, active).pipe(Effect.forkIn(active.runScope)))
+function persistInScope(
+  active: Active,
+  bridge: EffectBridge.Shape,
+  db: Database.Interface["db"],
+  events: EventV2Bridge.Service["Service"],
+) {
+  bridge.fork(persistRun(db, events, active).pipe(Effect.forkIn(active.runScope)))
 }
 
 /**
@@ -889,7 +1153,9 @@ function mutableMeta(meta: Meta): Definition["meta"] {
   return {
     name: meta.name,
     description: meta.description,
-    phases: meta.phases ? [...meta.phases] : undefined,
+    // Phases are normalized objects (Task 15); deep-copy each so the mutable
+    // Definition does not alias the (readonly) decoded meta's phase objects.
+    phases: meta.phases ? meta.phases.map((phase) => ({ ...phase })) : undefined,
     arguments: meta.arguments
       ? Object.fromEntries(Object.entries(meta.arguments).map(([name, argument]) => [name, { ...argument }]))
       : undefined,
@@ -916,6 +1182,23 @@ function mutableMeta(meta: Meta): Definition["meta"] {
 function journalKey(parts: { prompt: string; agent?: string; phase?: string }): string {
   return JSON.stringify([parts.prompt, parts.agent ?? null, parts.phase ?? null])
 }
+
+// Resume journal key for a `ctx.question` node (Tasks 12/13). The question has no
+// agent/model/schema, so it keys purely on [kind:"question", question, phase] —
+// the question text plus the phase it was asked in. The literal "question" tag
+// keeps the namespace disjoint from agent keys even if a prompt happened to equal
+// a question. Built identically on the seed side (from the source run's question
+// node) and the live side (the re-asked question), so a resumed run resolves the
+// answer from the journal instead of asking again.
+function questionJournalKey(parts: { question: string; phase?: string }): string {
+  return JSON.stringify(["question", parts.question, parts.phase ?? null])
+}
+
+// The default wait for a `ctx.question` with no explicit `timeout` (Tasks 12/13):
+// 10 minutes. Once it elapses with no answer the run PARKS as `paused` (existing
+// pause machinery) with the open question persisted, so a later `answer()` can
+// resume it. Tests pass a tiny timeout to exercise the park path quickly.
+const DEFAULT_QUESTION_TIMEOUT_MS = 10 * 60 * 1000
 
 // loadModule writes a transient import copy ALONGSIDE the source file (same
 // directory) on purpose: relative imports and the workflow module's
@@ -1108,10 +1391,28 @@ function projectConfigDir(ctx: { directory: string; worktree: string }) {
 function createContext(input: {
   active: Active
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  shell: ContextApi["shell"]
+  question: ContextApi["question"]
+  workflow: ContextApi["workflow"]
   permissionSessionID?: SessionID
   persist: () => void
   /** AbortSignal of the run fiber; fires when the run is interrupted/cancelled. */
   signal: () => AbortSignal | undefined
+  /**
+   * Run-relative prefix for `ctx.log`/`ctx.setPhase` messages. Empty for the
+   * top-level run; set to `"<child-name>: "` for a depth-1 nested workflow so its
+   * logs/phases are attributable to the child without a second run row.
+   */
+  logPrefix?: string
+  /**
+   * The NORMALIZED declared phases of THIS context's module (Task 15) — the
+   * top-level run's `module.meta.phases` or, for a nested ctx.workflow child, the
+   * CHILD module's phases. `setPhase` resolves a phase's default model and detects
+   * an undeclared phase against THIS list, so a nested child looks up its OWN
+   * phases (not the parent's), and the prefixed `current_phase` string never needs
+   * decoding. Omitted ⇒ no declared phases (every setPhase is "undeclared").
+   */
+  phases?: readonly Phase[]
   /**
    * Runs the parallel/pipeline task graph as a child of the run scope (not as a
    * detached root fiber): closing the run scope on cancel/remove propagates
@@ -1133,12 +1434,49 @@ function createContext(input: {
     get budgetRemaining() {
       return input.active.budgetRemaining
     },
+    // Claude-Code API-shape view over the same spend the run tracks. `total` is
+    // the cap (null when unlimited), `spent()` the running total charged so far,
+    // `remaining()` the headroom (Infinity when unlimited). All read live so a
+    // workflow sees them change across agent steps, mirroring `budgetRemaining`.
+    budget: {
+      get total() {
+        return input.active.budgetTotal ?? null
+      },
+      spent: () => input.active.costSpent,
+      remaining: () =>
+        input.active.budgetTotal === undefined
+          ? Infinity
+          : Math.max(0, input.active.budgetTotal - input.active.costSpent),
+    },
     setPhase(phase: string) {
-      input.active.run.current_phase = phase
+      input.active.run.current_phase = (input.logPrefix ?? "") + phase
+      // Task 15: resolve this phase against THIS context's declared phases (the
+      // raw `phase` name, never the prefixed string), keyed by `title`. A declared
+      // phase's `model` becomes the active per-phase default model that ctx.agent
+      // uses when a call gives no explicit model; an undeclared phase clears the
+      // default AND logs a warning (never an error — an undeclared phase is allowed,
+      // it simply has no default model). The lookup uses the SAME context's phases
+      // so a nested child resolves against its own declarations and the parent's
+      // restored on return (runNested snapshots/restores currentPhaseModel too).
+      const declared = input.phases?.find((entry) => entry.title === phase)
+      if (declared) {
+        input.active.currentPhaseModel = declared.model
+      } else {
+        input.active.currentPhaseModel = undefined
+        input.active.run.logs.push({
+          time: Date.now(),
+          phase: input.active.run.current_phase,
+          message: `${input.logPrefix ?? ""}phase "${phase}" is not declared`,
+        })
+      }
       input.persist()
     },
     log(message: string) {
-      input.active.run.logs.push({ time: Date.now(), phase: input.active.run.current_phase, message })
+      input.active.run.logs.push({
+        time: Date.now(),
+        phase: input.active.run.current_phase,
+        message: (input.logPrefix ?? "") + message,
+      })
       input.persist()
     },
     parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
@@ -1153,10 +1491,26 @@ function createContext(input: {
       return input.dispatch(
         Effect.forEach(
           tasks,
-          (task) =>
+          (task, index) =>
             Effect.promise(() => {
               checkpoint()
-              return task()
+              // P1 (Claude parity): a rejecting task resolves to `null` at its
+              // position instead of failing the whole batch. CancelledError stays
+              // fatal (an abort is not a task failure). The drop is logged — never
+              // silent.
+              return task().then(
+                (value) => value as T | null,
+                (error) => {
+                  if (error instanceof CancelledError) throw error
+                  input.active.run.logs.push({
+                    time: Date.now(),
+                    phase: input.active.run.current_phase,
+                    message: `parallel task ${index + 1} dropped: ${error instanceof Error ? error.message : String(error)}`,
+                  })
+                  input.persist()
+                  return null
+                },
+              )
             }),
           { concurrency },
         ),
@@ -1191,17 +1545,33 @@ function createContext(input: {
           (item) =>
             Effect.promise(async () => {
               let current: unknown = item
-              for (const stage of stages) {
-                checkpoint()
-                current = await stage(current, item)
+              try {
+                for (const stage of stages) {
+                  checkpoint()
+                  current = await stage(current, item)
+                }
+                return current
+              } catch (error) {
+                // P2: a throwing stage drops ONLY this item (null) and skips its
+                // remaining stages; other items keep running. Abort stays fatal.
+                if (error instanceof CancelledError) throw error
+                input.active.run.logs.push({
+                  time: Date.now(),
+                  phase: input.active.run.current_phase,
+                  message: `pipeline item ${items.indexOf(item) + 1} dropped: ${error instanceof Error ? error.message : String(error)}`,
+                })
+                input.persist()
+                return null
               }
-              return current
             }),
           { concurrency },
         ),
       )
     }) as ContextApi["pipeline"],
     agent: input.agent,
+    shell: input.shell,
+    question: input.question,
+    workflow: input.workflow,
   }
 }
 
@@ -1217,7 +1587,9 @@ export function fmt(list: Info[]) {
         `    <name>${workflow.name}</name>`,
         `    <description>${workflow.meta.description}</description>`,
         `    <path>${pathToFileURL(workflow.path).href}</path>`,
-        ...(workflow.meta.phases?.length ? [`    <phases>${workflow.meta.phases.join(", ")}</phases>`] : []),
+        ...(workflow.meta.phases?.length
+          ? [`    <phases>${workflow.meta.phases.map((phase) => phase.title).join(", ")}</phases>`]
+          : []),
         ...(workflow.meta.arguments
           ? [
               "    <arguments>",
@@ -1241,6 +1613,7 @@ export const layer = Layer.effect(
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
     const { db } = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* (ctx) {
         const runs = yield* SynchronizedRef.make(new Map<string, Active>())
@@ -1447,7 +1820,7 @@ export const layer = Layer.effect(
       // as the text `"null"`) instead of racing an in-flight progress write. The
       // `Effect.exit` guard keeps this ordering safe for the failing-persist case.
       const result = snapshot(active)
-      yield* persistRun(db, active, { terminal: true }).pipe(Effect.exit)
+      yield* persistRun(db, events, active, { terminal: true }).pipe(Effect.exit)
       yield* Deferred.succeed(active.done, result).pipe(Effect.ignore)
       // N1: evict the terminal run from the in-memory registry so the map does not
       // grow unbounded for a long-lived instance, and so a dead run's heavy
@@ -1518,6 +1891,12 @@ export const layer = Layer.effect(
       // call then runs live), so a stale resume id degrades to a normal run rather
       // than failing the start.
       const journal = new Map<string, AgentRun[]>()
+      // Question replay journal (Tasks 12/13): when this resume seeds answers
+      // (answer() on a paused run), map the source run's `kind:"question"` nodes to
+      // their provided answer keyed by [question, phase] — the SAME shape the live
+      // `ctx.question` will rebuild. On reaching that question the body is served
+      // the answer from here instead of asking again.
+      const questionJournal = new Map<string, string>()
       if (input.resume_of) {
         const sourceRow = yield* db
           .select()
@@ -1541,6 +1920,18 @@ export const layer = Layer.effect(
           }
           const invalidate = new Set(input.invalidate_agents ?? [])
           sourceRow.agents.forEach((node, index) => {
+            // A `kind:"question"` node is replayed from the SEEDED answer (not the
+            // agent journal): match it on [question, phase] and record the supplied
+            // answer. The source node may be `failed`/"Paused" (a timed-out park
+            // flips the still-open node), so — unlike the agent journal — we do NOT
+            // gate on `completed`; the seed answer is what makes the replay valid.
+            if (node.kind === "question") {
+              const seeded = input.questionAnswers?.[node.prompt]
+              if (seeded !== undefined) {
+                questionJournal.set(questionJournalKey({ question: node.prompt, phase: node.phase }), seeded)
+              }
+              return
+            }
             if (node.status !== "completed") return
             if (invalidate.has(index)) return
             const key = journalKey({ prompt: node.prompt, agent: node.agent, phase: node.phase })
@@ -1592,15 +1983,20 @@ export const layer = Layer.effect(
         // no-op, preserving the previous unlimited behavior exactly.
         budget: input.budget ?? Number.POSITIVE_INFINITY,
         budgetRemaining: input.budget ?? Number.POSITIVE_INFINITY,
+        // Kept as the raw validated budget (undefined ⇒ no budget) so
+        // `ctx.budget.total` reports `null` rather than coercing to Infinity.
+        budgetTotal: input.budget,
+        costSpent: 0,
         agentSemaphore,
         agentStarted: 0,
         agentLimit: agentLimitOverride ?? DEFAULT_AGENT_LIMIT,
         journal: input.resume_of ? journal : undefined,
         journalCursor: input.resume_of ? new Map<string, number>() : undefined,
         resumeOf: input.resume_of,
+        questionJournal: input.resume_of && questionJournal.size > 0 ? questionJournal : undefined,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
-      yield* persistRun(db, active)
+      yield* persistRun(db, events, active)
       if (input.prompt) {
         yield* input.prompt
           .prompt({
@@ -1674,6 +2070,12 @@ export const layer = Layer.effect(
           })
         }
         active.agentStarted += 1
+        // Task 15: snapshot the active per-phase default model SYNCHRONOUSLY here
+        // (alongside `node.phase`), not inside the dispatched gen — concurrent
+        // parallel/pipeline steps may move the phase before this fiber runs, so
+        // capturing it at call time keeps each step bound to the phase it was
+        // dispatched under (matching how `node.phase` snapshots current_phase).
+        const phaseModel = active.currentPhaseModel
         const node: AgentRun = {
           id: `${active.run.agents.length + 1}`,
           status: "running",
@@ -1684,13 +2086,92 @@ export const layer = Layer.effect(
           prompt: agentInput.prompt,
         }
         active.run.agents.push(node)
-        persistInScope(active, bridge, db)
+        persistInScope(active, bridge, db, events)
         const prompt = input.prompt
         if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
         return dispatch(
           Effect.gen(function* () {
             const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
-            const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+            // Model resolution (precedence, highest first):
+            //   1. EXPLICIT per-call `agentInput.model` — including the magic
+            //      `model: "small"`, which routes to the configured `small_model`
+            //      (read from the already-injected Config.Service). Requesting
+            //      "small" with no `small_model` configured is an authoring error
+            //      (fail the step, never silently fall back).
+            //   2. The active PHASE'S default `model` (Task 15) — captured at call
+            //      time as `phaseModel`; used only when the call gave no explicit
+            //      model, so an explicit model always wins over the phase default.
+            //   3. The selected agent's own model.
+            const smallModel = agentInput.model === "small" ? (yield* config.get()).small_model : undefined
+            if (agentInput.model === "small" && !smallModel) {
+              return yield* new InvalidError({
+                path: active.run.workflow,
+                message: 'ctx.agent({ model: "small" }) requires "small_model" to be configured',
+              })
+            }
+            const modelInfo = smallModel
+              ? Provider.parseModel(smallModel)
+              : agentInput.model
+                ? Provider.parseModel(agentInput.model)
+                : phaseModel
+                  ? Provider.parseModel(phaseModel)
+                  : selected.model
+            // OTel: enrich the enclosing `workflow.agent` span with the RESOLVED
+            // agent name and model now that both are known (the boundary above set
+            // only the static/requested attributes). Purely observational.
+            yield* Effect.annotateCurrentSpan({
+              "workflow.agent.name": selected.name,
+              ...(modelInfo ? { "workflow.agent.model": `${modelInfo.providerID}/${modelInfo.modelID}` } : {}),
+            })
+            // Per-step model reasoning variant (e.g. "max"). opencode keeps the
+            // variant SEPARATE from the model ref (model ids legitimately contain
+            // slashes, so it is never peeled from the model string here — that is
+            // the registry-aware job of the model picker); it rides alongside the
+            // model into both the child session and the prompt run.
+            const variant = agentInput.variant
+            // Per-step skills (Task 9). opencode has NO structured "give this
+            // session these skills" field: skills are only loadable at runtime via
+            // the `skill` tool (which asks for the `skill` permission and injects
+            // the skill content into the conversation). So the supported mechanism
+            // is a documented prompt convention — prepend a directive naming the
+            // requested skills and ENABLE the `skill` tool for the step (folded
+            // into the per-step tools scoping above). The directive precedes the
+            // author's prompt so the model loads the skills before starting.
+            const skills = agentInput.skills?.filter((s) => s.length > 0) ?? []
+            const promptText =
+              skills.length > 0
+                ? `Load these skills before starting: ${skills.join(", ")}.\n\n${agentInput.prompt}`
+                : agentInput.prompt
+            const tools =
+              skills.length > 0 ? { ...(agentInput.tools ?? {}), skill: true } : agentInput.tools
+            // Declarative file attachments (Task 10). Each path is resolved
+            // RELATIVE TO the run's workspace directory (`active.directory`, the
+            // InstanceState directory the run was started in) and must exist —
+            // a missing attachment is an authoring error, so fail the step with a
+            // clear WorkflowInvalidError naming the file (before any prompt is
+            // dispatched) rather than sending a broken prompt. Each resolved file
+            // becomes a `text/plain` FilePartInput whose `url` is the absolute
+            // `file://` URL; the prompt loop reads `file://` parts off disk (via
+            // the Read tool) exactly like a TUI-attached file. Built here so the
+            // parts can be appended AFTER the text part below.
+            const fileParts: { type: "file"; mime: string; filename: string; url: string }[] = []
+            for (const file of agentInput.files ?? []) {
+              if (file.length === 0) continue
+              const resolved = path.isAbsolute(file) ? file : path.resolve(active.directory, file)
+              const exists = yield* Effect.promise(() => Bun.file(resolved).exists())
+              if (!exists) {
+                return yield* new InvalidError({
+                  path: active.run.workflow,
+                  message: `ctx.agent file attachment not found: ${file} (resolved to ${resolved})`,
+                })
+              }
+              fileParts.push({
+                type: "file",
+                mime: "text/plain",
+                filename: path.basename(resolved),
+                url: pathToFileURL(resolved).href,
+              })
+            }
             // Resume replay: when this run has a journal (started with
             // resume_of), consume the next unused source agent for this call's
             // key (occurrence order) and replay it verbatim — NO session, NO
@@ -1742,7 +2223,7 @@ export const layer = Layer.effect(
                   node.cached = true
                   // The budget decrement is left to the shared `ensuring` below
                   // (node.cost is set), so a cache hit is charged exactly once.
-                  yield* persistRun(db, active)
+                  yield* persistRun(db, events, active)
                   const structured = parsedExit !== undefined ? parsedExit.value : undefined
                   return {
                     data: structured !== undefined ? structured : (cached.output ?? ""),
@@ -1768,18 +2249,98 @@ export const layer = Layer.effect(
               input.caller?.agent !== undefined
                 ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
                 : undefined
+            // The inherited subagent ruleset (#26514): parent Plan-Mode edit denies,
+            // parent session denies/external_directory, default task/todowrite denies.
+            // Absent a caller identity there is nothing to inherit (prior fallback).
+            const derivedPermission = callerSession
+              ? deriveSubagentSessionPermission({
+                  parentSessionPermission: callerSession.permission ?? [],
+                  parentAgent: callerAgent,
+                  subagent: selected,
+                })
+              : undefined
+            // Security (compose, never override): per-step tool scoping must NEVER
+            // re-grant a tool the inherited ruleset denies. The Record→rules
+            // conversion mirrors the prompt loop's (PromptInput.tools handler):
+            // each entry → `{ permission, action: allow|deny, pattern: "*" }`.
+            // When an inherited ruleset exists we MUST NOT route `tools` through
+            // PromptInput.tools, whose handler does a FULL ASSIGNMENT
+            // (`session.permission = [tools→rules]`) that would clobber the derived
+            // denies for the step. Instead we COMPOSE: the per-step rules go FIRST,
+            // the derived ruleset LAST. The permission engine is last-match-wins
+            // (`evaluate` = `.flat().findLast(...)`), so an inherited deny always
+            // beats a per-step grant of the same permission, while a per-step DENY
+            // (scoping down) and grants of non-denied tools still take effect. When
+            // there is no inherited ruleset there is nothing to clobber, so we keep
+            // routing `tools` through PromptInput.tools below (createPermission stays
+            // undefined and `tools` is passed to prompt.prompt).
+            const toolRules = Object.entries(tools ?? {}).map(([t, enabled]) => ({
+              permission: t,
+              action: enabled ? ("allow" as const) : ("deny" as const),
+              pattern: "*" as const,
+            }))
+            const composeTools = derivedPermission !== undefined && toolRules.length > 0
+            const createPermission = composeTools
+              ? [...toolRules, ...derivedPermission!]
+              : derivedPermission
+            // Per-step git-worktree isolation (Task 11). When requested, run the
+            // subagent inside a FRESH `git worktree` so parallel agents that
+            // mutate files cannot conflict. The worktree is created off the run's
+            // workspace (`active.directory`) and removed when the run finishes or
+            // is cancelled — the remove finalizer is registered on the RUN scope
+            // (this effect runs via dispatch → `Effect.forkIn(effect, runScope)`,
+            // so the finalizer attaches there, survives parallel steps, and fires
+            // on cancel). A non-git workspace cannot host a worktree, so the step
+            // fails with a clear WorkflowInvalidError instead of crashing.
+            //
+            // The isolation is load-bearing via the `InstanceRef` override below,
+            // NOT the session's `directory` field: the subagent's file tools
+            // (bash/edit/write/read) and the prompt loop resolve their cwd from
+            // the effective `InstanceState.context` (the `InstanceRef`), not from
+            // `session.directory`. So we both (a) override `InstanceRef` for the
+            // prompt run (what actually redirects the tools) and (b) record the
+            // worktree as the session's `directory` so the dashboard reflects
+            // where the work happened.
+            const instanceCtx = yield* InstanceState.context
+            let promptInstanceCtx = instanceCtx
+            let sessionDirectory = instanceCtx.directory
+            if (agentInput.isolation === "worktree") {
+              const base = path.join(os.tmpdir(), `oc-wf-${active.run.id}-${node.id}`)
+              const res = Bun.spawnSync(["git", "worktree", "add", "--detach", base], { cwd: instanceCtx.directory })
+              if (res.exitCode !== 0) {
+                return yield* new InvalidError({
+                  path: active.run.workflow,
+                  message: `ctx.agent isolation:"worktree" requires a git repository (${new TextDecoder().decode(res.stderr).trim()})`,
+                })
+              }
+              // Cleanup on the RUN scope: survives parallel steps, fires on
+              // cancel/finish. Register EXPLICITLY on `active.runScope` rather
+              // than via `Effect.addFinalizer` (which targets the ambient Scope):
+              // this effect is forked via `Effect.forkIn(effect, runScope)`, which
+              // SUPERVISES the fiber under the run scope but does NOT provide that
+              // scope as the `Scope` service in context — so an ambient
+              // `addFinalizer` would attach to the wrong (or no) scope. Targeting
+              // the run scope object directly guarantees the worktree is removed
+              // exactly once when the run terminates (finish closes runScope) or
+              // is cancelled/removed (abortRun closes it), never per step.
+              yield* Scope.addFinalizer(
+                active.runScope,
+                Effect.sync(() => {
+                  Bun.spawnSync(["git", "worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
+                }),
+              )
+              // A fresh worktree is a self-contained working tree, so both the
+              // working directory AND the worktree root point at `base`.
+              promptInstanceCtx = { ...instanceCtx, directory: base, worktree: base }
+              sessionDirectory = base
+            }
             const session = yield* sessions.create({
               parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
               title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
               agent: selected.name,
-              model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID } : undefined,
-              permission: callerSession
-                ? deriveSubagentSessionPermission({
-                    parentSessionPermission: callerSession.permission ?? [],
-                    parentAgent: callerAgent,
-                    subagent: selected,
-                  })
-                : undefined,
+              model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID, variant } : undefined,
+              permission: createPermission,
+              directory: sessionDirectory,
             })
             node.agent = selected.name
             if (modelInfo) node.model = `${modelInfo.providerID}/${modelInfo.modelID}`
@@ -1795,15 +2356,44 @@ export const layer = Layer.effect(
             if (active.cancelling || active.removed) {
               if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
             }
-            yield* persistRun(db, active)
+            yield* persistRun(db, events, active)
             const message = yield* prompt.prompt({
               sessionID: session.id,
               permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
               agent: selected.name,
               model: modelInfo,
+              variant,
+              // Per-step tool scoping: opencode's `Record<string, boolean>`
+              // whitelist/blacklist (glob-able keys, e.g. `{ webfetch: false }`)
+              // lives on PromptInput.tools (NOT sessions.create — that only takes a
+              // permission Ruleset). The prompt loop folds each entry into an
+              // allow/deny session permission rule, so threading it here scopes the
+              // child session's tools for this step. `tools` already merges the
+              // step's own scoping with the `skill: true` enablement that the
+              // skills directive (above) requires.
+              //
+              // BUT the prompt loop's handler does a FULL ASSIGNMENT that would
+              // clobber an inherited subagent ruleset. So when we already composed
+              // the per-step rules INTO the child session's permission at creation
+              // (an inherited ruleset existed — `composeTools`), we must NOT pass
+              // `tools` here, or it would overwrite that composed ruleset and drop
+              // the inherited denies. Only route through PromptInput.tools when there
+              // was nothing to inherit/clobber.
+              tools: composeTools ? undefined : tools,
               format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
-              parts: [{ type: "text", text: agentInput.prompt }],
-            })
+              // `promptText` is the author's prompt, optionally prefixed with the
+              // per-step skill-load directive (see the `skills` resolution above).
+              // Declarative file attachments (Task 10) follow the text part, in the
+              // order they were declared.
+              parts: [{ type: "text", text: promptText }, ...fileParts],
+              // Worktree isolation (Task 11): override the effective InstanceRef
+              // for the subagent's prompt run so its file tools resolve cwd
+              // against the worktree, not the run's workspace. `InstanceRef` is a
+              // Context.Reference (innermost-wins), so this local provide beats
+              // the run-level one attached at the dispatch boundary. When isolation
+              // is off, `promptInstanceCtx === instanceCtx` so this is the prior
+              // (effectively no-op) provide of the same ref value.
+            }).pipe(Effect.provideService(InstanceRef, promptInstanceCtx))
             node.message_id = message.info.id
             if (message.info.role === "assistant") {
               node.model = `${message.info.providerID}/${message.info.modelID}`
@@ -1902,7 +2492,13 @@ export const layer = Layer.effect(
                 // A pausing run is treated like a cancelling one: an interrupted
                 // step did not really spend, so it must not be charged.
                 if (active.cancelling || active.removed || active.pausing) return
+                // Charge the SAME cost to BOTH the live remaining budget (gated)
+                // and the lifetime spend accumulator. costSpent accrues regardless
+                // of whether a budget was set, so `ctx.budget.spent()` works without
+                // a budget; keeping it on the same guard/cost as `budgetRemaining`
+                // makes `spent()`/`remaining()`/`total` mutually consistent.
                 active.budgetRemaining -= node.cost ?? 0
+                active.costSpent += node.cost ?? 0
               }),
             ),
             // Run-wide concurrency cap (Spec §5.1): acquire one permit around
@@ -1913,6 +2509,25 @@ export const layer = Layer.effect(
             // step never leaks a permit. A journal replay returns early and so
             // holds the permit only momentarily.
             active.agentSemaphore.withPermits(1),
+            // OTel: each ctx.agent dispatch gets a `workflow.agent` span (the
+            // engine had no agent-level spans before). Static attributes are set
+            // here at construction time; the RESOLVED agent name and model are
+            // only known once `selected`/`modelInfo` are computed inside the gen,
+            // so they are added there via `Effect.annotateCurrentSpan`. Dotted
+            // lowercase keys match the repo convention (tool.name/session.id …);
+            // the span is purely observational and changes no behavior.
+            Effect.withSpan("workflow.agent", {
+              attributes: {
+                "workflow.run_id": active.run.id,
+                "workflow.agent.id": node.id,
+                "workflow.phase": node.phase ?? undefined,
+                // Requested (pre-resolution) agent/model, useful even on a step
+                // that fails before resolution. The resolved values are annotated
+                // onto this same span once known (see the gen body above).
+                ...(agentInput.agent ? { "workflow.agent.requested": agentInput.agent } : {}),
+                ...(agentInput.model ? { "workflow.agent.model_requested": agentInput.model } : {}),
+              },
+            }),
           ),
         ).then(
           (result) => {
@@ -1927,7 +2542,7 @@ export const layer = Layer.effect(
             node.status = "completed"
             node.completed_at = Date.now()
             node.output = result.text
-            persistInScope(active, bridge, db)
+            persistInScope(active, bridge, db, events)
             return result
           },
           (error) => {
@@ -1940,10 +2555,224 @@ export const layer = Layer.effect(
             node.status = "failed"
             node.completed_at = Date.now()
             node.error = errorText(error)
-            persistInScope(active, bridge, db)
+            persistInScope(active, bridge, db, events)
             return Promise.reject(error)
           },
         )
+      }
+
+      // Deterministic non-LLM step. Runs a shell command in the run's workspace
+      // (or an explicit `cwd`) and resolves to `{ output, exitCode }` WITHOUT
+      // touching `costSpent`/budget or starting an agent — it deliberately does
+      // NOT go through `agent()`, the budget gate, or the lifetime cap. The work
+      // runs as a child of the run scope (via `dispatch`), so a cancel/remove that
+      // closes the run scope interrupts an in-flight shell; a `checkpoint()`-style
+      // guard before dispatch refuses to start a new shell once a cancel/pause has
+      // landed. A non-zero exit is returned (`nothrow`), never thrown.
+      const shell: ContextApi["shell"] = (command, opts) => {
+        if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
+        const cwd = opts?.cwd ?? active.directory
+        return dispatch(
+          Effect.gen(function* () {
+            const cfg = yield* config.get()
+            const sh = Shell.preferred(cfg.shell)
+            const result = yield* Effect.tryPromise(() => {
+              // Real wall-clock timeout: Process.run only uses `timeout` as the
+              // SIGKILL grace AFTER an abort fires, so a hung command needs an
+              // explicit AbortController to be killed at all. When `opts.timeout`
+              // is set we arm a timer that aborts the signal; Process.run then
+              // SIGTERMs the child (and SIGKILLs it after its own default grace),
+              // and `nothrow` resolves the killed run with a non-zero exitCode
+              // (1) instead of hanging or throwing. The timer is always cleared.
+              const controller = opts?.timeout ? new AbortController() : undefined
+              const timer = controller
+                ? setTimeout(() => controller.abort(), opts!.timeout)
+                : undefined
+              return Process.run([sh, ...Shell.args(sh, command, cwd)], {
+                cwd,
+                nothrow: true,
+                abort: controller?.signal,
+              }).finally(() => {
+                if (timer) clearTimeout(timer)
+              })
+            }).pipe(Effect.orDie)
+            const output = Buffer.concat([result.stdout, result.stderr]).toString()
+            return { output, exitCode: result.code }
+          }),
+        )
+      }
+
+      // Human-in-the-loop step (Tasks 12/13). Persists a pending question on the
+      // run, records it as a `kind:"question"` journal node, and waits LIVE for an
+      // answer (a Deferred resolved by the service `answer()` method) racing a
+      // timeout (default 10 minutes). It deliberately does NOT consume an agent
+      // dispatch, the budget, or the lifetime cap — a question is not an LLM step.
+      const question: ContextApi["question"] = (questionInput) => {
+        // Gate exactly like ctx.agent/ctx.shell: a fired signal or a landed
+        // cancel/pause means the run is unwinding, so refuse to ask.
+        if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
+        const phase = active.run.current_phase
+        const node: AgentRun = {
+          id: `${active.run.agents.length + 1}`,
+          status: "running",
+          started_at: Date.now(),
+          phase,
+          kind: "question",
+          // The question text rides on `prompt` so it shares the journal-node
+          // shape (and the resume key is built from it, like an agent prompt).
+          prompt: questionInput.question,
+        }
+        active.run.agents.push(node)
+        // Resume replay: a resumed run that was parked on this exact question
+        // ([question, phase]) is served the SEEDED answer from the question journal
+        // — no live ask, no pending_question. Mirrors the agent-journal replay:
+        // mark the node completed + cached, record the answer, return it.
+        const replayKey = questionJournalKey({ question: questionInput.question, phase })
+        const seeded = active.questionJournal?.get(replayKey)
+        if (seeded !== undefined) {
+          node.status = "completed"
+          node.completed_at = Date.now()
+          node.answer = seeded
+          node.cached = true
+          persistInScope(active, bridge, db, events)
+          return Promise.resolve({ answer: seeded })
+        }
+        // Live path: persist the open question (emits workflow.run.updated with
+        // pending_question:true) and park on a Deferred + timeout race. The wait
+        // runs through `dispatch` (forked into the run scope) so an external
+        // pause()/cancel() that closes the run scope interrupts it — exactly like
+        // a hung ctx.agent. `answer()` resolves the Deferred to wake it live.
+        const timeout = questionInput.timeout ?? DEFAULT_QUESTION_TIMEOUT_MS
+        const options = questionInput.options ? [...questionInput.options] : undefined
+        return dispatch(
+          Effect.gen(function* () {
+            const deferred = yield* Deferred.make<{ answer: string }>()
+            // Publish the open question and register the Deferred so answer() can
+            // find + resolve it. Set BEFORE persist so a concurrent answer() that
+            // observes the persisted pending_question also sees the live Deferred.
+            active.pendingQuestion = { deferred, node }
+            active.run.pending_question = { question: questionInput.question, options, asked_at: node.started_at }
+            yield* persistRun(db, events, active)
+            // Race the answer against the timeout. `timeoutOption` is interruptible,
+            // so a run-scope close (external pause/cancel) unwinds this wait too.
+            const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(timeout))
+            return result
+          }),
+        ).then((result) => {
+          // Resolve (answer landed) or park (timeout). Either way the question is no
+          // longer pending in-memory.
+          active.pendingQuestion = undefined
+          if (result._tag === "Some") {
+            // Live answer. `answer()` is the authoritative writer (it completes the
+            // node + clears pending_question + persists before resolving the
+            // Deferred), so this branch only needs to hand the reply back to the
+            // body. Idempotently close the node if it was somehow left open, so the
+            // body never proceeds with a still-`running` question node.
+            if (node.status === "running") {
+              active.run.pending_question = undefined
+              node.status = "completed"
+              node.completed_at = Date.now()
+              node.answer = result.value.answer
+              persistInScope(active, bridge, db, events)
+            }
+            return result.value
+          }
+          // Timeout: PARK the run as `paused` via the existing pause machinery.
+          // Keep `pending_question` AND the open question node intact (do NOT
+          // complete the node) so a later answer() can resume. Setting `pausing`
+          // makes the body's matchCauseEffect map this unwind to `paused`, racing
+          // pause()'s own finish idempotently. Throwing CancelledError unwinds the
+          // body the same way an interrupt-driven pause does.
+          active.pausing = true
+          throw new CancelledError()
+        }, (error) => {
+          // An external pause()/cancel() that closed the run scope rejects the
+          // dispatched wait with CancelledError. Drop the dangling in-memory
+          // pending-question reference (the run is unwinding to paused/cancelled via
+          // abortRun's own finish) and let the rejection propagate so the body
+          // unwinds consistently with the rest of the engine.
+          active.pendingQuestion = undefined
+          throw error
+        })
+      }
+
+      // Build the run context for the top-level body OR a depth-1 nested workflow.
+      // Captured here so `ctx.workflow` (below) can re-enter it with a bumped
+      // `depth` and a `logPrefix`, sharing the SAME `active` — and thus the same
+      // concurrency semaphore, budget, abort scope, and agent-lifetime cap.
+      const buildContext = (ctxInput: {
+        depth: number
+        logPrefix?: string
+        phases?: readonly Phase[]
+      }): ContextApi =>
+        createContext({
+          active,
+          agent,
+          shell,
+          question,
+          workflow: (name, childArgs) => runNested(ctxInput.depth, name, childArgs),
+          logPrefix: ctxInput.logPrefix,
+          // Task 15: each context carries ITS OWN module's declared phases so
+          // setPhase resolves the per-phase default model (and undeclared warning)
+          // against the right list — the top-level run's phases, or a nested
+          // child's own phases.
+          phases: ctxInput.phases,
+          persist: () => void persistInScope(active, bridge, db, events),
+          signal: () => runSignal,
+          dispatch,
+        })
+
+      // Depth-1 nesting: run another DISCOVERED workflow inline under the SAME run
+      // (no second run row). It shares this run's `active`, so the concurrency
+      // semaphore, budget, abort scope, and agent-lifetime cap all carry over
+      // automatically — the child's `ctx.agent` dispatches funnel through the same
+      // `agent` closure and count against the same gates. The parent run was
+      // already approved (its own start went through the permission gate), so the
+      // child loads with NO additional permission ask. A nested call (the child
+      // itself calling ctx.workflow) is refused: nesting is limited to depth 1.
+      //
+      // A hoisted `function` declaration (not a `const` arrow) so `buildContext`
+      // above can reference it without a temporal-dead-zone smell, even though
+      // the reference is only invoked lazily once `ctx.workflow` is called.
+      async function runNested(parentDepth: number, name: string, childArgs?: Record<string, unknown>) {
+        if (parentDepth >= 1) {
+          throw new InvalidError({
+            path: active.run.workflow,
+            message: "ctx.workflow nesting is limited to depth 1",
+          })
+        }
+        // Load the named workflow via the existing discovery + loadModule path
+        // (discoverWorkflows reads InstanceState, so run it through `dispatch`).
+        // No permission ask: the parent run is already approved.
+        const discovered = await dispatch(discoverWorkflows())
+        const target = discovered.find((item) => item.name === name)
+        if (!target) {
+          throw new InvalidError({ path: active.run.workflow, message: `Workflow not found: ${name}` })
+        }
+        const childModule = await loadModule(target.path, target.source)
+        const coerced = coerceArgs(childArgs, childModule.meta.arguments, target.path)
+        if (coerced instanceof InvalidError) throw coerced
+        // Child context shares `active`; depth+1 closes the nesting at 1 and the
+        // logPrefix attributes the child's logs/phases without a second run row.
+        const childCtx = buildContext({
+          depth: parentDepth + 1,
+          logPrefix: `${name}: `,
+          phases: childModule.meta.phases,
+        })
+        // The child writes its (prefixed) phase into the SHARED
+        // `active.run.current_phase` and its per-phase default model into the SHARED
+        // `active.currentPhaseModel`. Snapshot BOTH parent values and restore them
+        // after the child returns (resolve OR throw) so a parent log/agent dispatched
+        // after the nested call is attributed to the parent's phase AND resolves the
+        // parent's phase-default model, not the child's leftover ones.
+        const parentPhase = active.run.current_phase
+        const parentPhaseModel = active.currentPhaseModel
+        try {
+          return await childModule.run(coerced ?? {}, childCtx)
+        } finally {
+          active.run.current_phase = parentPhase
+          active.currentPhaseModel = parentPhaseModel
+        }
       }
 
       // Fund 5 (TOCTOU): a cancel/remove can land during the startup window —
@@ -1960,16 +2789,7 @@ export const layer = Layer.effect(
 
       active.fiber = yield* Effect.promise((signal) => {
         runSignal = signal
-        return module.run(
-          args ?? {},
-          createContext({
-            active,
-            agent,
-            persist: () => void persistInScope(active, bridge, db),
-            signal: () => runSignal,
-            dispatch,
-          }),
-        )
+        return module.run(args ?? {}, buildContext({ depth: 0, phases: module.meta.phases }))
       }).pipe(
         Effect.matchCauseEffect({
           onSuccess: (result) => finish(id, "completed", { result }),
@@ -1995,6 +2815,15 @@ export const layer = Layer.effect(
             ),
         }),
         Effect.asVoid,
+        // OTel: wrap the whole run body in a `workflow.run` span so HTTP/CI/server
+        // operators get observability for a run (the engine had ZERO spans before;
+        // only the generic Tool.execute span wrapped a subagent's tool calls). The
+        // span is purely observational — it sits AFTER matchCauseEffect/asVoid so it
+        // never alters the run's success/cancel/fail mapping. Attribute style mirrors
+        // the repo convention (dotted lowercase keys, e.g. tool.name/session.id).
+        Effect.withSpan("workflow.run", {
+          attributes: { "workflow.run_id": id, "workflow.name": active.run.workflow },
+        }),
         // Fork lazily (no `startImmediately`) so this returns the fiber handle
         // immediately. With `startImmediately` the runtime drives the run body
         // synchronously into the first agent step, blocking `start` and leaving
@@ -2157,6 +2986,55 @@ export const layer = Layer.effect(
       return finished ?? (yield* persisted())
     })
 
+    const answer: Interface["answer"] = Effect.fn("Workflow.answer")(function* (input) {
+      const id = input.id
+      const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
+      // LIVE run waiting in ctx.question: this is the authoritative writer. Complete
+      // the question node + clear the persisted pending_question + persist, THEN
+      // resolve the Deferred so the parked ctx.question wakes and hands { answer }
+      // to the body. The returned snapshot already reflects the cleared question.
+      if (active && active.run.status === "running" && active.pendingQuestion) {
+        const { deferred, node } = active.pendingQuestion
+        active.pendingQuestion = undefined
+        active.run.pending_question = undefined
+        node.status = "completed"
+        node.completed_at = yield* Clock.currentTimeMillis
+        node.answer = input.answer
+        yield* persistRun(db, events, active)
+        yield* Deferred.succeed(deferred, { answer: input.answer }).pipe(Effect.ignore)
+        return snapshot(active)
+      }
+      // No live open question. Consult the (directory-scoped) DB row: a `paused` run
+      // with a persisted `pending_question` is resumed — start a NEW run keyed off
+      // the source, seeding the answer into the question journal so the replayed
+      // ctx.question returns it instead of asking again. Any other state (no pending
+      // question, terminal, unknown id, foreign directory) ⇒ undefined.
+      const directory = yield* InstanceState.directory
+      const row = yield* db
+        .select()
+        .from(WorkflowRunTable)
+        .where(and(eq(WorkflowRunTable.id, id), eq(WorkflowRunTable.directory, directory)))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row || row.status !== "paused" || !row.pending_question) return undefined
+      // Resume: re-run the SAME workflow, replaying the agent journal AND serving
+      // the seeded answer to the question node. The caller's execution options
+      // (prompt-ops vector, permissionSessionID, caller, budget) are forwarded
+      // UNCHANGED so a workflow that asks a question and then dispatches more
+      // `ctx.agent` steps can run those steps live on the resumed run — without
+      // them the post-question agent step would fail ("requires prompt operations").
+      return yield* start({
+        name: row.workflow,
+        args: row.args ?? undefined,
+        resume_of: id,
+        questionAnswers: { [row.pending_question.question]: input.answer },
+        prompt: input.prompt,
+        permissionSessionID: input.permissionSessionID,
+        caller: input.caller,
+        budget: input.budget,
+      })
+    })
+
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
       const inst = yield* InstanceState.get(state)
       const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
@@ -2196,7 +3074,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, runs, get, start, wait, cancel, pause, remove, sweep })
+    return Service.of({ list, runs, get, start, wait, cancel, pause, answer, remove, sweep })
   }),
 )
 
@@ -2206,6 +3084,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Agent.defaultLayer),
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
+  Layer.provide(EventV2Bridge.defaultLayer),
 )
 
 export * as Workflow from "./workflow"

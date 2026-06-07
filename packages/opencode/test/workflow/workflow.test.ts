@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
+import { Permission } from "@/permission"
 import { Agent } from "@/agent/agent"
 import { SessionID } from "@/session/schema"
 import type { SessionPrompt } from "@/session/prompt"
@@ -12,6 +14,7 @@ import { MessageID } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { eq, sql } from "drizzle-orm"
 import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"
+import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Deferred, Effect, Fiber, Layer } from "effect"
 import { Global } from "@opencode-ai/core/global"
@@ -32,6 +35,11 @@ const it = testEffect(
     Session.defaultLayer,
     Agent.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
+    // EventV2Bridge.defaultLayer is merged so a test can subscribe to the SAME bus
+    // instance the engine publishes run-lifecycle events on. It is the identical
+    // exported const reference the Workflow layer provides internally, so Effect's
+    // layer memoisation resolves both to ONE instance (exactly as for Database).
+    EventV2Bridge.defaultLayer,
   ),
 )
 
@@ -204,6 +212,241 @@ export async function run(args, ctx) {
 }
 `
 
+// Per-step reasoning variant fixture (Task 6): a single agent step that passes a
+// `variant` through to the engine. The engine must thread that variant into the
+// underlying prompt run (PromptInput.variant) unchanged.
+const VARIANT_FIXTURE = "variant-step"
+const VARIANT_WORKFLOW = `export const meta = { name: "${VARIANT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", variant: "max" })
+  return { ok: true }
+}
+`
+
+// model:"small" fixture (Task 7): a single agent step that requests the magic
+// "small" model. The engine must resolve this to the configured small_model and
+// dispatch the prompt against that provider/model.
+const SMALL_MODEL_FIXTURE = "small-model-step"
+const SMALL_MODEL_WORKFLOW = `export const meta = { name: "${SMALL_MODEL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", model: "small" })
+  return { ok: true }
+}
+`
+
+// Per-phase default model fixture (Task 15): a structured phase declares a
+// default `model`. The first ctx.agent call (no explicit model) must resolve to
+// that phase default; the second call passes an EXPLICIT model that must win over
+// the phase default.
+const PHASE_MODEL_FIXTURE = "phase-model"
+const PHASE_MODEL_WORKFLOW = `export const meta = {
+  name: "${PHASE_MODEL_FIXTURE}",
+  phases: ["plan", { title: "verify", model: "stub/mini" }]
+}
+export async function run(args, ctx) {
+  ctx.setPhase("verify")
+  await ctx.agent({ prompt: "hi" })
+  await ctx.agent({ prompt: "hi", model: "other/explicit" })
+  return { ok: true }
+}
+`
+
+// Undeclared-phase fixture (Task 15): setPhase on a phase NOT in meta.phases is
+// allowed (no error) but logs a warning. The run still completes.
+const UNDECLARED_PHASE_FIXTURE = "undeclared-phase"
+const UNDECLARED_PHASE_WORKFLOW = `export const meta = { name: "${UNDECLARED_PHASE_FIXTURE}", phases: ["plan"] }
+export async function run(args, ctx) {
+  ctx.setPhase("undeclared")
+  return { ok: true }
+}
+`
+
+// Per-step tools-scoping fixture (Task 8): a single agent step that passes a
+// `tools` whitelist/blacklist. The engine must thread that Record<string,boolean>
+// through to the prompt run (PromptInput.tools) unchanged so the session scopes
+// its tools accordingly.
+const TOOLS_FIXTURE = "tools-step"
+const TOOLS_WORKFLOW = `export const meta = { name: "${TOOLS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", tools: { webfetch: false } })
+  return { ok: true }
+}
+`
+
+// Security-compose fixture: a single agent step that tries to RE-GRANT a tool
+// (\`edit\`) the inherited caller permission denies (Plan Mode). The per-step
+// grant must NOT override the inherited deny — the composed child-session
+// ruleset must still deny \`edit\`.
+const TOOLS_REGRANT_FIXTURE = "tools-regrant-step"
+const TOOLS_REGRANT_WORKFLOW = `export const meta = { name: "${TOOLS_REGRANT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", tools: { edit: true } })
+  return { ok: true }
+}
+`
+
+// Per-step skills fixture (Task 9): a single agent step that requests specific
+// skills. opencode only loads skills via the runtime \`skill\` tool, so the engine
+// prepends a load directive to the prompt and enables the skill tool for the step.
+const SKILLS_FIXTURE = "skills-step"
+const SKILLS_WORKFLOW = `export const meta = { name: "${SKILLS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "do it", skills: ["pdf", "xlsx"] })
+  return { ok: true }
+}
+`
+
+// Declarative file-attachments fixture (Task 10): a single agent step that
+// attaches an existing file by path. The engine must resolve the path relative
+// to the run's workspace directory and append a file part after the text part.
+const FILES_FIXTURE = "files-step"
+const FILES_WORKFLOW = `export const meta = { name: "${FILES_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", files: ["./ATTACH.md"] })
+  return { ok: true }
+}
+`
+
+// Missing-file variant of the Task 10 fixture: a non-existent attachment must
+// fail the run with a WorkflowInvalidError naming the missing file.
+const FILES_MISSING_FIXTURE = "files-missing-step"
+const FILES_MISSING_WORKFLOW = `export const meta = { name: "${FILES_MISSING_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", files: ["./DOES_NOT_EXIST.md"] })
+  return { ok: true }
+}
+`
+
+
+// Task 11: a single agent step requesting worktree isolation. When the workspace
+// is a git repository the engine runs the subagent inside a fresh `git worktree`
+// (auto-cleaned on the run scope); a non-git workspace fails the step with a
+// WorkflowInvalidError naming the missing git repository.
+const ISOLATION_FIXTURE = "isolation-step"
+const ISOLATION_WORKFLOW = `export const meta = { name: "${ISOLATION_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", isolation: "worktree" })
+  return { ok: true }
+}
+`
+
+// Task 11a (deterministic non-LLM shell step): ctx.shell runs a command in the
+// run's workspace and returns { output, exitCode } WITHOUT consuming an LLM turn
+// or budget. A non-zero exit is mapped to the return value (never thrown), and
+// ctx.budget.spent() stays 0 because shell never touches the cost accumulator.
+const SHELL_FIXTURE = "shell-step"
+const SHELL_WORKFLOW = `export const meta = { name: "${SHELL_FIXTURE}", phases: ["run"] }
+export async function run(_args, ctx) {
+  ctx.setPhase("run")
+  const ok = await ctx.shell("echo hello-workflow")
+  const fail = await ctx.shell("exit 3")
+  return { out: ok.output.trim(), okCode: ok.exitCode, failCode: fail.exitCode, spent: ctx.budget.spent() }
+}
+`
+
+// Task 11a (real timeout): ctx.shell with a short timeout kills a hung command and
+// resolves PROMPTLY with a non-zero exitCode (not a hang, not a throw). The fixture
+// records elapsed wall-clock so the test can prove the timeout fired well before
+// the command's natural duration.
+const SHELL_TIMEOUT_FIXTURE = "shell-timeout-step"
+const SHELL_TIMEOUT_WORKFLOW = `export const meta = { name: "${SHELL_TIMEOUT_FIXTURE}", phases: ["run"] }
+export async function run(_args, ctx) {
+  ctx.setPhase("run")
+  const started = Date.now()
+  const r = await ctx.shell("sleep 5", { timeout: 100 })
+  const elapsed = Date.now() - started
+  return { exitCode: r.exitCode, elapsed }
+}
+`
+
+// Task 11b (depth-1 nesting): a parent workflow runs a DISCOVERED child workflow
+// inline via ctx.workflow under the SAME run (no second run row). The child's
+// logs are prefixed (`child: ...`) and its result flows back to the parent.
+const NEST_CHILD_FIXTURE = "child"
+const NEST_CHILD_WORKFLOW = `export const meta = { name: "${NEST_CHILD_FIXTURE}", description: "c" }
+export async function run(args, ctx) {
+  ctx.log("child-ran")
+  return { doubled: Number(args.n) * 2 }
+}
+`
+const NEST_PARENT_FIXTURE = "parent"
+const NEST_PARENT_WORKFLOW = `export const meta = { name: "${NEST_PARENT_FIXTURE}", description: "p" }
+export async function run(_a, ctx) {
+  const r = await ctx.workflow("child", { n: 21 })
+  return { fromChild: r.doubled }
+}
+`
+
+// Task 11b (phase restore): a child that sets its own phase must NOT leak it back
+// to the parent. The parent sets "plan", runs a child that sets "research", then
+// logs again — that final parent log must carry the parent's "plan" phase, not the
+// child's leftover "child-phase: research".
+const NEST_PHASE_CHILD_FIXTURE = "phase-child"
+const NEST_PHASE_CHILD_WORKFLOW = `export const meta = { name: "${NEST_PHASE_CHILD_FIXTURE}", description: "pc" }
+export async function run(args, ctx) {
+  ctx.setPhase("research")
+  ctx.log("inside-child")
+  return { ok: true }
+}
+`
+const NEST_PHASE_PARENT_FIXTURE = "phase-parent"
+const NEST_PHASE_PARENT_WORKFLOW = `export const meta = { name: "${NEST_PHASE_PARENT_FIXTURE}", description: "pp" }
+export async function run(_a, ctx) {
+  ctx.setPhase("plan")
+  await ctx.workflow("phase-child", {})
+  ctx.log("after-nested")
+  return { ok: true }
+}
+`
+
+// Task 11b (depth guard): a child that ITSELF calls ctx.workflow must be refused —
+// nesting is limited to depth 1, so the nested call throws a WorkflowInvalidError
+// and the run fails with that error.
+const NEST_GRANDCHILD_FIXTURE = "grandchild"
+const NEST_GRANDCHILD_WORKFLOW = `export const meta = { name: "${NEST_GRANDCHILD_FIXTURE}", description: "gc" }
+export async function run(args, ctx) { return { ok: true } }
+`
+const NEST_DEEP_CHILD_FIXTURE = "deep-child"
+const NEST_DEEP_CHILD_WORKFLOW = `export const meta = { name: "${NEST_DEEP_CHILD_FIXTURE}", description: "dc" }
+export async function run(args, ctx) {
+  // depth-2 attempt: this nested ctx.workflow must throw.
+  return await ctx.workflow("grandchild", {})
+}
+`
+const NEST_DEEP_PARENT_FIXTURE = "deep-parent"
+const NEST_DEEP_PARENT_WORKFLOW = `export const meta = { name: "${NEST_DEEP_PARENT_FIXTURE}", description: "dp" }
+export async function run(_a, ctx) {
+  return await ctx.workflow("deep-child", {})
+}
+`
+
+// Task 11b (c) (shared agent-lifetime cap): a parent that dispatches one agent and
+// then runs a child that dispatches more — collectively exceeding the run's
+// (test-lowered) agent-lifetime cap. The cap is shared via the SAME run, so the
+// over-cap dispatch (inside the child) fails the WHOLE run with AgentLimitError.
+const NEST_AGENT_CHILD_FIXTURE = "agent-child"
+const NEST_AGENT_CHILD_WORKFLOW = `export const meta = { name: "${NEST_AGENT_CHILD_FIXTURE}", description: "ac" }
+export async function run(args, ctx) {
+  for (let i = 0; i < args.count; i++) await ctx.agent({ prompt: "child step " + i })
+  return { ok: true }
+}
+`
+const NEST_AGENT_PARENT_FIXTURE = "agent-parent"
+const NEST_AGENT_PARENT_WORKFLOW = `export const meta = { name: "${NEST_AGENT_PARENT_FIXTURE}", description: "ap" }
+export async function run(_a, ctx) {
+  await ctx.agent({ prompt: "parent step" })
+  return await ctx.workflow("agent-child", { count: 10 })
+}
+`
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -212,6 +455,62 @@ function immediatePromptOps() {
     cancel: () => Effect.void,
   }
   return ops
+}
+
+// Capturing prompt-ops: resolve every agent prompt immediately (like
+// immediatePromptOps) but capture each real (non-noReply) PromptInput so a test
+// can assert on what the engine actually dispatched (e.g. its resolved `variant`
+// or `model`). The initial "Workflow started" noReply message is skipped so only
+// genuine ctx.agent dispatches are recorded. Named distinctly from the journal
+// `recordingPromptOps` below so the two never collide via function hoisting.
+function capturingPromptOps() {
+  const inputs: SessionPrompt.PromptInput[] = []
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.sync(() => {
+        if (!input.noReply) inputs.push(input)
+        return assistantReply()
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, inputs }
+}
+
+// Directory-capturing prompt-ops: like capturingPromptOps, but for each real
+// (non-noReply) dispatch it ALSO records the EFFECTIVE instance directory the
+// prompt runs under (`InstanceState.directory`). This is the directory the
+// subagent's file tools (bash/edit/write/read) resolve their cwd against — so
+// recording it from INSIDE the prompt-op Effect proves whether worktree
+// isolation actually redirects the child (the assertion target for Task 11),
+// not merely that a worktree was created.
+function directoryCapturingPromptOps() {
+  const inputs: SessionPrompt.PromptInput[] = []
+  const directories: string[] = []
+  // Whether the captured directory contained a `.git` entry AT DISPATCH TIME
+  // (i.e. while the worktree was still live) — proving it was a real git
+  // worktree, observed before the run-scope finalizer removes it.
+  const wasGitWorktree: boolean[] = []
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (!input.noReply) {
+          inputs.push(input)
+          const dir = yield* InstanceState.directory
+          directories.push(dir)
+          wasGitWorktree.push(
+            yield* Effect.promise(() =>
+              fs
+                .stat(path.join(dir, ".git"))
+                .then(() => true)
+                .catch(() => false),
+            ),
+          )
+        }
+        return assistantReply()
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, inputs, directories, wasGitWorktree }
 }
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
@@ -249,6 +548,14 @@ export async function run(args, ctx) { ctx.setPhase("run"); return null }
 const VOID_RESULT_FIXTURE = "void-result"
 const VOID_RESULT_WORKFLOW = `export const meta = { name: "${VOID_RESULT_FIXTURE}", phases: ["run"] }
 export async function run(args, ctx) { ctx.setPhase("run") }
+`
+
+// A minimal single-phase, zero-agent workflow used by the bus-event test: it sets
+// the phase and returns a value, so the run goes running -> completed through the
+// same persistRun choke-point every state write uses — no provider stubbing needed.
+const EVENTS_FIXTURE = "events"
+const EVENTS_WORKFLOW = `export const meta = { name: "${EVENTS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) { ctx.setPhase("run"); return { ok: true } }
 `
 
 // N2/N13-Fixture: ein Workflow, dessen Rückgabewert NICHT strukturell klonbar ist
@@ -361,6 +668,44 @@ export async function run(args, ctx) {
   const options = args.concurrencyLimit === undefined ? undefined : { concurrencyLimit: args.concurrencyLimit }
   const result = await ctx.parallel(tasks, options)
   return { peak: __b.peak, result }
+}
+`
+
+// P1 (Claude parity): a rejecting task in ctx.parallel must NOT kill the whole
+// batch — it resolves to `null` at its position, the surviving tasks keep their
+// values, and the drop is LOGGED (never silent). Module uses `export default`
+// so the resolved-object load path is exercised too.
+const PARALLEL_ERROR_FIXTURE = "par-err"
+const PARALLEL_ERROR_WORKFLOW = `export default {
+  meta: { name: "${PARALLEL_ERROR_FIXTURE}", description: "parallel error tolerance" },
+  async run(_args, ctx) {
+    const out = await ctx.parallel([
+      () => Promise.resolve("ok-1"),
+      () => Promise.reject(new Error("boom")),
+      () => Promise.resolve("ok-3"),
+    ])
+    return { out }
+  },
+}
+`
+
+// P2 (Claude parity): a throwing stage in ctx.pipeline must NOT kill the whole
+// pipeline — it drops ONLY that item to `null` at its position and skips that
+// item's remaining stages, while the other items run every stage to completion;
+// the drop is LOGGED (never silent). Module uses `export default` so the
+// resolved-object load path is exercised too.
+const PIPELINE_ERROR_FIXTURE = "pipe-err"
+const PIPELINE_ERROR_WORKFLOW = `export default {
+  meta: { name: "${PIPELINE_ERROR_FIXTURE}", description: "pipeline per-item drop" },
+  async run(_args, ctx) {
+    const calls: string[] = []
+    const out = await ctx.pipeline(
+      [1, 2, 3],
+      async (prev) => { if (prev === 2) throw new Error("stage1-boom"); calls.push("s1:" + prev); return prev * 10 },
+      async (prev, item) => { calls.push("s2:" + item); return prev + 1 },
+    )
+    return { out, calls }
+  },
 }
 `
 
@@ -821,6 +1166,26 @@ export async function run(args, ctx) {
 }
 `
 
+// ctx.budget (Claude-Code-Parität) MIT gesetztem Budget: liest total/spent()/
+// remaining() OHNE Agent-Step, sodass spent()===0 und remaining()===total gilt.
+const BUDGET_API_FIXTURE = "budget-api"
+const BUDGET_API_WORKFLOW = `export const meta = { name: "${BUDGET_API_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  return { total: ctx.budget.total, spent: ctx.budget.spent(), remaining: ctx.budget.remaining() }
+}
+`
+
+// ctx.budget OHNE Budget: total ist null und remaining() ist Infinity. Infinity
+// überlebt JSON nicht, daher gibt das Fixture stattdessen einen Booleschen zurück.
+const BUDGET_API_UNLIMITED_FIXTURE = "budget-api-unlimited"
+const BUDGET_API_UNLIMITED_WORKFLOW = `export const meta = { name: "${BUDGET_API_UNLIMITED_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  return { total: ctx.budget.total, remainingFinite: Number.isFinite(ctx.budget.remaining()) }
+}
+`
+
 // Fund 18/19/20 (Argument-Koerzierung & Defaults): ein Workflow, der die
 // deklarierten args UND deren JS-Laufzeittypen 1:1 ins Resultat zurückgibt.
 // Über `typeof` kann der Test beweisen, dass die Engine String-eingehende args
@@ -995,6 +1360,43 @@ export async function run(args, ctx) {
 }
 `
 
+// Tasks 12/13 (ctx.question): ein Workflow, der EINE Frage stellt und die Antwort
+// zurückgibt. Wird live beantwortet (Deferred), bevor das Timeout feuert. Der
+// Question-Node landet als Journal-Step (kind:"question"), so dass ein Resume die
+// Antwort aus dem Journal serviert statt erneut zu fragen.
+const QUESTION_FIXTURE = "ask-question"
+const QUESTION_WORKFLOW = `export const meta = { name: "${QUESTION_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "deploy?", options: ["yes", "no"] })
+  return { answer: a.answer }
+}
+`
+// Timeout-Variante: dieselbe Frage, aber mit winzigem Timeout. Wird sie nicht
+// rechtzeitig beantwortet, PARKT der Run als `paused` über die bestehende
+// Pause-Maschinerie, die offene Question wird persistiert (pending_question).
+const QUESTION_TIMEOUT_FIXTURE = "ask-question-timeout"
+const QUESTION_TIMEOUT_WORKFLOW = `export const meta = { name: "${QUESTION_TIMEOUT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "deploy?", options: ["yes", "no"], timeout: 50 })
+  return { answer: a.answer }
+}
+`
+// Question-then-agent: asks a question that times out (parks as paused), then
+// dispatches a real ctx.agent step that depends on the answer. The resume that
+// answer() triggers must thread the prompt-ops vector so this agent step can run
+// LIVE on the resumed run (the question is replayed from the journal).
+const QUESTION_AGENT_FIXTURE = "q-then-agent"
+const QUESTION_AGENT_WORKFLOW = `export const meta = { name: "${QUESTION_AGENT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "go?", timeout: 50 })
+  const r = await ctx.agent({ prompt: "after-" + a.answer })
+  return { answer: a.answer, agentText: r.text }
+}
+`
+
 // Prompt-Ops für den Drift-Test: zählt jeden GEFEUERTEN (live) Prompt und liefert,
 // wenn ein Schema angefordert wurde (input.format gesetzt), eine strukturierte
 // Antwort (message.info.structured) — sonst PLAINTEXT, dessen Text KEIN gültiges
@@ -1053,6 +1455,55 @@ function recordingPromptOps(db: Database.Interface["db"], cost = 0) {
 }
 
 describe("Workflow", () => {
+  // The engine must publish run-lifecycle bus events from persistRun so non-TUI
+  // consumers (dashboard, plugins) can observe a run instead of polling. A run
+  // crosses persistRun at least once while `running` and once at its terminal
+  // transition, so a subscriber must see >=1 `workflow.run.updated` (running)
+  // and a final `workflow.run.finished` (completed). The payload is the SLIM
+  // shape: `agents` is a COUNT object, never the full array.
+  it.instance("publishes workflow.run.updated/finished bus events with a slim payload", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, EVENTS_FIXTURE, EVENTS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const events = yield* EventV2Bridge.Service
+      const seen: Array<{ type: string; data: Record<string, unknown> }> = []
+      const unsub = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === "workflow.run.updated" || event.type === "workflow.run.finished")
+            seen.push({ type: event.type, data: event.data as Record<string, unknown> })
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsub)
+
+      const started = yield* workflow.start({ name: EVENTS_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("events workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // At least one `running` update was seen during the run.
+      const running = seen.filter((e) => e.type === "workflow.run.updated" && e.data["status"] === "running")
+      expect(running.length).toBeGreaterThanOrEqual(1)
+
+      // The final event is the terminal `finished` with status completed.
+      const last = seen.at(-1) ?? (yield* Effect.fail(new Error("no workflow.run events seen")))
+      expect(last.type).toBe("workflow.run.finished")
+      expect(last.data["status"]).toBe("completed")
+
+      // Slim payload: the metadata fields plus an `agents` COUNT object (never the
+      // full agents array).
+      expect(last.data["id"]).toBe(started.id)
+      expect(last.data["workflow"]).toBe(EVENTS_FIXTURE)
+      expect(last.data["current_phase"]).toBe("run")
+      expect(last.data["directory"]).toBe(test.directory)
+      expect(last.data["agents"]).toEqual({ total: 0, running: 0, failed: 0 })
+      expect(Array.isArray(last.data["agents"])).toBe(false)
+      // The slim payload carries a `pending_question` flag (false for a run with
+      // no open human-in-the-loop question — Tasks 12/13).
+      expect(last.data["pending_question"]).toBe(false)
+    }),
+  )
+
   // Fund 48 (deterministic ordering): the pipeline runs each item's stage SEQUENCE
   // independently — there is NO barrier between stages, so item B can be in stage 2
   // while item A is still in stage 1. Previously proven by sleeping item A 80ms in
@@ -1116,6 +1567,54 @@ describe("Workflow", () => {
       // accidental over-clamp to 1).
       expect(result.peak).toBe(2)
       delete globalThis.__workflowTestBarriers![sync.token]
+    }),
+  )
+
+  // P1 (Claude parity): a rejecting parallel task must not fail the whole batch.
+  // It resolves to `null` at its position, the surviving tasks keep their values,
+  // and the drop is logged (never silent). Before this change the first rejection
+  // killed the batch and the run ended `failed`.
+  it.instance("parallel drops a rejecting task to null and logs it instead of failing the batch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, PARALLEL_ERROR_FIXTURE, PARALLEL_ERROR_WORKFLOW, "ts"),
+      )
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PARALLEL_ERROR_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("par-err did not finish")))
+      // The batch survives the rejection.
+      expect(run.status).toBe("completed")
+      expect((run.result as { out: unknown[] }).out).toEqual(["ok-1", null, "ok-3"])
+      // The drop is logged, never silent — and carries the rejection's message.
+      const dropLog = run.logs.find((l) => l.message.includes("parallel task 2 dropped"))
+      expect(dropLog?.message).toContain("boom")
+    }),
+  )
+
+  // P2 (Claude parity): a throwing stage in ctx.pipeline must not fail the whole
+  // pipeline — it drops ONLY that item to `null` at its position and skips that
+  // item's remaining stages; the other items run every stage to completion, and
+  // the drop is logged (never silent). Before this change the first throwing item
+  // aborted the whole pipeline and the run ended `failed`.
+  it.instance("pipeline drops only the throwing item to null and skips its remaining stages", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, PIPELINE_ERROR_FIXTURE, PIPELINE_ERROR_WORKFLOW, "ts"),
+      )
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PIPELINE_ERROR_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("pipe-err did not finish")))
+      expect(run.status).toBe("completed")
+      const r = run.result as { out: unknown[]; calls: string[] }
+      expect(r.out).toEqual([11, null, 31]) // only item 2 dropped
+      expect(r.calls).not.toContain("s2:2") // item 2's remaining stages skipped
+      expect(
+        run.logs.some((l) => l.message.includes("pipeline item 2 dropped") && l.message.includes("stage1-boom")),
+      ).toBe(true)
     }),
   )
 
@@ -2066,6 +2565,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
         "result",
         "error",
         "resume_of",
+        "pending_question",
       ])
       for (const key of Object.keys(liveAny))
         expect(allowed.has(key)).toBe(true)
@@ -2578,6 +3078,42 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const done = yield* workflow.wait({ id: run.id })
       expect(done.run?.status).toBe("completed")
       expect((done.run?.result as { unlimited: boolean }).unlimited).toBe(true)
+    }),
+  )
+
+  // ctx.budget (Claude-Code-Parität) neben ctx.budgetRemaining: mit gesetztem
+  // Budget liefert total den Startwert, spent() den bisher ausgegebenen Betrag
+  // (0 ohne Agent-Step) und remaining() den Rest (== total bei spent()===0).
+  it.instance("ctx.budget exposes total/spent()/remaining() when started with a budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_API_FIXTURE, BUDGET_API_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: BUDGET_API_FIXTURE, args: {}, budget: 5 })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { total: number; spent: number; remaining: number }
+      expect(result.total).toBe(5)
+      expect(result.spent).toBe(0)
+      expect(result.remaining).toBe(5)
+    }),
+  )
+
+  // Ohne Budget: ctx.budget.total ist null und remaining() ist Infinity (nicht
+  // endlich). Infinity überlebt JSON nicht, deshalb prüft das Fixture per Boolean.
+  it.instance("ctx.budget.total is null and remaining() is Infinity without a budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, BUDGET_API_UNLIMITED_FIXTURE, BUDGET_API_UNLIMITED_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: BUDGET_API_UNLIMITED_FIXTURE, args: {} })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { total: number | null; remainingFinite: boolean }
+      expect(result.total).toBe(null)
+      expect(result.remainingFinite).toBe(false)
     }),
   )
 
@@ -3170,6 +3706,77 @@ export async function run() { return { ok: true } }
     }),
   )
 
+  // Security (compose, never override): per-step tool scoping must NEVER re-grant
+  // a tool the inherited subagent permission denies. A caller in Plan Mode denies
+  // `edit`; the step passes `tools: { edit: true }`.
+  //
+  // Before the fix, per-step tools were routed ONLY through PromptInput.tools,
+  // whose prompt-loop handler does a FULL ASSIGNMENT `session.permission =
+  // [tools→rules]` — clobbering the derived ruleset and re-enabling `edit` for the
+  // step. After the fix, when a caller-derived permission exists the per-step
+  // tools are instead COMPOSED into the child session's `permission` at creation,
+  // placed BEFORE the derived denies so (under last-match-wins evaluation) an
+  // inherited deny always beats a per-step grant — and the tools are NO LONGER
+  // passed to prompt.prompt (so the clobbering assignment can't fire).
+  //
+  // Observability: the workflow tests inject fake prompt-ops, so the regression's
+  // runtime clobber can't be seen via the prompt loop. We instead assert the two
+  // fix-visible facts directly: (1) the composed child-session `permission`
+  // CONTAINS the per-step edit grant yet still evaluates `edit` to deny (the
+  // inherited deny wins by ordering); (2) the captured PromptInput carries NO
+  // `tools` for this step (the engine stopped routing through the clobber path).
+  // Both are FALSE before the fix: (1) the create permission never held the
+  // per-step rule, and (2) `tools` was passed straight to prompt.prompt.
+  it.instance("per-step tools cannot re-grant an inherited-denied tool (deny wins)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, TOOLS_REGRANT_FIXTURE, TOOLS_REGRANT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sessions = yield* Session.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      // A Plan-Mode-style caller: edit is denied on the parent session.
+      const caller = yield* sessions.create({
+        title: "Caller",
+        permission: [{ permission: "edit", pattern: "**", action: "deny" }],
+      })
+
+      const run = yield* workflow.start({
+        name: TOOLS_REGRANT_FIXTURE,
+        args: {},
+        prompt: ops,
+        caller: { sessionID: caller.id, agent: "build" },
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("did not finish")))
+      expect(done.status).toBe("completed")
+
+      const childSessionID = done.agents[0]?.session_id
+      expect(childSessionID).toBeDefined()
+      const child = yield* pollWithTimeout(
+        sessions.get(SessionID.make(childSessionID!)).pipe(
+          Effect.map((s) => (s.permission ? s : undefined)),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        ),
+        "child session permission never populated",
+      )
+      const rules = child.permission ?? []
+      // The inherited edit deny is still present...
+      expect(rules).toContainEqual({ permission: "edit", pattern: "**", action: "deny" })
+      // ...the per-step grant was COMPOSED into the SAME ruleset (proving tools
+      // were folded into sessions.create, not routed to the clobbering prompt path)...
+      const grantIdx = rules.findIndex((r) => r.permission === "edit" && r.action === "allow")
+      const denyIdx = rules.findIndex((r) => r.permission === "edit" && r.action === "deny")
+      expect(grantIdx).toBeGreaterThanOrEqual(0)
+      // ...ordered BEFORE the inherited deny (last-match-wins ⇒ deny is later ⇒ deny wins)...
+      expect(grantIdx).toBeLessThan(denyIdx)
+      // ...so `edit` evaluates to deny despite the per-step `tools: { edit: true }`.
+      expect(Permission.evaluate("edit", "anything.ts", rules).action).toBe("deny")
+      // And the per-step tools were NOT routed to prompt.prompt (no clobber path).
+      expect(inputs.length).toBe(1)
+      expect(inputs[0]?.tools).toBeUndefined()
+    }),
+  )
+
   // Fallback (documented behavior): a programmatic start with NO caller context
   // keeps the prior behavior — the child session carries no derived `permission`.
   it.instance("workflow subagent has no inherited ruleset when no caller context is supplied", () =>
@@ -3251,7 +3858,13 @@ export async function run() { return { ok: true } }
       expect(info.path).toBe("builtin:deep-research")
       // Meta wurde rein statisch (ohne Modul-Ausführung) gelesen.
       expect(info.meta.name).toBe("deep-research")
-      expect(info.meta.phases).toEqual(["plan", "research", "verify", "synthesize"])
+      // Phases normalize to the internal object shape (Task 15): strings → { title }.
+      expect(info.meta.phases).toEqual([
+        { title: "plan" },
+        { title: "research" },
+        { title: "verify" },
+        { title: "synthesize" },
+      ])
       expect(info.meta.arguments?.question?.type).toBe("string")
     }),
   )
@@ -3355,6 +3968,17 @@ export async function run() { return { from: "global" } }
     // Temp-Datei wurde im globalen workflows-Verzeichnis geladen und ist danach
     // wieder weg (kein Orphan zurückgelassen).
     expect(await Bun.file(file).exists()).toBe(false)
+  })
+
+  // P1 (Claude parity): ctx.parallel now resolves a dropped (rejecting/agent-
+  // erroring) task to `null` at its position, so the deep-research builtin MUST
+  // filter the parallel results before dereferencing them (research findings and
+  // verify verdicts). Source-string assertion only — a live run needs web tools.
+  test("the deep-research builtin filters dropped parallel results before dereferencing", async () => {
+    const { BUILTIN_WORKFLOWS } = await import("@/workflow/builtin")
+    const src = BUILTIN_WORKFLOWS["deep-research"]
+    expect(src).toContain(".filter((f) => f !== null)")
+    expect(src).toContain(".filter((v) => v !== null)")
   })
   // ===========================================================================
   // Track B — Run-Caps (Concurrency + Lifetime) und Pause/Resume
@@ -3895,6 +4519,639 @@ export async function run() { return { from: "global" } }
       // Der Agent-Node ist NICHT als cached markiert (Cache-MISS → Live-Lauf).
       const node = done.agents.find((a) => a.prompt === "drift agent")
       expect(node?.cached).not.toBe(true)
+    }),
+  )
+
+  // TASK 12/13 — TEST A (live answer): ctx.question persists a pending question on
+  // the run (pending_question + a kind:"question" journal node), emits a
+  // workflow.run.updated event carrying pending_question:true, and waits LIVE for
+  // an answer. workflow.answer({ id, answer }) resolves the Deferred → the body
+  // gets { answer }, the run completes, pending_question is cleared, and the
+  // question node carries the answer.
+  it.instance("ctx.question waits live for an answer, records it on the journal node, clears pending_question", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_FIXTURE, QUESTION_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const events = yield* EventV2Bridge.Service
+      const seenPending: boolean[] = []
+      const unsub = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === "workflow.run.updated") seenPending.push((event.data as Record<string, unknown>)["pending_question"] === true)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsub)
+
+      const run = yield* workflow.start({ name: QUESTION_FIXTURE, args: {}, prompt: immediatePromptOps() })
+
+      // Poll until the pending question is persisted/visible on the run.
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.pending_question?.question === "deploy?" ? current : undefined
+        }),
+        "pending question never appeared",
+      )
+      expect(live.pending_question?.options).toEqual(["yes", "no"])
+      expect(live.status).toBe("running")
+
+      // Answer it live.
+      const answered = yield* workflow.answer({ id: run.id, answer: "yes" })
+      expect(answered?.id).toBe(run.id)
+
+      const done =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("question run did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("yes")
+      // pending_question cleared after the answer.
+      expect(done.pending_question).toBeUndefined()
+      // The journal carries a kind:"question" node with the answer.
+      const qnode = done.agents.find((a) => a.kind === "question")
+      expect(qnode).toBeDefined()
+      expect(qnode?.prompt).toBe("deploy?")
+      expect(qnode?.answer).toBe("yes")
+      expect(qnode?.status).toBe("completed")
+      // At least one workflow.run.updated event carried pending_question:true.
+      expect(seenPending.some((p) => p === true)).toBe(true)
+    }),
+  )
+
+  // TASK 12/13 — TEST B (park + resume): a question with a tiny timeout that goes
+  // unanswered PARKS the run as `paused` (existing pause machinery), keeping the
+  // journal (incl. the open question node) and the persisted pending_question.
+  // workflow.answer on the paused run starts a RESUME (resume_of) whose journal
+  // replay serves the answer to the question node WITHOUT asking again.
+  it.instance("an unanswered ctx.question times out, parks as paused, and answer() resumes serving the reply", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_TIMEOUT_FIXTURE, QUESTION_TIMEOUT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const run = yield* workflow.start({ name: QUESTION_TIMEOUT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+
+      // The timeout (50ms) fires → the run parks as paused.
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("timeout run did not settle")))
+      expect(paused.status).toBe("paused")
+      // The open question node + persisted pending_question survive the park.
+      expect(paused.pending_question?.question).toBe("deploy?")
+      const openNode = paused.agents.find((a) => a.kind === "question")
+      expect(openNode).toBeDefined()
+      expect(openNode?.answer).toBeUndefined()
+
+      // answer() on the paused run starts a NEW resume run.
+      const resumed = yield* workflow.answer({ id: run.id, answer: "no" })
+      expect(resumed).toBeDefined()
+      expect(resumed!.id).not.toBe(run.id)
+      expect(resumed!.resume_of).toBe(run.id)
+
+      const done =
+        (yield* workflow.wait({ id: resumed!.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("no")
+      // No second live ask on the resumed run: the question node carries the
+      // replayed answer and there is no open pending_question.
+      expect(done.pending_question).toBeUndefined()
+      const replayed = done.agents.find((a) => a.kind === "question")
+      expect(replayed?.answer).toBe("no")
+      expect(replayed?.status).toBe("completed")
+    }),
+  )
+
+  // TASK 12/13 follow-up: answer() must forward the SAME execution options start()
+  // accepts for a resume (at minimum the prompt-ops vector), so a workflow that
+  // asks a question and THEN dispatches ctx.agent steps can complete on the resume.
+  // The question times out → parks paused; answer({..., prompt}) starts a resume
+  // that replays the question from the journal AND runs the live agent step.
+  it.instance("answer() forwards prompt ops so a resumed run can dispatch agents after the question", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_AGENT_FIXTURE, QUESTION_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const run = yield* workflow.start({ name: QUESTION_AGENT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+
+      // Unanswered question times out → run parks as paused.
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("q-then-agent did not settle")))
+      expect(paused.status).toBe("paused")
+      expect(paused.pending_question?.question).toBe("go?")
+
+      // answer() with prompt ops → resume that runs the live agent step.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.answer({ id: run.id, answer: "yes", prompt: resumeOps })
+      expect(resumed).toBeDefined()
+      expect(resumed!.resume_of).toBe(run.id)
+
+      const done =
+        (yield* workflow.wait({ id: resumed!.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { answer: string; agentText: string }
+      // The question was replayed (answer served) AND the agent step ran live on
+      // the resumed run, prompted with the answer-dependent text.
+      expect(result.answer).toBe("yes")
+      expect(prompted).toContain("after-yes")
+      expect(result.agentText).toBe("out:after-yes")
+      // The resumed run carries both the (replayed) question node and the live
+      // agent node; no second pending_question.
+      expect(done.pending_question).toBeUndefined()
+      expect(done.agents.find((a) => a.kind === "question")?.answer).toBe("yes")
+      expect(done.agents.some((a) => a.kind !== "question" && a.output === "out:after-yes")).toBe(true)
+    }),
+  )
+
+  // Task 6: a per-step reasoning `variant` passed to ctx.agent must be threaded
+  // verbatim into the underlying prompt run. The recording prompt-ops capture the
+  // real PromptInput, so the dispatched `variant` is asserted directly — proving
+  // ctx.agent({ prompt, variant }) reaches SessionPrompt.prompt as input.variant.
+  it.instance("ctx.agent variant is threaded into the prompt run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, VARIANT_FIXTURE, VARIANT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: VARIANT_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("variant workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // Exactly one real agent dispatch, carrying the requested variant.
+      expect(inputs.length).toBe(1)
+      expect(inputs[0]?.variant).toBe("max")
+    }),
+  )
+
+  // Task 7: ctx.agent({ model: "small" }) must resolve to the configured
+  // small_model and dispatch the prompt against that provider/model. The
+  // capturing prompt-ops record the real PromptInput, so the resolved model is
+  // asserted directly against the configured small_model's providerID/modelID.
+  it.instance(
+    'ctx.agent model:"small" routes to the configured small_model',
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, SMALL_MODEL_FIXTURE, SMALL_MODEL_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, inputs } = capturingPromptOps()
+
+        const started = yield* workflow.start({ name: SMALL_MODEL_FIXTURE, args: {}, prompt: ops })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("small-model workflow did not finish")))
+        expect(done.status).toBe("completed")
+
+        // The dispatch resolved to the configured small_model, not the default agent model.
+        expect(inputs.length).toBe(1)
+        expect(String(inputs[0]?.model?.providerID)).toBe("smallprov")
+        expect(String(inputs[0]?.model?.modelID)).toBe("small-model")
+      }),
+    { config: { small_model: "smallprov/small-model" } },
+  )
+
+  // Task 7 (error path): requesting model:"small" with NO small_model configured
+  // is an authoring error. The agent step must fail with a clear message rather
+  // than silently falling back; the prompt is never dispatched.
+  it.instance("ctx.agent model:\"small\" fails clearly when no small_model is configured", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SMALL_MODEL_FIXTURE, SMALL_MODEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SMALL_MODEL_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("small-model workflow did not finish")))
+
+      // The run failed because the only agent step could not resolve a model.
+      expect(done.status).toBe("failed")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      expect(node?.error).toContain("small_model")
+      // The prompt was never dispatched (no model to run against).
+      expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 8: a per-step `tools` whitelist/blacklist passed to ctx.agent must be
+  // threaded verbatim into the underlying prompt run. opencode's tool-scoping
+  // mechanism is PromptInput.tools (a Record<string,boolean> with glob-able
+  // keys), which the prompt loop turns into session permission rules — so the
+  // capturing prompt-ops record it directly and the dispatched object is
+  // asserted unchanged.
+  it.instance("ctx.agent tools scoping is threaded into the prompt run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, TOOLS_FIXTURE, TOOLS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: TOOLS_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("tools workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // Exactly one real agent dispatch, carrying the requested tools object unchanged.
+      expect(inputs.length).toBe(1)
+      expect(inputs[0]?.tools).toEqual({ webfetch: false })
+    }),
+  )
+
+  // Task 9: a per-step `skills` array passed to ctx.agent must be honoured.
+  // opencode only loads skills via the runtime `skill` tool (no structured
+  // create/prompt field), so the engine prepends a load directive naming the
+  // skills to the prompt text and enables the `skill` tool for the step. Both
+  // are asserted on the captured PromptInput.
+  it.instance("ctx.agent skills are loaded via a prompt directive and the enabled skill tool", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SKILLS_FIXTURE, SKILLS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SKILLS_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("skills workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      expect(inputs.length).toBe(1)
+      // The skill tool is enabled for this step.
+      expect(inputs[0]?.tools?.skill).toBe(true)
+      // The text part carries a directive naming both skills, ahead of the prompt.
+      const textPart = inputs[0]?.parts.find((p) => p.type === "text")
+      expect(textPart?.type).toBe("text")
+      const text = textPart?.type === "text" ? textPart.text : ""
+      expect(text).toContain("pdf")
+      expect(text).toContain("xlsx")
+      expect(text).toContain("do it")
+      // Directive comes BEFORE the author's prompt.
+      expect(text.indexOf("pdf")).toBeLessThan(text.indexOf("do it"))
+    }),
+  )
+
+  // Task 10: a per-step `files` array passed to ctx.agent attaches files
+  // declaratively. Each path resolves relative to the run's workspace directory;
+  // the engine appends a file part (after the text part) whose URL is the
+  // absolute file:// URL of the attachment.
+  it.instance("ctx.agent files are resolved against the workspace and appended as file parts", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "ATTACH.md"), "# attached\n"))
+      yield* Effect.promise(() => writeWorkflow(test.directory, FILES_FIXTURE, FILES_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: FILES_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("files workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      expect(inputs.length).toBe(1)
+      const parts = inputs[0]?.parts ?? []
+      // Text part first, file part appended after it.
+      expect(parts[0]?.type).toBe("text")
+      const filePart = parts.find((p) => p.type === "file")
+      expect(filePart?.type).toBe("file")
+      // The file part resolves to the absolute attachment in the workspace directory.
+      const expectedUrl = pathToFileURL(path.join(test.directory, "ATTACH.md")).href
+      expect(filePart?.type === "file" ? filePart.url : undefined).toBe(expectedUrl)
+    }),
+  )
+
+  // Task 10 (error path): a non-existent attachment is an authoring error. The
+  // agent step must fail with a WorkflowInvalidError naming the missing file
+  // rather than dispatching a broken prompt.
+  it.instance("ctx.agent files fails clearly when an attachment does not exist", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, FILES_MISSING_FIXTURE, FILES_MISSING_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: FILES_MISSING_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("files-missing workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      expect(node?.error).toContain("DOES_NOT_EXIST.md")
+      // The prompt was never dispatched (the attachment could not be resolved).
+      expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 11: ctx.agent({ isolation: "worktree" }) runs the subagent inside a
+  // FRESH git worktree so parallel agents that mutate files do not conflict. The
+  // load-bearing assertion is that the EFFECTIVE instance directory the prompt
+  // runs under (what the subagent's file tools resolve cwd against) is the
+  // worktree path — NOT the run's workspace directory. The directory-capturing
+  // prompt-ops read InstanceState.directory from inside the dispatch, so we can
+  // assert real isolation rather than merely "a worktree was created". After the
+  // run finishes the worktree must be gone (run-scope finalizer cleaned it up).
+  it.instance(
+    "ctx.agent isolation:\"worktree\" runs the subagent in a fresh git worktree and cleans it up",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, inputs, directories, wasGitWorktree } = directoryCapturingPromptOps()
+
+        const started = yield* workflow.start({ name: ISOLATION_FIXTURE, args: {}, prompt: ops })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("isolation workflow did not finish")))
+        expect(done.status).toBe("completed")
+
+        // Exactly one real agent dispatch.
+        expect(inputs.length).toBe(1)
+        const effectiveDir = directories[0]
+        // The subagent ran under a DIFFERENT directory than the workspace — this
+        // is the load-bearing proof of real isolation: the prompt run (and so the
+        // subagent's file tools) resolves cwd against the worktree, not the
+        // workspace. Before the InstanceRef override this was the workspace dir.
+        expect(effectiveDir).toBeDefined()
+        expect(effectiveDir).not.toBe(test.directory)
+        // It was a real git worktree at dispatch time: it had a `.git` entry (a
+        // worktree's `.git` is a file pointing at the parent's gitdir), observed
+        // live before the finalizer removed it.
+        expect(wasGitWorktree[0]).toBe(true)
+        // The worktree lived OUTSIDE the workspace (a sibling temp dir), so it can
+        // never collide with the workspace or another step's worktree.
+        expect(effectiveDir!.startsWith(test.directory)).toBe(false)
+
+        // Run-scope finalizer cleans up the worktree. On a normal finish the run
+        // scope is closed fire-and-forget (so the terminal return is never delayed
+        // by a finalizer), meaning cleanup is async relative to wait() — poll for
+        // the directory to disappear rather than asserting it synchronously.
+        yield* pollWithTimeout(
+          Effect.promise(() =>
+            fs
+              .stat(effectiveDir!)
+              .then(() => undefined)
+              .catch(() => true as const),
+          ),
+          `worktree ${effectiveDir} was not cleaned up after the run finished`,
+        )
+      }),
+    { git: true },
+  )
+
+  // Task 11 (error path): isolation:"worktree" in a NON-git workspace is an
+  // authoring/environment error. The step must fail with a clear
+  // WorkflowInvalidError naming the missing git repository rather than crashing,
+  // and the prompt is never dispatched.
+  it.instance("ctx.agent isolation:\"worktree\" fails clearly outside a git repository", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: ISOLATION_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("isolation workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toContain("requires a git repository")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      // The prompt was never dispatched (no worktree to run in).
+      expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 11a: ctx.shell runs a real command in the run's workspace and returns
+  // { output, exitCode } without an LLM turn. A successful command reports
+  // exitCode 0 and its stdout; a non-zero exit is returned (failCode === 3), never
+  // thrown; and ctx.budget.spent() is 0 because shell never touches the budget.
+  it.instance("ctx.shell runs a deterministic non-LLM step returning output + exitCode without touching budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_FIXTURE, SHELL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: SHELL_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("shell workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      const result = done.result as { out: string; okCode: number; failCode: number; spent: number }
+      expect(result.out).toBe("hello-workflow")
+      expect(result.okCode).toBe(0)
+      // A non-zero exit is mapped to the return value, NOT a throw.
+      expect(result.failCode).toBe(3)
+      // Shell does not touch the budget — spend stays at 0.
+      expect(result.spent).toBe(0)
+    }),
+  )
+
+  // Task 11b (a): a parent runs a DISCOVERED child inline via ctx.workflow under
+  // the SAME run. The parent completes, the child's result flows back
+  // (fromChild === 42), exactly ONE run row exists for this start (no separate
+  // child run row), and the parent's logs include the child's prefixed log entry.
+  it.instance("ctx.workflow runs a discovered child inline under the same run with prefixed logs", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_CHILD_FIXTURE, NEST_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_PARENT_FIXTURE, NEST_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: NEST_PARENT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("parent workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      expect((done.result as { fromChild: number }).fromChild).toBe(42)
+
+      // Exactly ONE run row exists for this start: no separate child run row.
+      const runs = yield* workflow.runs()
+      expect(runs.length).toBe(1)
+      expect(runs[0]!.id).toBe(started.id)
+
+      // The parent's logs include the child's prefixed log entry.
+      const messages = done.logs.map((l) => l.message)
+      expect(messages).toContain("child: child-ran")
+    }),
+  )
+
+  // Task 11b (b): nesting is limited to depth 1. A child that itself calls
+  // ctx.workflow must be refused — the nested call throws a WorkflowInvalidError
+  // mentioning the depth limit, and the run fails with that error.
+  it.instance("ctx.workflow enforces a depth-1 limit: a nested ctx.workflow call fails the run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_GRANDCHILD_FIXTURE, NEST_GRANDCHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_DEEP_CHILD_FIXTURE, NEST_DEEP_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_DEEP_PARENT_FIXTURE, NEST_DEEP_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: NEST_DEEP_PARENT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("deep-parent workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/WorkflowInvalidError|nesting|depth/i)
+
+      // Still exactly ONE run row — the failed nesting never created a second run.
+      const runs = yield* workflow.runs()
+      expect(runs.length).toBe(1)
+    }),
+  )
+
+  // Task 11b (c): the child's agent dispatches count against the SAME run's
+  // agent-lifetime cap. With the cap lowered to 3, the parent's one agent plus the
+  // child's dispatches collectively exceed it, so the over-cap dispatch (inside
+  // the child) fails the WHOLE run with a tagged AgentLimitError — proving the cap
+  // is shared, not reset per nested workflow.
+  it.instance("ctx.workflow shares the run's agent-lifetime cap with the child", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_AGENT_CHILD_FIXTURE, NEST_AGENT_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_AGENT_PARENT_FIXTURE, NEST_AGENT_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      Workflow.__testHooks.agentLimit(3)
+
+      const started = yield* workflow.start({
+        name: NEST_AGENT_PARENT_FIXTURE,
+        args: {},
+        prompt: costPromptOps(db, 0),
+      })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("agent-parent workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/WorkflowAgentLimitError|agent.*limit/i)
+      // The cap is shared across parent + child: exactly 3 agents (1 parent + 2
+      // child) reach `completed` before the 4th dispatch is refused.
+      expect(done.agents.filter((a) => a.status === "completed").length).toBe(3)
+      // One run row only — the child never created its own run.
+      const runs = yield* workflow.runs()
+      expect(runs.length).toBe(1)
+    }),
+  )
+
+  // Task 11a (real timeout): ctx.shell("sleep 5", { timeout: 100 }) must kill the
+  // hung command and resolve PROMPTLY with a non-zero exitCode — never hang for the
+  // full 5s and never throw. The fixture records elapsed wall-clock so we can prove
+  // the timeout actually fired (well under the command's 5s natural duration).
+  it.instance("ctx.shell enforces a real wall-clock timeout: a hung command resolves promptly with non-zero exit", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_TIMEOUT_FIXTURE, SHELL_TIMEOUT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: SHELL_TIMEOUT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("shell-timeout workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      const result = done.result as { exitCode: number; elapsed: number }
+      // A timed-out command is killed -> non-zero exit (mapped, not thrown).
+      expect(result.exitCode).not.toBe(0)
+      // It resolved promptly: well before the command's natural 5s duration.
+      expect(result.elapsed).toBeLessThan(3000)
+    }),
+  )
+
+  // Task 11b (phase restore): a child's setPhase must not bleed into the parent.
+  // Parent sets "plan", the nested child sets "research" (recorded prefixed as
+  // "phase-child: research" on its own log), and the parent's log AFTER the nested
+  // call must carry the parent's "plan" phase again — not the child's leftover.
+  it.instance("ctx.workflow restores the parent's phase after a nested child changes it", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_PHASE_CHILD_FIXTURE, NEST_PHASE_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, NEST_PHASE_PARENT_FIXTURE, NEST_PHASE_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: NEST_PHASE_PARENT_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("phase-parent workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      // The child's own log was attributed to its (prefixed) phase...
+      const childLog = done.logs.find((l) => l.message === "phase-child: inside-child")
+      expect(childLog?.phase).toBe("phase-child: research")
+      // ...and the parent's log AFTER the nested call carries the parent's phase,
+      // NOT the child's leftover "phase-child: research".
+      const parentLog = done.logs.find((l) => l.message === "after-nested")
+      expect(parentLog?.phase).toBe("plan")
+      // The run's terminal phase is the parent's, not the child's leftover.
+      expect(done.current_phase).toBe("plan")
+    }),
+  )
+
+  // Task 14: a workflow run now emits OTel spans — `workflow.run` for the run
+  // body and `workflow.agent` for each ctx.agent dispatch. The test stack has NO
+  // span-collection seam (no in-memory tracer/exporter is wired into the engine's
+  // layer), so this is a SMOKE test: it proves the spans are transparent (a full
+  // 1-agent run still completes, the agent step succeeds, and the prompt was
+  // dispatched exactly once). The spans themselves are exercised by the engine's
+  // default no-op tracer; behavioral equivalence is the real gate.
+  it.instance("a 1-agent run still completes with run/agent spans wrapping it (transparent)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SINGLE_AGENT_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("single-agent workflow did not finish")))
+
+      // The wrapping spans changed nothing: the run completes and its single agent
+      // step ran to completion against exactly one dispatched prompt.
+      expect(done.status).toBe("completed")
+      expect(done.agents.length).toBe(1)
+      expect(done.agents[0]?.status).toBe("completed")
+      expect(inputs.length).toBe(1)
+    }),
+  )
+
+  // Task 15(b): a structured phase declares a default `model`. While that phase is
+  // active, a ctx.agent call with NO explicit model resolves to the phase default;
+  // an explicit per-call model still wins over the phase default.
+  it.instance("a phase default model is used when ctx.agent gives no model; explicit model wins", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PHASE_MODEL_FIXTURE, PHASE_MODEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: PHASE_MODEL_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("phase-model workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // Two dispatches. The first (no explicit model) resolved to the "verify"
+      // phase's default `stub/mini`; the second's explicit model won over it.
+      expect(inputs.length).toBe(2)
+      expect(String(inputs[0]?.model?.providerID)).toBe("stub")
+      expect(String(inputs[0]?.model?.modelID)).toBe("mini")
+      expect(String(inputs[1]?.model?.providerID)).toBe("other")
+      expect(String(inputs[1]?.model?.modelID)).toBe("explicit")
+    }),
+  )
+
+  // Task 15(c): setPhase on a phase NOT declared in meta.phases is allowed — the
+  // run completes — but a run log records a warning naming the undeclared phase.
+  it.instance("setPhase on an undeclared phase completes the run and logs a warning", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, UNDECLARED_PHASE_FIXTURE, UNDECLARED_PHASE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: UNDECLARED_PHASE_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("undeclared-phase workflow did not finish")))
+
+      // No error: an undeclared phase is allowed.
+      expect(done.status).toBe("completed")
+      // A run log warns about the undeclared phase.
+      const warning = done.logs.find((l) => l.message.includes('phase "undeclared" is not declared'))
+      expect(warning).toBeTruthy()
     }),
   )
 })

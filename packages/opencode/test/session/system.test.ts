@@ -55,7 +55,7 @@ const it = testEffect(
                 meta: {
                   name: "Release Notes",
                   description: "Draft release notes.",
-                  phases: ["draft", "review"],
+                  phases: [{ title: "draft" }, { title: "review" }],
                   arguments: {
                     version: { type: "string", description: "Version to summarize." },
                   },
@@ -69,6 +69,7 @@ const it = testEffect(
           wait: () => Effect.succeed({ timedOut: false }),
           cancel: () => Effect.succeed(undefined),
           pause: () => Effect.succeed(undefined),
+          answer: () => Effect.succeed(undefined),
           remove: () => Effect.succeed(false),
           sweep: () => Effect.void,
         }),
