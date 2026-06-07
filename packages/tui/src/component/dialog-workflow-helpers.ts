@@ -1,4 +1,5 @@
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
+import type { WorkflowRunEvent, WorkflowRunWithQuestion } from "./dialog-workflow-client"
 import path from "path"
 
 // The engine persists timestamps as numbers, but the SDK schema widens them to
@@ -121,6 +122,37 @@ export function reanchorSelection(prevId: string | undefined, rows: readonly Wor
 export function capLogs<T>(entries: readonly T[], max: number) {
   if (entries.length <= max) return { entries: entries.slice(), hidden: 0 }
   return { entries: entries.slice(-max), hidden: entries.length - max }
+}
+
+// Event-driven dashboard refresh (Spec §5.2, Delta 10): a workflow.run.* event
+// carries a lean wire shape (status/current_phase/error), not the full run with
+// its agents. Overlay only those fields onto the matching run so the list updates
+// instantly without waiting for the ≤1s poll. An event for a run not in the list
+// returns the SAME reference (identity-stable: no re-render churn) — a full
+// refetch picks up the genuinely-new run. Agent detail comes from the refetch,
+// not the lean event.
+export function mergeRunEvent(runs: WorkflowRun[], event: WorkflowRunEvent): WorkflowRun[] {
+  const index = runs.findIndex((run) => run.id === event.run.id)
+  if (index === -1) return runs
+  const next = runs.slice()
+  next[index] = {
+    ...next[index],
+    status: event.run.status,
+    ...(event.run.current_phase !== undefined && { current_phase: event.run.current_phase }),
+    ...(event.run.error !== undefined && { error: event.run.error }),
+  }
+  return next
+}
+
+// Dashboard waiting badge (Spec §5.2 (4)): a run that has asked a question and is
+// still running or parked (paused) shows the hourglass so the operator can spot
+// it needs an answer. Any other state (no pending question, or terminal) shows no
+// badge. Reads pending_question via the WorkflowRunWithQuestion shim (the SDK type
+// omits it; Delta 3).
+export function questionBadge(run: WorkflowRunWithQuestion): "⏳" | "" {
+  if (!run.pending_question) return ""
+  if (run.status === "running" || run.status === "paused") return "⏳"
+  return ""
 }
 
 export type WorkflowCommand = { type: "dashboard" } | { type: "start"; name: string; args: string }

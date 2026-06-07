@@ -6,6 +6,7 @@ import { Effect, Layer, Context, Schema } from "effect"
 import { Config } from "@/config/config"
 import { MCP } from "../mcp"
 import { Skill } from "../skill"
+import { Workflow } from "@/workflow/workflow"
 import { EventV2 } from "@opencode-ai/core/event"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
@@ -31,7 +32,7 @@ export const Info = Schema.Struct({
   description: Schema.optional(Schema.String),
   agent: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
-  source: Schema.optional(Schema.Literals(["command", "mcp", "skill"])),
+  source: Schema.optional(Schema.Literals(["command", "mcp", "skill", "workflow"])),
   // Some command templates are lazy promises from MCP prompt resolution.
   template: Schema.Unknown,
   subtask: Schema.optional(Schema.Boolean),
@@ -68,6 +69,7 @@ export const layer = Layer.effect(
     const config = yield* Config.Service
     const mcp = yield* MCP.Service
     const skill = yield* Skill.Service
+    const workflow = yield* Workflow.Service
 
     const init = Effect.fn("Command.state")(function* (ctx: InstanceContext) {
       const cfg = yield* config.get()
@@ -151,6 +153,29 @@ export const layer = Layer.effect(
         }
       }
 
+      // Spec §5.2 (3) / Delta 4+5: discovered workflows become real Command.Info
+      // entries (source "workflow") so they appear in /help and Command.list()
+      // (the TUI's sync.data.command), in parity with the autocomplete /<name>
+      // path. Runs LAST so any real command/mcp/skill of the same name wins
+      // (collision skip via `if (commands[wf.name]) continue`); invalid (broken)
+      // workflow files cannot be started, so they are skipped too.
+      // DELTA: source "workflow" is DISCOVERY-ONLY — the TUI dispatch starts these
+      // via the /workflow path (see AUTOCOMPLETE), NOT via session.command, so the
+      // empty `template` is never executed as a prompt.
+      for (const wf of yield* workflow.list()) {
+        if (wf.valid === false) continue
+        if (commands[wf.name]) continue
+        commands[wf.name] = {
+          name: wf.name,
+          description: wf.meta.description ?? wf.meta.whenToUse,
+          source: "workflow",
+          get template() {
+            return ""
+          },
+          hints: [],
+        }
+      }
+
       return {
         commands,
       }
@@ -176,6 +201,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Config.defaultLayer),
   Layer.provide(MCP.defaultLayer),
   Layer.provide(Skill.defaultLayer),
+  Layer.provide(Workflow.defaultLayer),
 )
 
 export * as Command from "."
