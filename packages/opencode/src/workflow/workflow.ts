@@ -47,7 +47,7 @@ import type {
 import { WorkflowRunTable } from "./workflow.sql"
 import { MetaReader } from "./meta-reader"
 import { Meta } from "./meta"
-import { BUILTIN_WORKFLOWS, builtinPath } from "./builtin"
+import { BUILTIN_WORKFLOWS, builtinPath, inlinePath } from "./builtin"
 import { Process } from "@/util/process"
 import { Shell } from "@/shell/shell"
 
@@ -264,7 +264,11 @@ export const Event = {
 }
 
 export const StartInput = Schema.Struct({
-  name: Schema.String,
+  // Optional so an inline-source start can omit it: when `source` is supplied with
+  // no `name`, start() loads the module straight from the source string (the
+  // builtin source-string load path) and the run's name is the source's meta name.
+  // Every other start path supplies a name to select a discovered workflow.
+  name: Schema.optional(Schema.String),
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   // Optional cost cap in USD for the whole run. The unit is USD because that is
   // exactly the per-agent telemetry the engine already records (`AgentRun.cost`,
@@ -1228,25 +1232,39 @@ function tempFileName(file: string): string {
 // (the realtime-update bug). Correctness over micro-optimization — the
 // double-load that motivated the original finding is already gone because
 // start() now loads only the target module instead of calling list().
-// `builtinSource`, when given, is the module SOURCE of a built-in workflow whose
-// `file` is the synthetic `builtin:<name>` marker (not a real path). The marker
-// has no source directory, so the temp copy is written into the GLOBAL workflows
-// directory (`<Global.Path.config>/workflows`) rather than `import.meta.dir`: in
-// a compiled Bun binary `import.meta.dir` is `/$bunfs/root` (read-only —
-// `Bun.write` throws ENOENT there), whereas the global config dir is a
-// binary-proven writable location where normal global workflows already load
+// `inlineSource`, when given, is the module SOURCE of a workflow that has no real
+// file on disk — its `file` is a synthetic scheme marker (`builtin:<name>` for a
+// bundled builtin, `inline:<metaName>` for a P3 inline-source start), not a real
+// path. The marker has no source directory, so the temp copy is written into the
+// GLOBAL workflows directory (`<Global.Path.config>/workflows`) rather than
+// `import.meta.dir`: in a compiled Bun binary `import.meta.dir` is `/$bunfs/root`
+// (read-only — `Bun.write` throws ENOENT there), whereas the global config dir is
+// a binary-proven writable location where normal global workflows already load
 // from. Builtin sources are SELF-CONTAINED by invariant (no imports — see
-// builtin.ts), so the temp copy depends on no node_modules above it and loads
-// identically in dev and in the binary. The directory is ensured (the workflows
-// subdir may not exist on a cold system) and the temp file keeps TEMP_FILE_RE's
-// name shape so the per-directory sweep in discover() cleans up any orphan. A
-// write failure is a hard error (there is no original file to fall back to).
-async function loadModule(file: string, builtinSource?: string): Promise<Module> {
-  const source = builtinSource ?? (await Bun.file(file).text())
-  if (builtinSource !== undefined) {
-    const workflowsDir = path.join(Global.Path.config, "workflows")
-    await fs.mkdir(workflowsDir, { recursive: true })
-    const cachePath = path.join(workflowsDir, tempFileName(`${file.replace(/^builtin:/, "")}.ts`))
+// builtin.ts); an inline source is authored by the model/user and likewise
+// materialized here, so the temp copy depends on no node_modules above it and
+// loads identically in dev and in the binary. The directory is ensured (the
+// workflows subdir may not exist on a cold system) and the temp file keeps
+// TEMP_FILE_RE's name shape so the per-directory sweep in discover() cleans up any
+// orphan; the random temp suffix means two concurrent inline starts never collide.
+// A write failure is a hard error (there is no original file to fall back to).
+async function loadModule(file: string, inlineSource?: string): Promise<Module> {
+  const source = inlineSource ?? (await Bun.file(file).text())
+  if (inlineSource !== undefined) {
+    const configDir = path.join(Global.Path.config, "workflows")
+    await fs.mkdir(configDir, { recursive: true })
+    // Resolve the dir to its REALPATH before writing+importing. On macOS the temp
+    // root is `/var/folders/...` (a symlink to `/private/var/...`); Bun's dynamic
+    // `import()` resolves the `file://` URL through the realpath, so after the first
+    // temp module in this dir is imported-then-deleted, a SECOND import of a new
+    // file under the symlinked path fails with "Cannot find module … from ''" (a
+    // stale per-directory resolver entry). Writing+importing via the realpath keeps
+    // both starts consistent so repeated source-string loads (two builtins, two
+    // inline starts, or the same one twice) all succeed.
+    const workflowsDir = await fs.realpath(configDir)
+    // Strip the synthetic `<scheme>:` marker prefix (builtin:/inline:) so the temp
+    // file name is just a sanitized basename, not a path with a colon in it.
+    const cachePath = path.join(workflowsDir, tempFileName(`${file.replace(/^[a-z]+:/, "")}.ts`))
     await Bun.write(cachePath, source)
     const imported = (await import(pathToFileURL(cachePath).href).finally(() =>
       Bun.file(cachePath).delete(),
@@ -1854,29 +1872,49 @@ export const layer = Layer.effect(
     })
 
     const start: Interface["start"] = Effect.fn("Workflow.start")(function* (input) {
-      // Resolve the single target by name without loading every workflow: a
-      // broken sibling file must not block starting a valid one. Only the target
-      // module is imported, and a broken target fails precisely (InvalidError
-      // naming the file) rather than as part of a whole-list failure.
-      const discovered = yield* discoverWorkflows()
-      const workflow = discovered.find((item) => item.name === input.name)
-      if (!workflow) return yield* new NotFoundError({ name: input.name })
+      // Resolve the start TARGET — `{ name, path, source? }` — either by discovery
+      // (a named workflow: project/global file or bundled builtin) or, when an
+      // inline `source` is supplied WITHOUT a name (P3), as a synthetic inline
+      // target that is never discovered and never written to the project. Both
+      // feed the SAME source-string/file load path below, so the run lifecycle,
+      // permission boundary, and argument coercion are source-agnostic.
+      let target: { name: string; path: string; source?: string }
+      if (input.source !== undefined && input.name === undefined) {
+        // Inline-source start: read the meta STATICALLY from the source (AST-only,
+        // never executes the module). The tool already pre-validates before its
+        // permission ask; the engine validates again defensively so a programmatic
+        // caller still fails cleanly (InvalidError) instead of defecting deep in
+        // the module load. The run's name is the source's meta name.
+        const read = MetaReader.read(input.source, inlinePath("inline"))
+        if (read.valid === false)
+          return yield* new InvalidError({ path: inlinePath("inline"), message: read.error })
+        target = { name: read.meta.name, path: inlinePath(read.meta.name), source: input.source }
+      } else {
+        // Resolve the single target by name without loading every workflow: a
+        // broken sibling file must not block starting a valid one. Only the target
+        // module is imported, and a broken target fails precisely (InvalidError
+        // naming the file) rather than as part of a whole-list failure.
+        const discovered = yield* discoverWorkflows()
+        const found = discovered.find((item) => item.name === input.name)
+        if (!found) return yield* new NotFoundError({ name: input.name ?? "" })
+        target = { name: found.name, path: found.path, source: found.source }
+      }
       // tryPromise so a load failure (bad meta / missing run / syntax error)
       // surfaces as a typed InvalidError naming the file, not as an unhandled
       // defect (Effect.promise would treat a rejection as a die).
       const module = yield* Effect.tryPromise({
-        // A builtin carries its module source inline (`workflow.source`); an
-        // on-disk workflow loads from its file. Both go through loadModule's
-        // temp-file import so a builtin runs the IDENTICAL load + validation path.
-        try: () => loadModule(workflow.path, workflow.source),
+        // A builtin/inline target carries its module source inline (`target.source`);
+        // an on-disk workflow loads from its file. Both go through loadModule's
+        // temp-file import so every source runs the IDENTICAL load + validation path.
+        try: () => loadModule(target.path, target.source),
         catch: (error) =>
-          isInvalidError(error) ? error : new InvalidError({ path: workflow.path, message: errorText(error) }),
+          isInvalidError(error) ? error : new InvalidError({ path: target.path, message: errorText(error) }),
       })
       // Enforce the declared argument contract HERE — the single engine boundary
       // before the body runs — so coercion + defaults apply identically on every
       // start path (HTTP/Tool/TUI). A non-coercible value fails the start as an
       // InvalidError; nothing reaches `module.run` until the args are authoritative.
-      const coerced = coerceArgs(input.args, module.meta.arguments, workflow.path)
+      const coerced = coerceArgs(input.args, module.meta.arguments, target.path)
       if (coerced instanceof InvalidError) return yield* coerced
       const args = coerced
       const inst = yield* InstanceState.get(state)
@@ -1915,7 +1953,7 @@ export const layer = Layer.effect(
           // and still degrades to a normal run (every call runs live), unchanged.
           if (sourceRow.status !== "paused" && sourceRow.status !== "interrupted") {
             return yield* new InvalidError({
-              path: workflow.path,
+              path: target.path,
               message: `Cannot resume run ${input.resume_of}: status is ${sourceRow.status} (only paused or interrupted runs can be resumed)`,
             })
           }
@@ -1960,11 +1998,11 @@ export const layer = Layer.effect(
         run: {
           id,
           session_id: session.id,
-          workflow: workflow.name,
+          workflow: target.name,
           args: args ?? undefined,
           definition: {
-            name: workflow.name,
-            path: workflow.path,
+            name: target.name,
+            path: target.path,
             meta: mutableMeta(module.meta),
             source: input.source,
             temporary: input.temporary,

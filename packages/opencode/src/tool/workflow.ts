@@ -388,7 +388,11 @@ function startWorkflow(input: {
   sessions: Session.Interface
   scope: Scope.Scope
   params: Params
-  name: string
+  // The named workflow to start. OMITTED for a P3 inline-source start: the engine
+  // keys its inline source-string load path on `name === undefined` (+ `source`
+  // set), deriving the run's name from the source's meta. A NAMED start (incl. a
+  // named temporary start) always supplies it to select a discovered workflow.
+  name?: string
   source?: string
   temporary?: boolean
   resumeOf?: Workflow.RunID
@@ -552,13 +556,61 @@ export const WorkflowTool = Tool.define(
           }
 
           if (params.action === "start") {
-            if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
+            // P3: inline source is mutually exclusive with name — exactly one selects
+            // the workflow to start.
+            if (params.source && params.name)
+              return yield* Effect.fail(new Error("Provide either name or source for action=start, not both"))
+            if (!params.name && !params.source)
+              return yield* Effect.fail(new Error("name or source is required for action=start"))
             // QW3: a malformed resume_of is surfaced as a clean not-found (using the
             // same prefix guard wait/inspect use) rather than a Schema defect through
             // the trailing orDie.
             const resumeOf = params.resume_of ? decodeRunId(params.resume_of) : undefined
             if (params.resume_of && !resumeOf)
               return yield* Effect.fail(new Error(`Workflow run not found: ${params.resume_of}`))
+
+            if (params.source) {
+              // P3: inline-source start runs as a TEMPORARY run. Statically validate
+              // the source via MetaReader (AST-only, never executes the module) BEFORE
+              // the permission ask — same gate order as create/named-start: a bad meta
+              // fails here, the module LOAD (which runs code) happens later inside the
+              // engine, after the ask.
+              const validated = MetaReader.read(params.source, "inline.ts")
+              if (validated.valid === false)
+                return yield* Effect.fail(new Error(`Invalid workflow inline.ts: ${validated.error}`))
+              // The meta name keys the permission pattern/`always`, so an illegal name
+              // (glob metacharacter/whitespace) is rejected here with a clean fail —
+              // never sanitizeWorkflowName's synchronous throw (which orDie would turn
+              // into a defect) and never an over-broad `always` rule (N15).
+              if (!WORKFLOW_NAME_PATTERN.test(validated.meta.name))
+                return yield* Effect.fail(
+                  new Error("Workflow names may only contain letters, numbers, underscores, and dashes"),
+                )
+              const safeName = validated.meta.name
+              yield* ctx.ask({
+                permission: "workflow",
+                patterns: [safeName],
+                always: [safeName],
+                metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
+              })
+              return yield* startWorkflow({
+                workflow,
+                background,
+                sessions,
+                scope,
+                params,
+                // Omit name: the engine takes its inline source-string load path when
+                // name is undefined and source is set, deriving the run's name from
+                // the source's meta (validated above).
+                source: params.source,
+                temporary: true,
+                resumeOf,
+                invalidateAgents: params.invalidate_agents ? [...params.invalidate_agents] : undefined,
+                ctx,
+              })
+            }
+
+            if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
             // N15 (security, behavior change): the name reaching the permission
             // pattern/`always` MUST be glob-metacharacter-free. A discovered
             // workflow name is just a file basename (discover() does

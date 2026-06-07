@@ -16,7 +16,7 @@ import { eq, sql } from "drizzle-orm"
 import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import fs from "fs/promises"
 import path from "path"
@@ -1951,6 +1951,55 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       expect(done.definition?.temporary).toBe(true)
       expect(done.definition?.source).toBe(source)
       expect(done.result).toEqual({ value: 99 })
+    }),
+  )
+
+  // Inline-source start (P3): start({ source, temporary: true }) with NO name loads
+  // the module straight from the source string via the builtin source-string load
+  // path under a synthetic `inline:<metaName>` marker — never written to the
+  // project, never discovered. The run completes, the definition carries the
+  // source, list() does NOT surface it, and a second identical start works (the
+  // temp-file name randomizes, so no collision).
+  it.instance("starts an inline source as a temporary run without discovery", () =>
+    Effect.gen(function* () {
+      const source = `export const meta = { name: "InlineEngine", description: "Inline." }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ args: { value: 7 }, source, temporary: true })
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("inline workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(done.workflow).toBe("InlineEngine")
+      expect(done.definition?.temporary).toBe(true)
+      expect(done.definition?.source).toBe(source)
+      expect(done.result).toEqual({ value: 7 })
+      // Never discovered: list() does not surface an inline run's workflow.
+      const listed = yield* workflow.list()
+      expect(listed.some((item) => item.name === "InlineEngine")).toBe(false)
+      // A second identical inline start works (no temp-file collision).
+      const run2 = yield* workflow.start({ args: { value: 8 }, source, temporary: true })
+      const done2 =
+        (yield* workflow.wait({ id: run2.id })).run ??
+        (yield* Effect.fail(new Error("second inline workflow did not finish")))
+      expect(done2.status).toBe("completed")
+      expect(done2.result).toEqual({ value: 8 })
+    }),
+  )
+
+  // Inline-source start with an INVALID source (non-literal meta name → MetaReader
+  // rejects it statically) fails the start as a WorkflowInvalidError, never a
+  // defect — the engine validates the source defensively even though the tool also
+  // pre-validates before its permission ask.
+  it.instance("inline source with invalid meta fails the start as InvalidError", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const source = `export const meta = { name: someVar }
+export async function run() {}
+`
+      const exit = yield* Effect.exit(workflow.start({ source, temporary: true }))
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("WorkflowInvalidError")
     }),
   )
 
@@ -3949,8 +3998,12 @@ export async function run() { return { from: "global" } }
     // (/$bunfs/root, read-only) — mit TEMP_FILE_RE-Namensschema, laden, danach
     // löschen. Das Modul-Top-Level wird ausgeführt, also deckt dies
     // Syntax-/Compile-Fehler im Source-Literal auf.
-    const workflowsDir = path.join(Global.Path.config, "workflows")
-    await fs.mkdir(workflowsDir, { recursive: true })
+    const configDir = path.join(Global.Path.config, "workflows")
+    await fs.mkdir(configDir, { recursive: true })
+    // Mirror loadModule: resolve to the realpath before writing+importing so the
+    // import is consistent with Bun's realpath resolution (the /var → /private/var
+    // symlink otherwise breaks a second source-string import in the same dir).
+    const workflowsDir = await fs.realpath(configDir)
     const file = path.join(workflowsDir, `.deep-research.${Date.now()}.${Math.random().toString(16).slice(2)}.mts`)
     await Bun.write(file, source)
     try {

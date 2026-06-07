@@ -266,6 +266,58 @@ export async function run(args, ctx) { if (args.hang) await new Promise(() => {}
     ),
   )
 
+  it.live("start with inline source runs as a temporary run and asks permission by meta name (P3)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Inline", description: "Inline run." }
+export async function run(args, ctx) { return { value: args.value } }
+`
+        const result = yield* tool.execute({ action: "start", source, args: { value: 9 } }, recorder.ctx)
+        // Permission ask used the meta name from the inline source.
+        expect(recorder.requests.length).toBe(1)
+        expect(recorder.requests[0].permission).toBe("workflow")
+        expect(recorder.requests[0].patterns).toEqual(["Inline"])
+        expect(result.output).toContain(`state="completed"`)
+        expect(result.output).toContain('"value": 9')
+        // The run is flagged temporary in its definition.
+        expect(result.output).toContain("<temporary>true</temporary>")
+      }),
+    ),
+  )
+
+  it.live("start with invalid inline source fails statically before the permission ask (P3)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        // Non-literal meta name → MetaReader rejects it statically.
+        const source = `export const meta = { name: someVar }
+export async function run() {}
+`
+        const exit = yield* Effect.exit(tool.execute({ action: "start", source }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        // No permission ask fired — the static gate ran first.
+        expect(recorder.requests.length).toBe(0)
+      }),
+    ),
+  )
+
+  it.live("start rejects both name and source supplied together (P3)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const exit = yield* Effect.exit(
+          tool.execute({ action: "start", name: "x", source: 'export const meta = { name: "X" }' }, recorder.ctx),
+        )
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(recorder.requests.length).toBe(0)
+      }),
+    ),
+  )
+
   it.live("routes workflow agent permission asks to the caller session", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
