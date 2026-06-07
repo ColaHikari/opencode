@@ -260,7 +260,7 @@ export async function run(args, ctx) { if (args.hang) await new Promise(() => {}
           recorder.ctx,
         )
         const run = yield* workflow.get(Workflow.RunID.make(resumed.metadata.runId as string))
-        expect(run?.resume_of).toBe(sourceId)
+        expect(run?.resume_of as string | undefined).toBe(sourceId)
         expect(resumed.output).toContain(`state="completed"`)
       }),
     ),

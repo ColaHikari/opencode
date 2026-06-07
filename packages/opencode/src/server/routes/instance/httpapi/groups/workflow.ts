@@ -179,7 +179,11 @@ export const WorkflowApi = HttpApi.make("workflow")
           // PARKED (paused) run returns the NEW resumed run. A run not known to this
           // workspace is a 404; a known run with no open question is a 409.
           success: described(Workflow.Run, "Workflow run after answering its open question"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
+          // WorkflowApiError (400): answering a PARKED run starts a resume, which can
+          // fail to load the (now resumed) workflow file the same way start does — the
+          // handler maps that engine InvalidError to WorkflowApiError, so it must be a
+          // declared channel here too.
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError, WorkflowApiError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "workflow.answer",
