@@ -76,12 +76,34 @@ export const layer = Layer.effect(
       const bridge = yield* EffectBridge.make()
       const commands: Record<string, Info> = {}
 
+      // T5 (/init): surface discovered workflows in the generated AGENTS.md prompt
+      // so the init pass documents them. Names + descriptions (falling back to
+      // whenToUse). Only VALID workflows are listed; the section is omitted
+      // entirely when none remain, so a repo with no workflows gets the unchanged
+      // prompt. list() is the static (never-executed) reader — safe at build time.
+      const allWorkflows = (yield* workflow.list()).filter((wf) => wf.valid !== false)
+      // The init section documents REPO/PROJECT-defined workflows ("This repository
+      // defines …"); the builtins that ship inside opencode (source_kind "builtin",
+      // e.g. deep-research) are not repo-specific, so they are excluded from the
+      // prompt section. They still register as Command.Info entries via the loop below.
+      const initWorkflows = allWorkflows.filter((wf) => wf.source_kind !== "builtin")
+      const workflowsSection =
+        initWorkflows.length === 0
+          ? ""
+          : "\n\n## Available workflows\n\nThis repository defines OpenCode workflows. Mention them in `AGENTS.md` so future sessions know they exist:\n\n" +
+            initWorkflows
+              .map((wf) => {
+                const desc = wf.meta.description ?? wf.meta.whenToUse
+                return desc ? `- \`${wf.name}\` — ${desc}` : `- \`${wf.name}\``
+              })
+              .join("\n")
+
       commands[Default.INIT] = {
         name: Default.INIT,
         description: "guided AGENTS.md setup",
         source: "command",
         get template() {
-          return PROMPT_INITIALIZE.replace("${path}", ctx.worktree)
+          return PROMPT_INITIALIZE.replace("${path}", ctx.worktree) + workflowsSection
         },
         hints: hints(PROMPT_INITIALIZE),
       }
@@ -162,7 +184,11 @@ export const layer = Layer.effect(
       // DELTA: source "workflow" is DISCOVERY-ONLY — the TUI dispatch starts these
       // via the /workflow path (see AUTOCOMPLETE), NOT via session.command, so the
       // empty `template` is never executed as a prompt.
-      for (const wf of yield* workflow.list()) {
+      // Reuses `allWorkflows` (already filtered to valid, INCLUDING builtins so
+      // deep-research still registers as a command) instead of a second
+      // workflow.list() call. The `valid === false` guard is now redundant but kept
+      // for clarity; the collision skip below still applies.
+      for (const wf of allWorkflows) {
         if (wf.valid === false) continue
         if (commands[wf.name]) continue
         commands[wf.name] = {
