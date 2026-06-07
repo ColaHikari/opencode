@@ -830,6 +830,11 @@ let agentLimitOverride: number | undefined
 // does synchronously — reproducing the narrow window where a run is unwinding to
 // paused but its open question is still live — without racing the real scope close.
 let setPausingHook: ((id: string) => Effect.Effect<boolean>) | undefined
+// Finding 4 test seam: an Effect the question() dispatch runs the instant the
+// timeout wins (`None`) but BEFORE the park decision — while `pendingQuestion` is
+// still live — so a test can deterministically land an answer() in the
+// timeout-vs-answer race window. `Effect.void` in production (no-op).
+let questionTimeoutParkHook: Effect.Effect<unknown> = Effect.void
 export const __testHooks = {
   failNextTerminalPersist: () => {
     failNextTerminalPersist = true
@@ -844,6 +849,21 @@ export const __testHooks = {
    */
   setPausing: (id: string): Effect.Effect<boolean> =>
     setPausingHook ? setPausingHook(id) : Effect.succeed(false),
+  /**
+   * Register an Effect to run once inside the question() timeout-park window
+   * (Finding 4). It fires while the open question is still live in-memory, so a
+   * test can call answer() there to reproduce the timeout-vs-answer race
+   * deterministically. The hook auto-clears after firing so it runs at most once.
+   */
+  runOnQuestionTimeoutPark: (effect: Effect.Effect<unknown>) => {
+    questionTimeoutParkHook = effect.pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          questionTimeoutParkHook = Effect.void
+        }),
+      ),
+    )
+  },
 }
 
 class TerminalPersistTestError extends Error {
@@ -2718,6 +2738,12 @@ export const layer = Layer.effect(
             // Race the answer against the timeout. `timeoutOption` is interruptible,
             // so a run-scope close (external pause/cancel) unwinds this wait too.
             const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(timeout))
+            // Finding 4 (test seam): when the timeout won (`None`), fire the hook
+            // HERE — `active.pendingQuestion` is still set, so a test's answer() can
+            // take the live-answer branch and complete the node, deterministically
+            // reproducing the timeout-vs-answer race the `.then` below must survive.
+            // No-op in production (the hook is `Effect.void`).
+            if (result._tag === "None") yield* questionTimeoutParkHook.pipe(Effect.ignore)
             return result
           }),
         ).then(
@@ -2740,12 +2766,25 @@ export const layer = Layer.effect(
               }
               return result.value
             }
-            // Timeout: PARK the run as `paused` via the existing pause machinery.
-            // Keep `pending_question` AND the open question node intact (do NOT
-            // complete the node) so a later answer() can resume. Setting `pausing`
-            // makes the body's matchCauseEffect map this unwind to `paused`, racing
-            // pause()'s own finish idempotently. Throwing CancelledError unwinds the
-            // body the same way an interrupt-driven pause does.
+            // Timeout fired at the Effect level (`None`). Finding 4: a concurrent
+            // answer() can land in the window between the timeout resolving and this
+            // continuation running — it completes the question node + clears
+            // pending_question + persists, then its Deferred.succeed is a no-op
+            // (the timeout already completed the Deferred). If we parked
+            // unconditionally here we would discard that recorded answer AND park as
+            // paused, leaving the caller with a success snapshot while the run is
+            // actually paused. So re-read the node: if a racing answer() already
+            // closed it (status flipped to `completed`), hand that answer back to
+            // the body instead of parking. Only park when the node is still open.
+            if (node.status === "completed") {
+              return { answer: node.answer! }
+            }
+            // PARK the run as `paused` via the existing pause machinery. Keep
+            // `pending_question` AND the open question node intact (do NOT complete
+            // the node) so a later answer() can resume. Setting `pausing` makes the
+            // body's matchCauseEffect map this unwind to `paused`, racing pause()'s
+            // own finish idempotently. Throwing CancelledError unwinds the body the
+            // same way an interrupt-driven pause does.
             active.pausing = true
             throw new CancelledError()
           },

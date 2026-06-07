@@ -1382,6 +1382,20 @@ export async function run(args, ctx) {
   return { answer: a.answer }
 }
 `
+// Finding 4 (timeout-park races answer): a question with a very short timeout,
+// answered the instant its pending_question is published. The engine must NOT
+// both record the answer AND park as paused — exactly one of {answer, park}
+// wins. The fix makes the timeout-park branch re-read node.status, so an answer()
+// that completed the node mid-race returns the answer instead of parking.
+const QUESTION_TINY_TIMEOUT_FIXTURE = "ask-question-tiny-timeout"
+const QUESTION_TINY_TIMEOUT_WORKFLOW = `export const meta = { name: "${QUESTION_TINY_TIMEOUT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "deploy?", options: ["yes", "no"], timeout: 1 })
+  return { answer: a.answer }
+}
+`
+
 // Question-then-agent: asks a question that times out (parks as paused), then
 // dispatches a real ctx.agent step that depends on the answer. The resume that
 // answer() triggers must thread the prompt-ops vector so this agent step can run
@@ -4959,6 +4973,50 @@ export async function run(args, ctx) {
       const paused = yield* workflow.pause(run.id)
       expect(paused?.status).toBe("paused")
       expect(paused?.pending_question?.question).toBe("deploy?")
+    }),
+  )
+
+  // Finding 4 (timeout-park races answer): a live answer() that completes the
+  // question node in the window between the timeout firing and the park decision
+  // must WIN — the run completes with the answer rather than parking as paused
+  // with the answer silently discarded. The race is driven deterministically via
+  // the __testHooks.runOnQuestionTimeoutPark seam, which fires answer() exactly in
+  // that window (the open question is still live in-memory there). On broken code
+  // the run parks as paused (answer lost); on fixed code the timeout branch
+  // re-reads the now-completed node and returns the answer.
+  it.instance("a live answer() that lands as the question times out wins over the park (no lost answer)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, QUESTION_TINY_TIMEOUT_FIXTURE, QUESTION_TINY_TIMEOUT_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+
+      // The run id is only known after start(); capture it so the hook can answer
+      // the right run. The hook fires INSIDE the timeout-park window (question still
+      // live), so this answer() takes the authoritative live-writer branch.
+      let runId: Workflow.RunID | undefined
+      Workflow.__testHooks.runOnQuestionTimeoutPark(
+        Effect.suspend(() => (runId ? workflow.answer({ id: runId, answer: "yes" }).pipe(Effect.ignore) : Effect.void)),
+      )
+
+      const started = yield* workflow.start({
+        name: QUESTION_TINY_TIMEOUT_FIXTURE,
+        args: {},
+        prompt: immediatePromptOps(),
+      })
+      runId = started.id
+
+      const done =
+        (yield* workflow.wait({ id: started.id })).run ??
+        (yield* Effect.fail(new Error("tiny-timeout question run did not settle")))
+      // The answer won: the run completed with it, NOT parked as paused.
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("yes")
+      expect(done.pending_question).toBeUndefined()
+      const qnode = done.agents.find((a) => a.kind === "question")
+      expect(qnode?.status).toBe("completed")
+      expect(qnode?.answer).toBe("yes")
     }),
   )
 
