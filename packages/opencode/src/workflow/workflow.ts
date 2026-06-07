@@ -405,6 +405,7 @@ export type AgentInput = {
   variant?: string
   tools?: Record<string, boolean>
   skills?: string[]
+  files?: string[]
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
 }
@@ -1868,6 +1869,34 @@ export const layer = Layer.effect(
                 : agentInput.prompt
             const tools =
               skills.length > 0 ? { ...(agentInput.tools ?? {}), skill: true } : agentInput.tools
+            // Declarative file attachments (Task 10). Each path is resolved
+            // RELATIVE TO the run's workspace directory (`active.directory`, the
+            // InstanceState directory the run was started in) and must exist —
+            // a missing attachment is an authoring error, so fail the step with a
+            // clear WorkflowInvalidError naming the file (before any prompt is
+            // dispatched) rather than sending a broken prompt. Each resolved file
+            // becomes a `text/plain` FilePartInput whose `url` is the absolute
+            // `file://` URL; the prompt loop reads `file://` parts off disk (via
+            // the Read tool) exactly like a TUI-attached file. Built here so the
+            // parts can be appended AFTER the text part below.
+            const fileParts: { type: "file"; mime: string; filename: string; url: string }[] = []
+            for (const file of agentInput.files ?? []) {
+              if (file.length === 0) continue
+              const resolved = path.isAbsolute(file) ? file : path.resolve(active.directory, file)
+              const exists = yield* Effect.promise(() => Bun.file(resolved).exists())
+              if (!exists) {
+                return yield* new InvalidError({
+                  path: active.run.workflow,
+                  message: `ctx.agent file attachment not found: ${file} (resolved to ${resolved})`,
+                })
+              }
+              fileParts.push({
+                type: "file",
+                mime: "text/plain",
+                filename: path.basename(resolved),
+                url: pathToFileURL(resolved).href,
+              })
+            }
             // Resume replay: when this run has a journal (started with
             // resume_of), consume the next unused source agent for this call's
             // key (occurrence order) and replay it verbatim — NO session, NO
@@ -1991,7 +2020,9 @@ export const layer = Layer.effect(
               format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
               // `promptText` is the author's prompt, optionally prefixed with the
               // per-step skill-load directive (see the `skills` resolution above).
-              parts: [{ type: "text", text: promptText }],
+              // Declarative file attachments (Task 10) follow the text part, in the
+              // order they were declared.
+              parts: [{ type: "text", text: promptText }, ...fileParts],
             })
             node.message_id = message.info.id
             if (message.info.role === "assistant") {

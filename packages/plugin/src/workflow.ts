@@ -39,6 +39,13 @@ export type WorkflowAgentInput = {
    * named skill before doing its work.
    */
   skills?: string[]
+  /**
+   * Files to attach to this agent step. Each path is resolved relative to the
+   * run's workspace directory (absolute paths are used as-is) and must exist —
+   * a missing file fails the step. Each attachment is appended after the prompt
+   * as a file part, so the agent can read it directly.
+   */
+  files?: string[]
   schema?: unknown
   permissionSessionID?: string
 }

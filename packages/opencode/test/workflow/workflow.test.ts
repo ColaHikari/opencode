@@ -259,6 +259,29 @@ export async function run(args, ctx) {
 }
 `
 
+// Declarative file-attachments fixture (Task 10): a single agent step that
+// attaches an existing file by path. The engine must resolve the path relative
+// to the run's workspace directory and append a file part after the text part.
+const FILES_FIXTURE = "files-step"
+const FILES_WORKFLOW = `export const meta = { name: "${FILES_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", files: ["./ATTACH.md"] })
+  return { ok: true }
+}
+`
+
+// Missing-file variant of the Task 10 fixture: a non-existent attachment must
+// fail the run with a WorkflowInvalidError naming the missing file.
+const FILES_MISSING_FIXTURE = "files-missing-step"
+const FILES_MISSING_WORKFLOW = `export const meta = { name: "${FILES_MISSING_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", files: ["./DOES_NOT_EXIST.md"] })
+  return { ok: true }
+}
+`
+
 
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
@@ -4305,6 +4328,58 @@ export async function run() { return { from: "global" } }
       expect(text).toContain("do it")
       // Directive comes BEFORE the author's prompt.
       expect(text.indexOf("pdf")).toBeLessThan(text.indexOf("do it"))
+    }),
+  )
+
+  // Task 10: a per-step `files` array passed to ctx.agent attaches files
+  // declaratively. Each path resolves relative to the run's workspace directory;
+  // the engine appends a file part (after the text part) whose URL is the
+  // absolute file:// URL of the attachment.
+  it.instance("ctx.agent files are resolved against the workspace and appended as file parts", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "ATTACH.md"), "# attached\n"))
+      yield* Effect.promise(() => writeWorkflow(test.directory, FILES_FIXTURE, FILES_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: FILES_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("files workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      expect(inputs.length).toBe(1)
+      const parts = inputs[0]?.parts ?? []
+      // Text part first, file part appended after it.
+      expect(parts[0]?.type).toBe("text")
+      const filePart = parts.find((p) => p.type === "file")
+      expect(filePart?.type).toBe("file")
+      // The file part resolves to the absolute attachment in the workspace directory.
+      const expectedUrl = pathToFileURL(path.join(test.directory, "ATTACH.md")).href
+      expect(filePart?.type === "file" ? filePart.url : undefined).toBe(expectedUrl)
+    }),
+  )
+
+  // Task 10 (error path): a non-existent attachment is an authoring error. The
+  // agent step must fail with a WorkflowInvalidError naming the missing file
+  // rather than dispatching a broken prompt.
+  it.instance("ctx.agent files fails clearly when an attachment does not exist", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, FILES_MISSING_FIXTURE, FILES_MISSING_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: FILES_MISSING_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("files-missing workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      expect(node?.error).toContain("DOES_NOT_EXIST.md")
+      // The prompt was never dispatched (the attachment could not be resolved).
+      expect(inputs.length).toBe(0)
     }),
   )
 })
