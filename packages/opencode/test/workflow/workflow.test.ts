@@ -234,6 +234,20 @@ export async function run(args, ctx) {
 }
 `
 
+// Per-step tools-scoping fixture (Task 8): a single agent step that passes a
+// `tools` whitelist/blacklist. The engine must thread that Record<string,boolean>
+// through to the prompt run (PromptInput.tools) unchanged so the session scopes
+// its tools accordingly.
+const TOOLS_FIXTURE = "tools-step"
+const TOOLS_WORKFLOW = `export const meta = { name: "${TOOLS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", tools: { webfetch: false } })
+  return { ok: true }
+}
+`
+
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -4223,6 +4237,30 @@ export async function run() { return { from: "global" } }
       expect(node?.error).toContain("small_model")
       // The prompt was never dispatched (no model to run against).
       expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 8: a per-step `tools` whitelist/blacklist passed to ctx.agent must be
+  // threaded verbatim into the underlying prompt run. opencode's tool-scoping
+  // mechanism is PromptInput.tools (a Record<string,boolean> with glob-able
+  // keys), which the prompt loop turns into session permission rules — so the
+  // capturing prompt-ops record it directly and the dispatched object is
+  // asserted unchanged.
+  it.instance("ctx.agent tools scoping is threaded into the prompt run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, TOOLS_FIXTURE, TOOLS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: TOOLS_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("tools workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // Exactly one real agent dispatch, carrying the requested tools object unchanged.
+      expect(inputs.length).toBe(1)
+      expect(inputs[0]?.tools).toEqual({ webfetch: false })
     }),
   )
 })

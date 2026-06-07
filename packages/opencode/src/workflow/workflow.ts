@@ -403,6 +403,7 @@ export type AgentInput = {
   prompt: string
   model?: string
   variant?: string
+  tools?: Record<string, boolean>
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
 }
@@ -1962,6 +1963,13 @@ export const layer = Layer.effect(
               agent: selected.name,
               model: modelInfo,
               variant,
+              // Per-step tool scoping: opencode's `Record<string, boolean>`
+              // whitelist/blacklist (glob-able keys, e.g. `{ webfetch: false }`)
+              // lives on PromptInput.tools (NOT sessions.create — that only takes a
+              // permission Ruleset). The prompt loop folds each entry into an
+              // allow/deny session permission rule, so threading it here scopes the
+              // child session's tools for this step. Passed through unchanged.
+              tools: agentInput.tools,
               format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
               parts: [{ type: "text", text: agentInput.prompt }],
             })

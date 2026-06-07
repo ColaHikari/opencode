@@ -24,6 +24,13 @@ export type WorkflowAgentInput = {
   model?: string
   /** Per-step model reasoning variant (e.g. "max"), threaded into the underlying prompt run. */
   variant?: string
+  /**
+   * Per-step tool scoping for this agent step. A map of tool/permission name to
+   * whether it is enabled, with glob-able keys (e.g. `{ webfetch: false }` or
+   * `{ "skill_*": true }`). Each entry becomes an allow/deny permission rule on
+   * the child session, so the subagent only sees the tools you scope it to.
+   */
+  tools?: Record<string, boolean>
   schema?: unknown
   permissionSessionID?: string
 }
