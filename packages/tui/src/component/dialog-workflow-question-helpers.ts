@@ -14,6 +14,15 @@ export function questionOptions(pq: PendingQuestion): QuestionOption[] {
   return [...declared, { kind: "freetext", label: "Type a custom answer" }]
 }
 
+// Whether the option-list navigation keys (↑/↓) should be active. They are only
+// meaningful when there is a declared option to move between — a free-text-only
+// question has a single entry (the freetext sentinel), so the arrows belong to
+// the focused textarea (cursor movement) rather than to list navigation. Used to
+// scope the nav bindings off so a custom answer's arrow keys are not stolen.
+export function shouldEnableNav(options: QuestionOption[]): boolean {
+  return options.length > 1
+}
+
 // Resolves the answer string to submit from the current selection: an `option`
 // selection returns its label (the free-text field is ignored), the `freetext`
 // entry returns the trimmed typed text or `undefined` when empty (nothing to

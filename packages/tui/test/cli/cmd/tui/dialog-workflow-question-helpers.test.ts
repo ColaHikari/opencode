@@ -4,6 +4,7 @@ import {
   questionOptions,
   selectedAnswer,
   isResumeAnswer,
+  shouldEnableNav,
 } from "../../../../src/component/dialog-workflow-question-helpers"
 
 function run(id: string): WorkflowRun {
@@ -33,6 +34,18 @@ describe("selectedAnswer", () => {
   test("empty free-text returns undefined (nothing to submit)", () => {
     const opts = questionOptions({ question: "Q", asked_at: 1 })
     expect(selectedAnswer(opts, 0, "   ")).toBeUndefined()
+  })
+})
+
+describe("shouldEnableNav (scope the option-list nav keys)", () => {
+  test("nav is enabled when there is a declared option besides the free-text entry", () => {
+    expect(shouldEnableNav(questionOptions({ question: "Q", options: ["yes", "no"], asked_at: 1 }))).toBe(true)
+  })
+  test("nav is disabled for a free-text-only question (the lone entry — arrows belong to the textarea)", () => {
+    expect(shouldEnableNav(questionOptions({ question: "Q", asked_at: 1 }))).toBe(false)
+  })
+  test("an empty option list disables nav", () => {
+    expect(shouldEnableNav([])).toBe(false)
   })
 })
 

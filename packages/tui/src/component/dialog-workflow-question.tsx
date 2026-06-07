@@ -8,11 +8,11 @@ import { useDialog, type DialogContext } from "../ui/dialog"
 import { useToast } from "../ui/toast"
 import { useBindings } from "../keymap"
 import { answerWorkflowRun } from "./dialog-workflow-client"
-import { isResumeAnswer, questionOptions, selectedAnswer } from "./dialog-workflow-question-helpers"
+import { isResumeAnswer, questionOptions, selectedAnswer, shouldEnableNav } from "./dialog-workflow-question-helpers"
 
 // Thin Solid component for the question dialog (Spec §5.2 (4)): renders the
 // question + declared options + a free-text entry, and submits the resolved
-// answer to the LIVE `POST /workflow/run/:id/answer` route via the WFCLIENT shim.
+// answer via the generated `sdk.client.workflow.answer` route (answerWorkflowRun).
 // All decision logic (option list, answer resolution, resume detection) lives in
 // dialog-workflow-question-helpers; this component only wires render + I/O.
 // `onClose(resumeRunID?)` is called with the NEW run id when answering a parked
@@ -64,16 +64,37 @@ export function DialogWorkflowQuestion(props: {
     props.onClose()
   }
 
+  // The free-text textarea is focused on open so a custom answer (including the
+  // letters j/k) can be typed. The dialog form bindings are therefore scoped to
+  // the textarea target with priority 1 so they win over the global managed
+  // textarea input layer (mirrors DialogWorkflowSave / DialogPrompt / the prompt
+  // autocomplete). Only ↑/↓ navigate the option list — the bare k/j aliases are
+  // gone (they belong to the textarea now) — and nav is enabled only when there
+  // is an option to move between (shouldEnableNav), so a free-text-only question
+  // leaves the arrows to the textarea cursor.
   useBindings(() => ({
+    target: textareaTarget,
+    enabled: textareaTarget() !== undefined,
+    priority: 1,
     bindings: [
-      { key: "up,k", desc: "Previous answer", group: "Dialog", cmd: () => move(-1) },
-      { key: "down,j", desc: "Next answer", group: "Dialog", cmd: () => move(1) },
+      ...(shouldEnableNav(options())
+        ? [
+            { key: "up", desc: "Previous answer", group: "Dialog", cmd: () => move(-1) },
+            { key: "down", desc: "Next answer", group: "Dialog", cmd: () => move(1) },
+          ]
+        : []),
       { key: "return", desc: "Submit answer", group: "Dialog", cmd: () => void submit() },
     ],
   }))
 
   onMount(() => {
     dialog.setSize("medium")
+    // Focus after a tick so the textarea is mounted (mirrors DialogWorkflowSave /
+    // DialogPrompt); a custom answer is then typable the moment the dialog opens.
+    setTimeout(() => {
+      if (!textarea || textarea.isDestroyed) return
+      textarea.focus()
+    }, 1)
   })
 
   return (
