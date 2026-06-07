@@ -769,8 +769,7 @@ function snapshot(active: Active): Run {
     // Detach the pending question from the live run so a caller mutating the
     // returned snapshot cannot reach into engine state (mirrors the nested-value
     // defensiveness above). `options` is a plain string array, JSON-safe.
-    pending_question:
-      active.run.pending_question === undefined ? undefined : jsonClone(active.run.pending_question),
+    pending_question: active.run.pending_question === undefined ? undefined : jsonClone(active.run.pending_question),
   }
 }
 
@@ -1886,8 +1885,7 @@ export const layer = Layer.effect(
         // caller still fails cleanly (InvalidError) instead of defecting deep in
         // the module load. The run's name is the source's meta name.
         const read = MetaReader.read(input.source, inlinePath("inline"))
-        if (read.valid === false)
-          return yield* new InvalidError({ path: inlinePath("inline"), message: read.error })
+        if (read.valid === false) return yield* new InvalidError({ path: inlinePath("inline"), message: read.error })
         target = { name: read.meta.name, path: inlinePath(read.meta.name), source: input.source }
       } else {
         // Resolve the single target by name without loading every workflow: a
@@ -2188,8 +2186,7 @@ export const layer = Layer.effect(
               skills.length > 0
                 ? `Load these skills before starting: ${skills.join(", ")}.\n\n${agentInput.prompt}`
                 : agentInput.prompt
-            const tools =
-              skills.length > 0 ? { ...(agentInput.tools ?? {}), skill: true } : agentInput.tools
+            const tools = skills.length > 0 ? { ...(agentInput.tools ?? {}), skill: true } : agentInput.tools
             // Declarative file attachments (Task 10). Each path is resolved
             // RELATIVE TO the run's workspace directory (`active.directory`, the
             // InstanceState directory the run was started in) and must exist —
@@ -2326,9 +2323,7 @@ export const layer = Layer.effect(
               pattern: "*" as const,
             }))
             const composeTools = derivedPermission !== undefined && toolRules.length > 0
-            const createPermission = composeTools
-              ? [...toolRules, ...derivedPermission!]
-              : derivedPermission
+            const createPermission = composeTools ? [...toolRules, ...derivedPermission!] : derivedPermission
             // Per-step git-worktree isolation (Task 11). When requested, run the
             // subagent inside a FRESH `git worktree` so parallel agents that
             // mutate files cannot conflict. The worktree is created off the run's
@@ -2403,43 +2398,45 @@ export const layer = Layer.effect(
               if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
             }
             yield* persistRun(db, events, active)
-            const message = yield* prompt.prompt({
-              sessionID: session.id,
-              permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
-              agent: selected.name,
-              model: modelInfo,
-              variant,
-              // Per-step tool scoping: opencode's `Record<string, boolean>`
-              // whitelist/blacklist (glob-able keys, e.g. `{ webfetch: false }`)
-              // lives on PromptInput.tools (NOT sessions.create — that only takes a
-              // permission Ruleset). The prompt loop folds each entry into an
-              // allow/deny session permission rule, so threading it here scopes the
-              // child session's tools for this step. `tools` already merges the
-              // step's own scoping with the `skill: true` enablement that the
-              // skills directive (above) requires.
-              //
-              // BUT the prompt loop's handler does a FULL ASSIGNMENT that would
-              // clobber an inherited subagent ruleset. So when we already composed
-              // the per-step rules INTO the child session's permission at creation
-              // (an inherited ruleset existed — `composeTools`), we must NOT pass
-              // `tools` here, or it would overwrite that composed ruleset and drop
-              // the inherited denies. Only route through PromptInput.tools when there
-              // was nothing to inherit/clobber.
-              tools: composeTools ? undefined : tools,
-              format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
-              // `promptText` is the author's prompt, optionally prefixed with the
-              // per-step skill-load directive (see the `skills` resolution above).
-              // Declarative file attachments (Task 10) follow the text part, in the
-              // order they were declared.
-              parts: [{ type: "text", text: promptText }, ...fileParts],
-              // Worktree isolation (Task 11): override the effective InstanceRef
-              // for the subagent's prompt run so its file tools resolve cwd
-              // against the worktree, not the run's workspace. `InstanceRef` is a
-              // Context.Reference (innermost-wins), so this local provide beats
-              // the run-level one attached at the dispatch boundary. When isolation
-              // is off, `promptInstanceCtx === instanceCtx` so this is the prior
-              // (effectively no-op) provide of the same ref value.
-            }).pipe(Effect.provideService(InstanceRef, promptInstanceCtx))
+            const message = yield* prompt
+              .prompt({
+                sessionID: session.id,
+                permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
+                agent: selected.name,
+                model: modelInfo,
+                variant,
+                // Per-step tool scoping: opencode's `Record<string, boolean>`
+                // whitelist/blacklist (glob-able keys, e.g. `{ webfetch: false }`)
+                // lives on PromptInput.tools (NOT sessions.create — that only takes a
+                // permission Ruleset). The prompt loop folds each entry into an
+                // allow/deny session permission rule, so threading it here scopes the
+                // child session's tools for this step. `tools` already merges the
+                // step's own scoping with the `skill: true` enablement that the
+                // skills directive (above) requires.
+                //
+                // BUT the prompt loop's handler does a FULL ASSIGNMENT that would
+                // clobber an inherited subagent ruleset. So when we already composed
+                // the per-step rules INTO the child session's permission at creation
+                // (an inherited ruleset existed — `composeTools`), we must NOT pass
+                // `tools` here, or it would overwrite that composed ruleset and drop
+                // the inherited denies. Only route through PromptInput.tools when there
+                // was nothing to inherit/clobber.
+                tools: composeTools ? undefined : tools,
+                format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
+                // `promptText` is the author's prompt, optionally prefixed with the
+                // per-step skill-load directive (see the `skills` resolution above).
+                // Declarative file attachments (Task 10) follow the text part, in the
+                // order they were declared.
+                parts: [{ type: "text", text: promptText }, ...fileParts],
+                // Worktree isolation (Task 11): override the effective InstanceRef
+                // for the subagent's prompt run so its file tools resolve cwd
+                // against the worktree, not the run's workspace. `InstanceRef` is a
+                // Context.Reference (innermost-wins), so this local provide beats
+                // the run-level one attached at the dispatch boundary. When isolation
+                // is off, `promptInstanceCtx === instanceCtx` so this is the prior
+                // (effectively no-op) provide of the same ref value.
+              })
+              .pipe(Effect.provideService(InstanceRef, promptInstanceCtx))
             node.message_id = message.info.id
             if (message.info.role === "assistant") {
               node.model = `${message.info.providerID}/${message.info.modelID}`
@@ -2631,9 +2628,7 @@ export const layer = Layer.effect(
               // and `nothrow` resolves the killed run with a non-zero exitCode
               // (1) instead of hanging or throwing. The timer is always cleared.
               const controller = opts?.timeout ? new AbortController() : undefined
-              const timer = controller
-                ? setTimeout(() => controller.abort(), opts!.timeout)
-                : undefined
+              const timer = controller ? setTimeout(() => controller.abort(), opts!.timeout) : undefined
               return Process.run([sh, ...Shell.args(sh, command, cwd)], {
                 cwd,
                 nothrow: true,
@@ -2704,53 +2699,52 @@ export const layer = Layer.effect(
             const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(timeout))
             return result
           }),
-        ).then((result) => {
-          // Resolve (answer landed) or park (timeout). Either way the question is no
-          // longer pending in-memory.
-          active.pendingQuestion = undefined
-          if (result._tag === "Some") {
-            // Live answer. `answer()` is the authoritative writer (it completes the
-            // node + clears pending_question + persists before resolving the
-            // Deferred), so this branch only needs to hand the reply back to the
-            // body. Idempotently close the node if it was somehow left open, so the
-            // body never proceeds with a still-`running` question node.
-            if (node.status === "running") {
-              active.run.pending_question = undefined
-              node.status = "completed"
-              node.completed_at = Date.now()
-              node.answer = result.value.answer
-              persistInScope(active, bridge, db, events)
+        ).then(
+          (result) => {
+            // Resolve (answer landed) or park (timeout). Either way the question is no
+            // longer pending in-memory.
+            active.pendingQuestion = undefined
+            if (result._tag === "Some") {
+              // Live answer. `answer()` is the authoritative writer (it completes the
+              // node + clears pending_question + persists before resolving the
+              // Deferred), so this branch only needs to hand the reply back to the
+              // body. Idempotently close the node if it was somehow left open, so the
+              // body never proceeds with a still-`running` question node.
+              if (node.status === "running") {
+                active.run.pending_question = undefined
+                node.status = "completed"
+                node.completed_at = Date.now()
+                node.answer = result.value.answer
+                persistInScope(active, bridge, db, events)
+              }
+              return result.value
             }
-            return result.value
-          }
-          // Timeout: PARK the run as `paused` via the existing pause machinery.
-          // Keep `pending_question` AND the open question node intact (do NOT
-          // complete the node) so a later answer() can resume. Setting `pausing`
-          // makes the body's matchCauseEffect map this unwind to `paused`, racing
-          // pause()'s own finish idempotently. Throwing CancelledError unwinds the
-          // body the same way an interrupt-driven pause does.
-          active.pausing = true
-          throw new CancelledError()
-        }, (error) => {
-          // An external pause()/cancel() that closed the run scope rejects the
-          // dispatched wait with CancelledError. Drop the dangling in-memory
-          // pending-question reference (the run is unwinding to paused/cancelled via
-          // abortRun's own finish) and let the rejection propagate so the body
-          // unwinds consistently with the rest of the engine.
-          active.pendingQuestion = undefined
-          throw error
-        })
+            // Timeout: PARK the run as `paused` via the existing pause machinery.
+            // Keep `pending_question` AND the open question node intact (do NOT
+            // complete the node) so a later answer() can resume. Setting `pausing`
+            // makes the body's matchCauseEffect map this unwind to `paused`, racing
+            // pause()'s own finish idempotently. Throwing CancelledError unwinds the
+            // body the same way an interrupt-driven pause does.
+            active.pausing = true
+            throw new CancelledError()
+          },
+          (error) => {
+            // An external pause()/cancel() that closed the run scope rejects the
+            // dispatched wait with CancelledError. Drop the dangling in-memory
+            // pending-question reference (the run is unwinding to paused/cancelled via
+            // abortRun's own finish) and let the rejection propagate so the body
+            // unwinds consistently with the rest of the engine.
+            active.pendingQuestion = undefined
+            throw error
+          },
+        )
       }
 
       // Build the run context for the top-level body OR a depth-1 nested workflow.
       // Captured here so `ctx.workflow` (below) can re-enter it with a bumped
       // `depth` and a `logPrefix`, sharing the SAME `active` — and thus the same
       // concurrency semaphore, budget, abort scope, and agent-lifetime cap.
-      const buildContext = (ctxInput: {
-        depth: number
-        logPrefix?: string
-        phases?: readonly Phase[]
-      }): ContextApi =>
+      const buildContext = (ctxInput: { depth: number; logPrefix?: string; phases?: readonly Phase[] }): ContextApi =>
         createContext({
           active,
           agent,

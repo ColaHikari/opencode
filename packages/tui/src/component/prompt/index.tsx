@@ -1165,12 +1165,8 @@ export function Prompt(props: PromptProps) {
         })()
       : inputText
     const ultracodeParts = [
-      ...(ultracodeSession()
-        ? [{ type: "text" as const, text: ULTRACODE_SESSION_DIRECTIVE, synthetic: true }]
-        : []),
-      ...(keywordActive
-        ? [{ type: "text" as const, text: ULTRACODE_PROMPT_DIRECTIVE, synthetic: true }]
-        : []),
+      ...(ultracodeSession() ? [{ type: "text" as const, text: ULTRACODE_SESSION_DIRECTIVE, synthetic: true }] : []),
+      ...(keywordActive ? [{ type: "text" as const, text: ULTRACODE_PROMPT_DIRECTIVE, synthetic: true }] : []),
     ]
 
     if (store.mode === "shell") {

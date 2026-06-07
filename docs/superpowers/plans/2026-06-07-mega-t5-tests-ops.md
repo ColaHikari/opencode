@@ -15,6 +15,7 @@
 Read these before writing any test. They are the reason most of the §5.4 "gaps" are already closed; only the deltas below are genuine.
 
 **Resume-replay (`packages/opencode/test/workflow/workflow.test.ts`), ALREADY covered — skip:**
+
 - `"resume replays the completed agent from the journal and runs the rest live"` (line 4223) — A cached, B live, `resume_of` on the row, `cached:true`.
 - `"resume caches two identical prompts separately by occurrence"` (line 4315) — occurrence index.
 - `"resume with invalidate_agents reruns the named index live and caches the rest"` (line 4386) — `invalidate_agents:[0]`.
@@ -25,20 +26,24 @@ Read these before writing any test. They are the reason most of the §5.4 "gaps"
 - `"answer() forwards prompt ops so a resumed run can dispatch agents after the question"` (line 4679) — question parks, resume runs the LIVE agent after replaying the question.
 
 **Orphan-sweep, ALREADY covered — skip:**
+
 - `"orphaned running rows are marked interrupted on service start"` (line 2352).
 - `"orphan sweep normalizes still-running agent nodes to failed"` (line 2371) — Fund 15.
 - `"sweep leaves paused rows untouched"` (line 4168) — but the paused row here has NO `pending_question` (genuine gap below).
 - `"cancel on a paused run transitions it to cancelled"` (line 4196).
 
 **Budget, ALREADY covered — skip:**
+
 - `"agent calls beyond exhausted budget fail the run with a budget error"` (line 2959).
 - `"parallel steps all pass the gate and overspend; the next step fails (soft cap)"` (line 2993) — Fund 23: 3 parallel à 0.5, budget 1.0, a Deferred barrier holds all 3 until all pass the gate ⇒ overspend to −0.5, next step fails. **This already proves the documented soft-cap overspend deterministically.** Task 4 adds only the minimal "2 agents, budget for 1" framing the review asked for plus a gate comment — NOT a fix.
 - `"budgetRemaining reflects real spend during the run"` (3027), `"ctx.budget exposes total/spent()/remaining()"` (3136), etc.
 
 **HTTP, ALREADY covered — skip:**
+
 - `test/server/httpapi-workflow-answer.test.ts` only asserts the route `POST /workflow/run/{id}/answer` is registered in the OpenAPI spec. It does NOT exercise any lifecycle (genuine gap below).
 
 **`/init` / commands, ALREADY covered — skip:**
+
 - `test/command/workflow-source.test.ts` proves workflows become `Command.Info` entries (`source:"workflow"`) and that a name colliding with a built-in (`init`) keeps `source:"command"`. It does NOT test the init PROMPT template content (genuine gap below).
 
 **Budget-race code AUDIT verdict (for Task 4):** In `src/workflow/workflow.ts` the `agent = async (agentInput) => { … }` body (lines 2080–2131) runs the abort gate, the `budgetRemaining <= 0` gate (line 2090), the lifetime gate, `active.agentStarted += 1`, and pushes the node ALL SYNCHRONOUSLY — there is no `await`/`yield` between the budget check and `dispatch(...)` (line 2131). The actual spend (`active.budgetRemaining -= node.cost`, line 2539) happens inside an `Effect.ensuring` that runs AFTER the prompt completes, behind `active.agentSemaphore.withPermits(1)` (line 2550) which is acquired INSIDE the dispatched effect. So multiple `ctx.parallel` tasks each call `agent()` and all pass the synchronous gate before any of them spends — exactly the documented best-effort soft cap, not a hidden hard-limit violation. **Verdict: benign-by-design. Deliverable = a pin test + a one-line gate comment. NO `SynchronizedRef.modify` reservation fix.**
@@ -65,6 +70,7 @@ Read these before writing any test. They are the reason most of the §5.4 "gaps"
 The replay basics, occurrence index, single-index `invalidate_agents:[0]`, status guards, schema drift, and the three question-resume flows are all pinned (see Grounding). The genuine gaps are: (1a) `invalidate_agents` at a NON-zero index combined with a kept earlier agent (proves the index is honored positionally, not just "rerun the first"); (1b) a fully-cached MIXED journal (question + agent) replayed on a single resume where BOTH come from the journal and NEITHER is re-asked/re-prompted; (1c) resume across a simulated engine restart via `reloadTestInstance` (the re-layer seam exists in the fixture but is never used for resume).
 
 **Files:**
+
 - Test: `packages/opencode/test/workflow/workflow.test.ts` (add tests after the existing `invalidate_agents` test, ~line 4438; add fixtures near line 1400)
 
 - [ ] **Step 1: Write the failing test for invalidate_agents at a non-zero index**
@@ -72,59 +78,59 @@ The replay basics, occurrence index, single-index `invalidate_agents:[0]`, statu
 Add this fixture next to `RESUME_WORKFLOW` (the existing two-agent fixture at ~line 1316 already has agents A then B). Reuse it; no new fixture needed. Add the test after line 4438:
 
 ```ts
-  // T5 gap (invalidate_agents positional): the existing invalidate test only
-  // rebuilds index [0]. Pin that a NON-zero index reruns ONLY that agent live
-  // while the EARLIER agent stays cached — proving the index is honored
-  // positionally, not "always rerun the first". RESUME_WORKFLOW dispatches A
-  // (index 0) then B (index 1); invalidate_agents:[1] must rerun B live, cache A.
-  it.instance("resume with invalidate_agents reruns a NON-zero index live and caches the earlier agent", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
-      const workflow = yield* Workflow.Service
-      const { db } = yield* Database.Service
+// T5 gap (invalidate_agents positional): the existing invalidate test only
+// rebuilds index [0]. Pin that a NON-zero index reruns ONLY that agent live
+// while the EARLIER agent stays cached — proving the index is honored
+// positionally, not "always rerun the first". RESUME_WORKFLOW dispatches A
+// (index 0) then B (index 1); invalidate_agents:[1] must rerun B live, cache A.
+it.instance("resume with invalidate_agents reruns a NON-zero index live and caches the earlier agent", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+    const workflow = yield* Workflow.Service
+    const { db } = yield* Database.Service
 
-      const firstOps = recordingPromptOps(db, 0)
-      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
-      const firstDone =
-        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
-      expect(firstDone.status).toBe("completed")
+    const firstOps = recordingPromptOps(db, 0)
+    const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
+    const firstDone =
+      (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+    expect(firstDone.status).toBe("completed")
 
-      // completed → paused so it is a legitimate resume source (journal kept).
-      yield* pollWithTimeout(
-        Effect.gen(function* () {
-          yield* db
-            .update(WorkflowRunTable)
-            .set({ status: "paused" })
-            .where(eq(WorkflowRunTable.id, first.id))
-            .run()
-            .pipe(Effect.orDie)
-          const current = yield* workflow.get(first.id)
-          return current?.status === "paused" ? current : undefined
-        }),
-        "source run never became paused",
-      )
+    // completed → paused so it is a legitimate resume source (journal kept).
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        yield* db
+          .update(WorkflowRunTable)
+          .set({ status: "paused" })
+          .where(eq(WorkflowRunTable.id, first.id))
+          .run()
+          .pipe(Effect.orDie)
+        const current = yield* workflow.get(first.id)
+        return current?.status === "paused" ? current : undefined
+      }),
+      "source run never became paused",
+    )
 
-      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
-      const resumed = yield* workflow.start({
-        name: RESUME_FIXTURE,
-        args: {},
-        prompt: resumeOps,
-        resume_of: first.id,
-        invalidate_agents: [1],
-      })
-      const done =
-        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
-      expect(done.status).toBe("completed")
-      // Only B (index 1) reran live; A (index 0) came from the journal.
-      expect(prompted).toContain("agent B")
-      expect(prompted).not.toContain("agent A")
-      const agentA = done.agents.find((a) => a.prompt === "agent A")
-      expect(agentA?.cached).toBe(true)
-      const agentB = done.agents.find((a) => a.prompt === "agent B")
-      expect(agentB?.cached).not.toBe(true)
-    }),
-  )
+    const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+    const resumed = yield* workflow.start({
+      name: RESUME_FIXTURE,
+      args: {},
+      prompt: resumeOps,
+      resume_of: first.id,
+      invalidate_agents: [1],
+    })
+    const done =
+      (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+    expect(done.status).toBe("completed")
+    // Only B (index 1) reran live; A (index 0) came from the journal.
+    expect(prompted).toContain("agent B")
+    expect(prompted).not.toContain("agent A")
+    const agentA = done.agents.find((a) => a.prompt === "agent A")
+    expect(agentA?.cached).toBe(true)
+    const agentB = done.agents.find((a) => a.prompt === "agent B")
+    expect(agentB?.cached).not.toBe(true)
+  }),
+)
 ```
 
 - [ ] **Step 2: Run it to verify it fails (or passes) and confirm the assertion is real**
@@ -156,72 +162,72 @@ export async function run(args, ctx) {
 Add the test after the Step 1 test:
 
 ```ts
-  // T5 gap (fully-cached mixed journal): question + agent BOTH replayed from the
-  // journal on a single resume. The existing q-then-agent test reruns the agent
-  // LIVE; here neither is re-executed.
-  it.instance("resume replays a question AND a following agent both from the journal without re-running either", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, MIXED_REPLAY_FIXTURE, MIXED_REPLAY_WORKFLOW))
-      const workflow = yield* Workflow.Service
-      const { db } = yield* Database.Service
+// T5 gap (fully-cached mixed journal): question + agent BOTH replayed from the
+// journal on a single resume. The existing q-then-agent test reruns the agent
+// LIVE; here neither is re-executed.
+it.instance("resume replays a question AND a following agent both from the journal without re-running either", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => writeWorkflow(test.directory, MIXED_REPLAY_FIXTURE, MIXED_REPLAY_WORKFLOW))
+    const workflow = yield* Workflow.Service
+    const { db } = yield* Database.Service
 
-      // First run: answer the question live, agent runs live with a recorded prompt.
-      const firstOps = recordingPromptOps(db, 0)
-      const first = yield* workflow.start({ name: MIXED_REPLAY_FIXTURE, args: {}, prompt: firstOps.ops })
-      yield* pollWithTimeout(
-        Effect.gen(function* () {
-          const current = yield* workflow.get(first.id)
-          return current?.pending_question?.question === "ship?" ? current : undefined
-        }),
-        "pending question never appeared",
-      )
-      yield* workflow.answer({ id: first.id, answer: "yes" })
-      const firstDone =
-        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first mixed run did not finish")))
-      expect(firstDone.status).toBe("completed")
-      expect(firstOps.prompted).toContain("do-yes")
-      const firstResult = firstDone.result as { answer: string; work: string }
-      expect(firstResult.answer).toBe("yes")
+    // First run: answer the question live, agent runs live with a recorded prompt.
+    const firstOps = recordingPromptOps(db, 0)
+    const first = yield* workflow.start({ name: MIXED_REPLAY_FIXTURE, args: {}, prompt: firstOps.ops })
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const current = yield* workflow.get(first.id)
+        return current?.pending_question?.question === "ship?" ? current : undefined
+      }),
+      "pending question never appeared",
+    )
+    yield* workflow.answer({ id: first.id, answer: "yes" })
+    const firstDone =
+      (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first mixed run did not finish")))
+    expect(firstDone.status).toBe("completed")
+    expect(firstOps.prompted).toContain("do-yes")
+    const firstResult = firstDone.result as { answer: string; work: string }
+    expect(firstResult.answer).toBe("yes")
 
-      // completed → paused so it is a legitimate resume source (journal kept).
-      yield* pollWithTimeout(
-        Effect.gen(function* () {
-          yield* db
-            .update(WorkflowRunTable)
-            .set({ status: "paused" })
-            .where(eq(WorkflowRunTable.id, first.id))
-            .run()
-            .pipe(Effect.orDie)
-          const current = yield* workflow.get(first.id)
-          return current?.status === "paused" ? current : undefined
-        }),
-        "source run never became paused",
-      )
+    // completed → paused so it is a legitimate resume source (journal kept).
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        yield* db
+          .update(WorkflowRunTable)
+          .set({ status: "paused" })
+          .where(eq(WorkflowRunTable.id, first.id))
+          .run()
+          .pipe(Effect.orDie)
+        const current = yield* workflow.get(first.id)
+        return current?.status === "paused" ? current : undefined
+      }),
+      "source run never became paused",
+    )
 
-      // Resume: BOTH the question and the agent are served from the journal.
-      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
-      const resumed = yield* workflow.start({
-        name: MIXED_REPLAY_FIXTURE,
-        args: {},
-        prompt: resumeOps,
-        resume_of: first.id,
-      })
-      const done =
-        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("mixed resume did not finish")))
-      expect(done.status).toBe("completed")
-      // No agent was re-prompted on the resume — it came from the journal.
-      expect(prompted).toHaveLength(0)
-      // The question was NOT re-asked: no open pending_question on the resumed run.
-      expect(done.pending_question).toBeUndefined()
-      // Both journal nodes are present and the result matches the first run.
-      const qnode = done.agents.find((a) => a.kind === "question")
-      expect(qnode?.answer).toBe("yes")
-      const anode = done.agents.find((a) => a.prompt === "do-yes")
-      expect(anode?.cached).toBe(true)
-      expect(done.result).toEqual(firstResult)
-    }),
-  )
+    // Resume: BOTH the question and the agent are served from the journal.
+    const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+    const resumed = yield* workflow.start({
+      name: MIXED_REPLAY_FIXTURE,
+      args: {},
+      prompt: resumeOps,
+      resume_of: first.id,
+    })
+    const done =
+      (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("mixed resume did not finish")))
+    expect(done.status).toBe("completed")
+    // No agent was re-prompted on the resume — it came from the journal.
+    expect(prompted).toHaveLength(0)
+    // The question was NOT re-asked: no open pending_question on the resumed run.
+    expect(done.pending_question).toBeUndefined()
+    // Both journal nodes are present and the result matches the first run.
+    const qnode = done.agents.find((a) => a.kind === "question")
+    expect(qnode?.answer).toBe("yes")
+    const anode = done.agents.find((a) => a.prompt === "do-yes")
+    expect(anode?.cached).toBe(true)
+    expect(done.result).toEqual(firstResult)
+  }),
+)
 ```
 
 - [ ] **Step 4: Run it to verify behavior**
@@ -234,54 +240,54 @@ Expected: PASS (pins that a mixed journal fully replays). If the question replay
 The fixture import is `reloadTestInstance` from `../fixture/fixture`. Add it to the existing import line (`import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"`) → add `reloadTestInstance`. This test runs OUTSIDE `it.instance` (which owns the instance lifecycle); use a `tmpdirScoped`-based `it.live` shape so the test controls reload. Add after the Step 3 test:
 
 ```ts
-  // T5 gap (resume after engine restart): the resume path is proven within ONE
-  // service lifetime; here we PROVE it survives a process restart. A run parks as
-  // paused (its journal persisted in SQLite), then we reload the instance
-  // (reloadTestInstance → fresh Workflow.Service over the SAME directory/DB,
-  // running the startup orphan sweep). The reload must NOT touch the paused row
-  // (it has no live fiber by design but is parked, not lost), and a resume started
-  // by the fresh service must still replay the journaled question from disk.
-  it.live("a resume after an engine restart (service re-layer) replays the journaled question from disk", () =>
-    Effect.gen(function* () {
-      const directory = yield* tmpdirScoped({ git: true })
-      yield* Effect.promise(() => writeWorkflow(directory, QUESTION_TIMEOUT_FIXTURE, QUESTION_TIMEOUT_WORKFLOW))
+// T5 gap (resume after engine restart): the resume path is proven within ONE
+// service lifetime; here we PROVE it survives a process restart. A run parks as
+// paused (its journal persisted in SQLite), then we reload the instance
+// (reloadTestInstance → fresh Workflow.Service over the SAME directory/DB,
+// running the startup orphan sweep). The reload must NOT touch the paused row
+// (it has no live fiber by design but is parked, not lost), and a resume started
+// by the fresh service must still replay the journaled question from disk.
+it.live("a resume after an engine restart (service re-layer) replays the journaled question from disk", () =>
+  Effect.gen(function* () {
+    const directory = yield* tmpdirScoped({ git: true })
+    yield* Effect.promise(() => writeWorkflow(directory, QUESTION_TIMEOUT_FIXTURE, QUESTION_TIMEOUT_WORKFLOW))
 
-      // Lifetime 1: start the run; its 50ms-timeout question parks it as paused
-      // with the open question persisted on the row.
-      const pausedId = yield* Effect.gen(function* () {
-        const workflow = yield* Workflow.Service
-        const run = yield* workflow.start({ name: QUESTION_TIMEOUT_FIXTURE, args: {}, prompt: immediatePromptOps() })
-        const paused =
-          (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("timeout run did not settle")))
-        expect(paused.status).toBe("paused")
-        expect(paused.pending_question?.question).toBe("deploy?")
-        return run.id
-      }).pipe(provideInstance(directory))
+    // Lifetime 1: start the run; its 50ms-timeout question parks it as paused
+    // with the open question persisted on the row.
+    const pausedId = yield* Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: QUESTION_TIMEOUT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("timeout run did not settle")))
+      expect(paused.status).toBe("paused")
+      expect(paused.pending_question?.question).toBe("deploy?")
+      return run.id
+    }).pipe(provideInstance(directory))
 
-      // Restart: drop the instance and rebuild a fresh one over the SAME directory.
-      yield* Effect.promise(() => reloadTestInstance({ directory }))
+    // Restart: drop the instance and rebuild a fresh one over the SAME directory.
+    yield* Effect.promise(() => reloadTestInstance({ directory }))
 
-      // Lifetime 2: the fresh service ran its startup sweep. The paused row must be
-      // intact (not swept to interrupted), and answer() must start a resume that
-      // replays the question from disk and completes.
-      yield* Effect.gen(function* () {
-        const workflow = yield* Workflow.Service
-        const reloaded = yield* workflow.get(pausedId)
-        expect(reloaded?.status).toBe("paused")
-        expect(reloaded?.pending_question?.question).toBe("deploy?")
-        const resumed = yield* workflow.answer({ id: pausedId, answer: "no" })
-        expect(resumed).toBeDefined()
-        expect(resumed!.resume_of).toBe(pausedId)
-        const done =
-          (yield* workflow.wait({ id: resumed!.id })).run ??
-          (yield* Effect.fail(new Error("post-restart resume did not finish")))
-        expect(done.status).toBe("completed")
-        expect((done.result as { answer: string }).answer).toBe("no")
-        const replayed = done.agents.find((a) => a.kind === "question")
-        expect(replayed?.answer).toBe("no")
-      }).pipe(provideInstance(directory))
-    }),
-  )
+    // Lifetime 2: the fresh service ran its startup sweep. The paused row must be
+    // intact (not swept to interrupted), and answer() must start a resume that
+    // replays the question from disk and completes.
+    yield* Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const reloaded = yield* workflow.get(pausedId)
+      expect(reloaded?.status).toBe("paused")
+      expect(reloaded?.pending_question?.question).toBe("deploy?")
+      const resumed = yield* workflow.answer({ id: pausedId, answer: "no" })
+      expect(resumed).toBeDefined()
+      expect(resumed!.resume_of).toBe(pausedId)
+      const done =
+        (yield* workflow.wait({ id: resumed!.id })).run ??
+        (yield* Effect.fail(new Error("post-restart resume did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("no")
+      const replayed = done.agents.find((a) => a.kind === "question")
+      expect(replayed?.answer).toBe("no")
+    }).pipe(provideInstance(directory))
+  }),
+)
 ```
 
 - [ ] **Step 6: Run it to verify behavior**
@@ -309,6 +315,7 @@ git commit -m "test(workflow): resume-replay gaps — non-zero invalidate index,
 `"sweep leaves paused rows untouched"` (line 4168) uses a paused row WITHOUT a `pending_question`. The §5.4 gaps are: (2a) sweep must leave a paused row that carries a persisted `pending_question` untouched AND preserve the question (so a later answer can still resume); (2b) the orphan sweep must NOT interrupt a LIVE-waiting question run (it has a live fiber by design, so the live-id set passed to `sweep()` protects it).
 
 **Files:**
+
 - Test: `packages/opencode/test/workflow/workflow.test.ts` (add after the existing sweep tests, ~line 4192)
 
 - [ ] **Step 1: Write the failing test for sweep vs paused-with-pending_question**
@@ -316,46 +323,56 @@ git commit -m "test(workflow): resume-replay gaps — non-zero invalidate index,
 Reuse the direct-insert pattern from the existing `"sweep leaves paused rows untouched"` test (line 4168). Add after it:
 
 ```ts
-  // T5 gap (sweep vs parked question): the existing "leaves paused rows untouched"
-  // test uses a paused row WITHOUT a pending_question. A run parked by an
-  // unanswered ctx.question carries a persisted pending_question; the sweep must
-  // leave BOTH the paused status AND the question intact so a later answer() can
-  // still resume it.
-  it.instance("sweep leaves a paused run that carries a pending_question untouched (status + question preserved)", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const workflow = yield* Workflow.Service
-      const { db } = yield* Database.Service
-      const pausedId = "job_paused_pending_question"
-      const now = Date.now()
-      yield* db
-        .insert(WorkflowRunTable)
-        .values({
-          id: pausedId,
-          workflow: HELLO_FIXTURE,
-          status: "paused",
-          started_at: now,
-          directory: test.directory,
-          logs: [],
-          agents: [{ id: "1", status: "completed", started_at: now, completed_at: now, kind: "question", prompt: "deploy?", answer: undefined }],
-          pending_question: { question: "deploy?", options: ["yes", "no"], asked_at: now },
-        })
-        .run()
-        .pipe(Effect.orDie)
+// T5 gap (sweep vs parked question): the existing "leaves paused rows untouched"
+// test uses a paused row WITHOUT a pending_question. A run parked by an
+// unanswered ctx.question carries a persisted pending_question; the sweep must
+// leave BOTH the paused status AND the question intact so a later answer() can
+// still resume it.
+it.instance("sweep leaves a paused run that carries a pending_question untouched (status + question preserved)", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const workflow = yield* Workflow.Service
+    const { db } = yield* Database.Service
+    const pausedId = "job_paused_pending_question"
+    const now = Date.now()
+    yield* db
+      .insert(WorkflowRunTable)
+      .values({
+        id: pausedId,
+        workflow: HELLO_FIXTURE,
+        status: "paused",
+        started_at: now,
+        directory: test.directory,
+        logs: [],
+        agents: [
+          {
+            id: "1",
+            status: "completed",
+            started_at: now,
+            completed_at: now,
+            kind: "question",
+            prompt: "deploy?",
+            answer: undefined,
+          },
+        ],
+        pending_question: { question: "deploy?", options: ["yes", "no"], asked_at: now },
+      })
+      .run()
+      .pipe(Effect.orDie)
 
-      yield* workflow.sweep()
+    yield* workflow.sweep()
 
-      const row = yield* fetchRunRow(pausedId)
-      expect(row.status).toBe("paused")
-      // The persisted question survives the sweep.
-      expect(row.pending_question?.question).toBe("deploy?")
-      expect(row.pending_question?.options).toEqual(["yes", "no"])
-      // The open question node is not flipped to failed (it is a parked question,
-      // not a lost running agent).
-      const qnode = row.agents.find((a) => a.kind === "question")
-      expect(qnode?.status).not.toBe("failed")
-    }),
-  )
+    const row = yield* fetchRunRow(pausedId)
+    expect(row.status).toBe("paused")
+    // The persisted question survives the sweep.
+    expect(row.pending_question?.question).toBe("deploy?")
+    expect(row.pending_question?.options).toEqual(["yes", "no"])
+    // The open question node is not flipped to failed (it is a parked question,
+    // not a lost running agent).
+    const qnode = row.agents.find((a) => a.kind === "question")
+    expect(qnode?.status).not.toBe("failed")
+  }),
+)
 ```
 
 - [ ] **Step 2: Run it to verify behavior**
@@ -368,41 +385,41 @@ Expected: PASS. If the sweep stripped `pending_question` or flipped the paused s
 A live `ctx.question` run has a real fiber; `sweep()` is called with the set of currently-live ids, so it must skip it. Reuse `QUESTION_WORKFLOW` (line 1368, no timeout → waits live) and `immediatePromptOps`. Add after the Step 1 test:
 
 ```ts
-  // T5 gap (sweep vs live-waiting question): a run blocked LIVE on ctx.question
-  // has a real fiber by design — the sweep (which only heals fiber-less zombie
-  // running rows) must NOT interrupt it. Start the question run, wait until its
-  // pending_question is live, sweep, and assert it is still running and still
-  // answerable.
-  it.instance("sweep does not interrupt a run waiting live on a question", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_FIXTURE, QUESTION_WORKFLOW))
-      const workflow = yield* Workflow.Service
+// T5 gap (sweep vs live-waiting question): a run blocked LIVE on ctx.question
+// has a real fiber by design — the sweep (which only heals fiber-less zombie
+// running rows) must NOT interrupt it. Start the question run, wait until its
+// pending_question is live, sweep, and assert it is still running and still
+// answerable.
+it.instance("sweep does not interrupt a run waiting live on a question", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_FIXTURE, QUESTION_WORKFLOW))
+    const workflow = yield* Workflow.Service
 
-      const run = yield* workflow.start({ name: QUESTION_FIXTURE, args: {}, prompt: immediatePromptOps() })
-      yield* pollWithTimeout(
-        Effect.gen(function* () {
-          const current = yield* workflow.get(run.id)
-          return current?.pending_question?.question === "deploy?" ? current : undefined
-        }),
-        "pending question never appeared",
-      )
+    const run = yield* workflow.start({ name: QUESTION_FIXTURE, args: {}, prompt: immediatePromptOps() })
+    yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const current = yield* workflow.get(run.id)
+        return current?.pending_question?.question === "deploy?" ? current : undefined
+      }),
+      "pending question never appeared",
+    )
 
-      // sweep() keys off the live-id set; the live-waiting run must be protected.
-      yield* workflow.sweep()
+    // sweep() keys off the live-id set; the live-waiting run must be protected.
+    yield* workflow.sweep()
 
-      const afterSweep = yield* workflow.get(run.id)
-      expect(afterSweep?.status).toBe("running")
-      expect(afterSweep?.pending_question?.question).toBe("deploy?")
+    const afterSweep = yield* workflow.get(run.id)
+    expect(afterSweep?.status).toBe("running")
+    expect(afterSweep?.pending_question?.question).toBe("deploy?")
 
-      // Still answerable: the live fiber resolves and the run completes.
-      yield* workflow.answer({ id: run.id, answer: "yes" })
-      const done =
-        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("live question run did not finish")))
-      expect(done.status).toBe("completed")
-      expect((done.result as { answer: string }).answer).toBe("yes")
-    }),
-  )
+    // Still answerable: the live fiber resolves and the run completes.
+    yield* workflow.answer({ id: run.id, answer: "yes" })
+    const done =
+      (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("live question run did not finish")))
+    expect(done.status).toBe("completed")
+    expect((done.result as { answer: string }).answer).toBe("yes")
+  }),
+)
 ```
 
 - [ ] **Step 4: Run it to verify behavior**
@@ -430,6 +447,7 @@ git commit -m "test(workflow): orphan-sweep vs question runs — parked pending_
 `httpapi-workflow-answer.test.ts` only checks route registration. The genuine gap is a full lifecycle sequence through the REAL `httpApiLayer` + `requestInDirectory`: start → (question) answer (live) → completed; and start → pause → (answer-as-resume) → completed; and start → cancel. Use a workflow fixture that ONLY uses `ctx.question` (no `ctx.agent`) so no LLM is needed — the question waits live, the answer route resolves it. For pause/cancel, a hanging-question (tiny-timeout) fixture parks as paused; cancel is exercised on a live-waiting question run.
 
 **Files:**
+
 - Create: `packages/opencode/test/server/httpapi-workflow-lifecycle.test.ts`
 
 Read first: `packages/opencode/test/server/httpapi-workflow-answer.test.ts` (imports), `packages/opencode/test/server/httpapi-layer.ts` (`httpApiLayer`, `request`, `requestInDirectory`), and a representative directory-scoped server test for the harness shape: `packages/opencode/test/server/httpapi-session.test.ts` (how `tmpdirScoped` + `x-opencode-directory` + the `it`/`testEffectShared` harness are wired). The workflow routes are `POST /workflow/:name/start`, `POST /workflow/run/:id/answer`, `POST /workflow/run/:id/cancel`, `GET /workflow/run/:id` (see `src/server/routes/instance/httpapi/groups/workflow.ts:62`). The answer payload is `{ answer: string }`; start payload is optional.
@@ -634,6 +652,7 @@ git commit -m "test(server): HTTP workflow lifecycle e2e — start/question/answ
 **Verdict (grounded, see Grounding):** benign-by-design. The budget gate and `agentStarted` increment run synchronously in the `agent` async body with no `await` before `dispatch(...)`; the spend happens in `Effect.ensuring` after the prompt, behind the per-run semaphore acquired INSIDE the dispatched effect. The existing Fund-23 test (line 2993, 3 parallel à 0.5 / budget 1.0) already proves the soft-cap overspend deterministically. This task adds the precise "2 parallel agents, budget for 1" framing the review asked for as an additional pin, plus a one-line comment at the gate documenting why the soft cap is intentional. **No `SynchronizedRef.modify` reservation.**
 
 **Files:**
+
 - Modify: `packages/opencode/src/workflow/workflow.ts:2090` (comment only)
 - Test: `packages/opencode/test/workflow/workflow.test.ts` (add after the Fund-23 soft-cap test, ~line 3025)
 
@@ -642,17 +661,19 @@ git commit -m "test(server): HTTP workflow lifecycle e2e — start/question/answ
 This reuses the same barrier mechanism as the Fund-23 test so it is deterministic, not timing-dependent. Check the existing helpers: `budgetBarrierPromptOps(db, costPerAgent, count)` and `BUDGET_PARALLEL_WORKFLOW` (used by the Fund-23 test at line 2993, declared near the budget fixtures). If `BUDGET_PARALLEL_WORKFLOW` takes `args.count`, parametrize with `count: 2`. Add after line 3025:
 
 ```ts
-  // T5 budget-race AUDIT (verdict: benign soft cap, no fix). The review asked
-  // specifically: "2 parallel agents, budget for exactly 1 — does the second
-  // double-spend BEYOND the documented soft cap?" Deterministic proof via the
-  // same Deferred barrier as the Fund-23 test: 2 agents à 1.0, budget 1.0. The
-  // barrier holds BOTH until both have passed the synchronous gate, so both
-  // charge ⇒ overspend to -1.0 (exactly one extra step's worth, the cost already
-  // in flight). This is the DOCUMENTED soft cap — NOT an unbounded race: the gate
-  // refuses any FURTHER step once the budget is non-positive. This test pins that
-  // boundary so a future refactor that turns the soft cap into either a hard limit
-  // OR an unbounded leak fails here.
-  it.instance("budget-race audit: 2 parallel agents with budget for 1 overspend by exactly one step (soft cap, bounded)", () =>
+// T5 budget-race AUDIT (verdict: benign soft cap, no fix). The review asked
+// specifically: "2 parallel agents, budget for exactly 1 — does the second
+// double-spend BEYOND the documented soft cap?" Deterministic proof via the
+// same Deferred barrier as the Fund-23 test: 2 agents à 1.0, budget 1.0. The
+// barrier holds BOTH until both have passed the synchronous gate, so both
+// charge ⇒ overspend to -1.0 (exactly one extra step's worth, the cost already
+// in flight). This is the DOCUMENTED soft cap — NOT an unbounded race: the gate
+// refuses any FURTHER step once the budget is non-positive. This test pins that
+// boundary so a future refactor that turns the soft cap into either a hard limit
+// OR an unbounded leak fails here.
+it.instance(
+  "budget-race audit: 2 parallel agents with budget for 1 overspend by exactly one step (soft cap, bounded)",
+  () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_PARALLEL_FIXTURE, BUDGET_PARALLEL_WORKFLOW))
@@ -679,7 +700,7 @@ This reuses the same barrier mechanism as the Fund-23 test so it is deterministi
       expect(result.nextStarted).toBe(true)
       expect(result.nextFailed).toBe(true)
     }),
-  )
+)
 ```
 
 - [ ] **Step 2: Run it; if the fixture body does not expose `overspent`/`nextStarted`/`nextFailed` for count:2, reconcile**
@@ -692,23 +713,26 @@ Expected: PASS. If `BUDGET_PARALLEL_WORKFLOW` hardcodes 3 agents instead of read
 In `packages/opencode/src/workflow/workflow.ts`, at the budget gate (line 2090, `if (active.budgetRemaining <= 0) {`), append to the existing comment block above it (lines 2084–2089) one sentence pinning the audited semantics. Edit the existing comment:
 
 Find (line 2087–2089):
+
 ```ts
-        // Once the prior steps have consumed the whole budget we refuse to spend
-        // again: fail the step with a BudgetExceededError, which propagates like
-        // any other agent failure (node `failed`, run `failed` unless caught).
+// Once the prior steps have consumed the whole budget we refuse to spend
+// again: fail the step with a BudgetExceededError, which propagates like
+// any other agent failure (node `failed`, run `failed` unless caught).
 ```
+
 Replace with:
+
 ```ts
-        // Once the prior steps have consumed the whole budget we refuse to spend
-        // again: fail the step with a BudgetExceededError, which propagates like
-        // any other agent failure (node `failed`, run `failed` unless caught).
-        // AUDITED soft cap (T5): this gate + the post-step spend (ensuring, below)
-        // run on SEPARATE turns, so N parallel ctx.parallel tasks can all pass this
-        // synchronous check before any of them charges ⇒ a run may overspend by the
-        // combined cost of the steps already in flight. That overspend is BOUNDED
-        // (the next step after exhaustion is refused here), so it is best-effort by
-        // design, not an unbounded leak — no atomic reservation is needed. Pinned by
-        // "budget-race audit: 2 parallel agents with budget for 1 …".
+// Once the prior steps have consumed the whole budget we refuse to spend
+// again: fail the step with a BudgetExceededError, which propagates like
+// any other agent failure (node `failed`, run `failed` unless caught).
+// AUDITED soft cap (T5): this gate + the post-step spend (ensuring, below)
+// run on SEPARATE turns, so N parallel ctx.parallel tasks can all pass this
+// synchronous check before any of them charges ⇒ a run may overspend by the
+// combined cost of the steps already in flight. That overspend is BOUNDED
+// (the next step after exhaustion is refused here), so it is best-effort by
+// design, not an unbounded leak — no atomic reservation is needed. Pinned by
+// "budget-race audit: 2 parallel agents with budget for 1 …".
 ```
 
 - [ ] **Step 4: Run the full budget block + typecheck**
@@ -731,16 +755,19 @@ git commit -m "test(workflow): budget-race audit — pin bounded soft-cap oversp
 Grounded: there is NO gitlab command/webhook handler in `packages/opencode/src`. `gitlab` appears only as a model provider (`provider/provider.ts`, `gitlab-ai-provider`), an auth plugin import (`plugin/index.ts`), and a provider id reference (`session/llm.ts`). The github engine-bypass concern lives in `src/cli/cmd/github.handler.ts`, which drives `Session`/`SessionPrompt` directly (bypassing the workflow engine). With no gitlab equivalent, the engine-bypass question is github-only — nothing to fix.
 
 **Files:**
+
 - Append to: this plan file (`docs/superpowers/plans/2026-06-07-mega-t5-tests-ops.md`) — the "Findings" appendix at the bottom.
 
 - [ ] **Step 1: Re-verify the finding holds at execution time (the worktree may have advanced)**
 
 Run:
+
 ```bash
 cd /Users/manuelguttmann/Projekte/oc-mega-t1
 grep -rln "gitlab" packages/opencode/src --include="*.ts"
 ls packages/opencode/src/cli/cmd/ | grep -iE "gitlab|github"
 ```
+
 Expected: gitlab hits are only `provider/provider.ts`, `plugin/index.ts`, `session/llm.ts` (model-provider scope); `cmd/` lists `github.handler.ts` (and `github*.ts`) but NO `gitlab*` file. If a gitlab handler HAS since appeared, escalate: that turns this into a real audit task (read it, compare to `github.handler.ts`'s `Session`-direct bypass) — STOP and flag to the orchestrator rather than silently documenting "none".
 
 - [ ] **Step 2: Record the finding in this plan's appendix**
@@ -762,6 +789,7 @@ git commit -m "docs(t5): document gitlab finding — no gitlab handler exists; e
 The `/init` command is prompt-template driven (`src/command/template/initialize.txt`); the model writes AGENTS.md from that prompt. The seam is `src/command/index.ts` `commands[Default.INIT]` (line 79), whose `template` getter renders `PROMPT_INITIALIZE.replace("${path}", ctx.worktree)`. The same `init` gen already resolves `yield* workflow.list()` (line 165). Inject an "Available workflows" section (names + descriptions) into the rendered init template ONLY when at least one VALID workflow exists. TDD against the existing command-discovery harness.
 
 **Files:**
+
 - Modify: `packages/opencode/src/command/index.ts` (init command body, ~line 74–87 and the `workflow.list()` loop at ~line 165)
 - Test: `packages/opencode/test/command/init-workflows.test.ts` (new)
 
@@ -795,9 +823,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { ok: true } 
 `
 
 async function initTemplate() {
-  const command = await Effect.runPromise(
-    Command.Service.pipe(Effect.flatMap((c) => c.get("init"))) as any,
-  )
+  const command = await Effect.runPromise(Command.Service.pipe(Effect.flatMap((c) => c.get("init"))) as any)
   return typeof command.template === "string" ? command.template : await command.template
 }
 
@@ -811,7 +837,8 @@ describe("/init lists available workflows in its AGENTS.md prompt", () => {
         yield* Effect.promise(() => writeWorkflow(dir, "audit", AUDIT))
         const command = yield* Command.Service
         const init = yield* command.get("init")
-        const template = typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => init!.template)
+        const template =
+          typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => init!.template)
         expect(template).toContain("Available workflows")
         expect(template).toContain("deploy")
         expect(template).toContain("Ship the app to prod.")
@@ -829,7 +856,8 @@ describe("/init lists available workflows in its AGENTS.md prompt", () => {
       Effect.gen(function* () {
         const command = yield* Command.Service
         const init = yield* command.get("init")
-        const template = typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => init!.template)
+        const template =
+          typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => init!.template)
         expect(template).not.toContain("Available workflows")
         expect(template).toContain("Create or update `AGENTS.md`")
       }),
@@ -842,7 +870,8 @@ describe("/init lists available workflows in its AGENTS.md prompt", () => {
         yield* Effect.promise(() => writeWorkflow(dir, "broken", "this is not a valid workflow module"))
         const command = yield* Command.Service
         const init = yield* command.get("init")
-        const template = typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => init!.template)
+        const template =
+          typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => init!.template)
         // No valid workflows ⇒ no section at all.
         expect(template).not.toContain("Available workflows")
         expect(template).not.toContain("broken")
@@ -864,32 +893,36 @@ Expected: FAIL — the first test fails at `expect(template).toContain("Availabl
 The `workflow.list()` loop is at line 165. Compute the rendered section in the SAME gen (before building `commands[Default.INIT]`, since the loop currently runs after). Move the list resolution up OR compute the section from a separate `workflow.list()` (cheap; discovery is static). Add, inside the `init` gen near the top (after `const commands = {}` at line 77), a section builder, then use it in the INIT template getter.
 
 Add after line 77 (`const commands: Record<string, Info> = {}`):
+
 ```ts
-      // T5 (/init): surface discovered workflows in the generated AGENTS.md prompt
-      // so the init pass documents them. Names + descriptions (falling back to
-      // whenToUse). Only VALID workflows are listed; the section is omitted
-      // entirely when none exist, so a repo with no workflows gets the unchanged
-      // prompt. list() is the static (never-executed) reader — safe at build time.
-      const initWorkflows = (yield* workflow.list()).filter((wf) => wf.valid !== false)
-      const workflowsSection =
-        initWorkflows.length === 0
-          ? ""
-          : "\n\n## Available workflows\n\nThis repository defines OpenCode workflows. Mention them in `AGENTS.md` so future sessions know they exist:\n\n" +
-            initWorkflows
-              .map((wf) => {
-                const desc = wf.meta.description ?? wf.meta.whenToUse
-                return desc ? `- \`${wf.name}\` — ${desc}` : `- \`${wf.name}\``
-              })
-              .join("\n")
+// T5 (/init): surface discovered workflows in the generated AGENTS.md prompt
+// so the init pass documents them. Names + descriptions (falling back to
+// whenToUse). Only VALID workflows are listed; the section is omitted
+// entirely when none exist, so a repo with no workflows gets the unchanged
+// prompt. list() is the static (never-executed) reader — safe at build time.
+const initWorkflows = (yield * workflow.list()).filter((wf) => wf.valid !== false)
+const workflowsSection =
+  initWorkflows.length === 0
+    ? ""
+    : "\n\n## Available workflows\n\nThis repository defines OpenCode workflows. Mention them in `AGENTS.md` so future sessions know they exist:\n\n" +
+      initWorkflows
+        .map((wf) => {
+          const desc = wf.meta.description ?? wf.meta.whenToUse
+          return desc ? `- \`${wf.name}\` — ${desc}` : `- \`${wf.name}\``
+        })
+        .join("\n")
 ```
 
 Then change the INIT template getter (line 83–85) from:
+
 ```ts
         get template() {
           return PROMPT_INITIALIZE.replace("${path}", ctx.worktree)
         },
 ```
+
 to:
+
 ```ts
         get template() {
           return PROMPT_INITIALIZE.replace("${path}", ctx.worktree) + workflowsSection
@@ -933,17 +966,21 @@ Expected: no errors.
 - [ ] **Step 2: Run the affected suites**
 
 Run:
+
 ```bash
 cd packages/opencode && bun test test/workflow/workflow.test.ts test/server/httpapi-workflow-lifecycle.test.ts test/server/httpapi-workflow-answer.test.ts test/command/init-workflows.test.ts test/command/workflow-source.test.ts --timeout 30000 2>&1 | tail -10
 ```
+
 Expected: all pass (existing workflow suite + the new resume/sweep/budget tests + the HTTP lifecycle e2e + both command tests).
 
 - [ ] **Step 3: Run the full workflow + server + command suites (regression guard)**
 
 Run:
+
 ```bash
 cd packages/opencode && bun test test/workflow/ test/server/ test/command/ --timeout 30000 2>&1 | tail -12
 ```
+
 Expected: green. If a pre-existing unrelated server test is flaky/red on this base, note it explicitly (do NOT attribute it to T5) and re-run the specific T5 files to confirm they pass in isolation.
 
 - [ ] **Step 4: Final commit if anything is uncommitted**
@@ -968,6 +1005,7 @@ Expected: clean (all task commits already landed). If anything dangling, commit 
 ## Self-Review
 
 **Spec §5.4 coverage:**
+
 - Resume-replay (incl. question steps): Phase 1 covers the bulk; Task 1 adds the 3 genuine gaps (non-zero invalidate index, fully-cached mixed journal, resume-after-restart). ✓
 - Orphan-sweep: Phase 1 covers orphan→interrupted, node normalization, plain-paused-untouched, cancel-on-paused; Task 2 adds the 2 genuine gaps (paused-with-pending_question, live-waiting question run). ✓
 - HTTP lifecycle e2e (start→question→answer→pause→resume→cancel): Task 3, new file, real httpapi. ✓

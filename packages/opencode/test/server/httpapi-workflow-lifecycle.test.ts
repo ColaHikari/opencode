@@ -46,13 +46,7 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeServices.layer),
 )
 const it = testEffect(
-  Layer.mergeAll(
-    instanceStoreLayer,
-    Project.defaultLayer,
-    Session.defaultLayer,
-    Database.defaultLayer,
-    httpApiLayer,
-  ),
+  Layer.mergeAll(instanceStoreLayer, Project.defaultLayer, Session.defaultLayer, Database.defaultLayer, httpApiLayer),
 )
 
 function requestInDirectory(reqPath: string, directory: string, init: RequestInit = {}) {

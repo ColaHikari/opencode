@@ -132,10 +132,7 @@ export function DialogWorkflowQuestion(props: {
 // Promise wrapper mirroring DialogConfirm.show / DialogWorkflowApproval.show.
 // Resolves to the resume run id when answering parked a run produced one, or
 // undefined (answered in place / cancelled / failed).
-DialogWorkflowQuestion.show = (
-  dialog: DialogContext,
-  input: { run: WorkflowRunWithQuestion; sessionID?: string },
-) => {
+DialogWorkflowQuestion.show = (dialog: DialogContext, input: { run: WorkflowRunWithQuestion; sessionID?: string }) => {
   return new Promise<string | undefined>((resolve) => {
     dialog.replace(
       () => (

@@ -200,7 +200,8 @@ const outputs = (
   await ctx.pipeline(
     ["api", "ui", "tests"],
     async (area) => (await ctx.agent({ agent: "explore", prompt: `Inspect ${area}` })).text,
-    async (notes, area) => (await ctx.agent({ agent: "plan", prompt: `Turn notes for ${area} into checks:\n${notes}` })).text,
+    async (notes, area) =>
+      (await ctx.agent({ agent: "plan", prompt: `Turn notes for ${area} into checks:\n${notes}` })).text,
     { concurrencyLimit: 4 }, // optional, trailing
   )
 ).filter((out) => out !== null) // a stage that throws drops that item to null

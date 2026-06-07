@@ -663,7 +663,8 @@ export const RunCommand = effectCmd({
           )
         } else {
           UI.println(`Workflow ${final.workflow} ${final.status}`)
-          if (final.result !== undefined) UI.println(typeof final.result === "string" ? final.result : JSON.stringify(final.result, null, 2))
+          if (final.result !== undefined)
+            UI.println(typeof final.result === "string" ? final.result : JSON.stringify(final.result, null, 2))
           if (final.error) UI.error(final.error)
         }
         process.exitCode = workflowExitCode(final.status)

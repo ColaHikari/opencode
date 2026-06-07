@@ -11,10 +11,9 @@ describe("opencode run --workflow (subprocess)", () => {
     "run --workflow exits nonzero for an unknown workflow name",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const result = yield* opencode.spawn(
-          ["run", "--workflow", "does-not-exist", "--model", "test/test-model"],
-          { timeoutMs: 20_000 },
-        )
+        const result = yield* opencode.spawn(["run", "--workflow", "does-not-exist", "--model", "test/test-model"], {
+          timeoutMs: 20_000,
+        })
         expect(result.exitCode).not.toBe(0)
         expect(result.durationMs).toBeLessThan(20_000) // no hang
       }),

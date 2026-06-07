@@ -32,7 +32,10 @@ describe("/init lists available workflows in its AGENTS.md prompt", () => {
         yield* Effect.promise(() => writeWorkflow(dir, "audit", AUDIT))
         const command = yield* Command.Service
         const init = yield* command.get("init")
-        const template = typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => Promise.resolve(init!.template))
+        const template =
+          typeof init!.template === "string"
+            ? init!.template
+            : yield* Effect.promise(() => Promise.resolve(init!.template))
         expect(template).toContain("Available workflows")
         expect(template).toContain("deploy")
         expect(template).toContain("Ship the app to prod.")
@@ -50,7 +53,10 @@ describe("/init lists available workflows in its AGENTS.md prompt", () => {
       Effect.gen(function* () {
         const command = yield* Command.Service
         const init = yield* command.get("init")
-        const template = typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => Promise.resolve(init!.template))
+        const template =
+          typeof init!.template === "string"
+            ? init!.template
+            : yield* Effect.promise(() => Promise.resolve(init!.template))
         // No repo-defined workflows ⇒ no section. The builtin deep-research workflow
         // ships inside opencode (source_kind "builtin"), so it is NOT documented as a
         // repository workflow in the init prompt.
@@ -67,7 +73,10 @@ describe("/init lists available workflows in its AGENTS.md prompt", () => {
         yield* Effect.promise(() => writeWorkflow(dir, "broken", "this is not a valid workflow module"))
         const command = yield* Command.Service
         const init = yield* command.get("init")
-        const template = typeof init!.template === "string" ? init!.template : yield* Effect.promise(() => Promise.resolve(init!.template))
+        const template =
+          typeof init!.template === "string"
+            ? init!.template
+            : yield* Effect.promise(() => Promise.resolve(init!.template))
         // No valid workflows ⇒ no section at all.
         expect(template).not.toContain("Available workflows")
         expect(template).not.toContain("broken")

@@ -29,7 +29,12 @@ import { PartID } from "@/session/schema"
 // builds internally, so a run started through the tool is the same run this
 // service reads back — mirroring why Session.defaultLayer is merged here.
 const it = testEffect(
-  Layer.mergeAll(ToolRegistry.defaultLayer, Session.defaultLayer, Workflow.defaultLayer, CrossSpawnSpawner.defaultLayer),
+  Layer.mergeAll(
+    ToolRegistry.defaultLayer,
+    Session.defaultLayer,
+    Workflow.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+  ),
 )
 
 const baseCtx: Omit<Tool.Context, "ask"> = {

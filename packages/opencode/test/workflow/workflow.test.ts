@@ -13,13 +13,7 @@ import { MessageTable } from "@opencode-ai/core/session/sql"
 import { MessageID } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { eq, sql } from "drizzle-orm"
-import {
-  TestInstance,
-  provideInstance,
-  tmpdirScoped,
-  reloadInstance,
-  testInstanceStoreLayer,
-} from "../fixture/fixture"
+import { TestInstance, provideInstance, tmpdirScoped, reloadInstance, testInstanceStoreLayer } from "../fixture/fixture"
 import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
@@ -329,7 +323,6 @@ export async function run(args, ctx) {
   return { ok: true }
 }
 `
-
 
 // Task 11: a single agent step requesting worktree isolation. When the workspace
 // is a git repository the engine runs the subagent inside a fresh `git worktree`
@@ -1598,9 +1591,7 @@ describe("Workflow", () => {
   it.instance("parallel drops a rejecting task to null and logs it instead of failing the batch", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, PARALLEL_ERROR_FIXTURE, PARALLEL_ERROR_WORKFLOW, "ts"),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_ERROR_FIXTURE, PARALLEL_ERROR_WORKFLOW, "ts"))
       const workflow = yield* Workflow.Service
       const started = yield* workflow.start({ name: PARALLEL_ERROR_FIXTURE, args: {} })
       const waited = yield* workflow.wait({ id: started.id })
@@ -1622,9 +1613,7 @@ describe("Workflow", () => {
   it.instance("pipeline drops only the throwing item to null and skips its remaining stages", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, PIPELINE_ERROR_FIXTURE, PIPELINE_ERROR_WORKFLOW, "ts"),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_ERROR_FIXTURE, PIPELINE_ERROR_WORKFLOW, "ts"))
       const workflow = yield* Workflow.Service
       const started = yield* workflow.start({ name: PIPELINE_ERROR_FIXTURE, args: {} })
       const waited = yield* workflow.wait({ id: started.id })
@@ -3055,33 +3044,35 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   // refuses any FURTHER step once the budget is non-positive. This test pins that
   // boundary so a future refactor that turns the soft cap into either a hard limit
   // OR an unbounded leak fails here.
-  it.instance("budget-race audit: 2 parallel agents with budget for 1 overspend by exactly one step (soft cap, bounded)", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_PARALLEL_FIXTURE, BUDGET_PARALLEL_WORKFLOW))
-      const workflow = yield* Workflow.Service
-      const { db } = yield* Database.Service
-      const run = yield* workflow.start({
-        name: BUDGET_PARALLEL_FIXTURE,
-        args: { count: 2 },
-        prompt: budgetBarrierPromptOps(db, 1, 2),
-        budget: 1,
-      })
-      const done = yield* workflow.wait({ id: run.id })
-      expect(done.run?.status).toBe("completed")
-      const result = done.run?.result as { overspent: number; nextStarted: boolean; nextFailed: boolean }
-      // Exactly one extra step's worth of overspend: 2 * 1.0 charged against a 1.0
-      // budget ⇒ remaining -1.0. Bounded, not unbounded.
-      expect(result.overspent).toBeCloseTo(-1, 10)
-      // Both parallel steps charged (the in-flight cost), and exactly two nodes
-      // exist — no third step slipped past the gate.
-      const completed = done.run?.agents.filter((a) => a.status === "completed") ?? []
-      expect(completed.length).toBe(2)
-      expect(done.run?.agents.length).toBe(2)
-      // The NEXT sequential step after exhaustion is refused (bounded soft cap).
-      expect(result.nextStarted).toBe(true)
-      expect(result.nextFailed).toBe(true)
-    }),
+  it.instance(
+    "budget-race audit: 2 parallel agents with budget for 1 overspend by exactly one step (soft cap, bounded)",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_PARALLEL_FIXTURE, BUDGET_PARALLEL_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { db } = yield* Database.Service
+        const run = yield* workflow.start({
+          name: BUDGET_PARALLEL_FIXTURE,
+          args: { count: 2 },
+          prompt: budgetBarrierPromptOps(db, 1, 2),
+          budget: 1,
+        })
+        const done = yield* workflow.wait({ id: run.id })
+        expect(done.run?.status).toBe("completed")
+        const result = done.run?.result as { overspent: number; nextStarted: boolean; nextFailed: boolean }
+        // Exactly one extra step's worth of overspend: 2 * 1.0 charged against a 1.0
+        // budget ⇒ remaining -1.0. Bounded, not unbounded.
+        expect(result.overspent).toBeCloseTo(-1, 10)
+        // Both parallel steps charged (the in-flight cost), and exactly two nodes
+        // exist — no third step slipped past the gate.
+        const completed = done.run?.agents.filter((a) => a.status === "completed") ?? []
+        expect(completed.length).toBe(2)
+        expect(done.run?.agents.length).toBe(2)
+        // The NEXT sequential step after exhaustion is refused (bounded soft cap).
+        expect(result.nextStarted).toBe(true)
+        expect(result.nextFailed).toBe(true)
+      }),
   )
 
   it.instance("budgetRemaining reflects real spend during the run", () =>
@@ -4337,7 +4328,8 @@ export async function run() { return { from: "global" } }
       // Still answerable: the live fiber resolves and the run completes.
       yield* workflow.answer({ id: run.id, answer: "yes" })
       const done =
-        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("live question run did not finish")))
+        (yield* workflow.wait({ id: run.id })).run ??
+        (yield* Effect.fail(new Error("live question run did not finish")))
       expect(done.status).toBe("completed")
       expect((done.result as { answer: string }).answer).toBe("yes")
     }),
@@ -4671,7 +4663,8 @@ export async function run() { return { from: "global" } }
       )
       yield* workflow.answer({ id: first.id, answer: "yes" })
       const firstDone =
-        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first mixed run did not finish")))
+        (yield* workflow.wait({ id: first.id })).run ??
+        (yield* Effect.fail(new Error("first mixed run did not finish")))
       expect(firstDone.status).toBe("completed")
       expect(firstOps.prompted).toContain("do-yes")
       const firstResult = firstDone.result as { answer: string; work: string }
@@ -4937,7 +4930,8 @@ export async function run() { return { from: "global" } }
       const seenPending: boolean[] = []
       const unsub = yield* events.listen((event) =>
         Effect.sync(() => {
-          if (event.type === "workflow.run.updated") seenPending.push((event.data as Record<string, unknown>)["pending_question"] === true)
+          if (event.type === "workflow.run.updated")
+            seenPending.push((event.data as Record<string, unknown>)["pending_question"] === true)
         }),
       )
       yield* Effect.addFinalizer(() => unsub)
@@ -5112,7 +5106,7 @@ export async function run() { return { from: "global" } }
   // Task 7 (error path): requesting model:"small" with NO small_model configured
   // is an authoring error. The agent step must fail with a clear message rather
   // than silently falling back; the prompt is never dispatched.
-  it.instance("ctx.agent model:\"small\" fails clearly when no small_model is configured", () =>
+  it.instance('ctx.agent model:"small" fails clearly when no small_model is configured', () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, SMALL_MODEL_FIXTURE, SMALL_MODEL_WORKFLOW))
@@ -5250,7 +5244,7 @@ export async function run() { return { from: "global" } }
   // assert real isolation rather than merely "a worktree was created". After the
   // run finishes the worktree must be gone (run-scope finalizer cleaned it up).
   it.instance(
-    "ctx.agent isolation:\"worktree\" runs the subagent in a fresh git worktree and cleans it up",
+    'ctx.agent isolation:"worktree" runs the subagent in a fresh git worktree and cleans it up',
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
@@ -5301,7 +5295,7 @@ export async function run() { return { from: "global" } }
   // authoring/environment error. The step must fail with a clear
   // WorkflowInvalidError naming the missing git repository rather than crashing,
   // and the prompt is never dispatched.
-  it.instance("ctx.agent isolation:\"worktree\" fails clearly outside a git repository", () =>
+  it.instance('ctx.agent isolation:"worktree" fails clearly outside a git repository', () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))

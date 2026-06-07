@@ -521,7 +521,10 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       // Follow the freshly-spawned resume run into its detail view. Fetch it once
       // so the detail view has an `initial` to render before its own poll/event
       // refetch arrives; fall back to the dashboard if the run is not retrievable.
-      const resumed = await sdk.client.workflow.get({ id: resumeRunID }).then((r) => r.data, () => undefined)
+      const resumed = await sdk.client.workflow.get({ id: resumeRunID }).then(
+        (r) => r.data,
+        () => undefined,
+      )
       if (resumed) {
         dialog.replace(
           () => <DialogWorkflowRun id={resumeRunID} initial={resumed} workflows={workflows()} />,

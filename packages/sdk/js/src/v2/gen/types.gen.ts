@@ -75,6 +75,8 @@ export type Event =
   | EventTuiSessionSelect2
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
+  | EventWorkflowRunUpdated
+  | EventWorkflowRunFinished
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
   | EventProjectUpdated
@@ -1473,6 +1475,42 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "workflow.run.updated"
+        properties: {
+          id: string
+          workflow: string
+          status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+          current_phase: string
+          directory: string
+          agents: {
+            total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            running: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            failed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          }
+          pending_question: boolean
+          error: string
+        }
+      }
+    | {
+        id: string
+        type: "workflow.run.finished"
+        properties: {
+          id: string
+          workflow: string
+          status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+          current_phase: string
+          directory: string
+          agents: {
+            total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            running: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            failed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          }
+          pending_question: boolean
+          error: string
+        }
+      }
+    | {
+        id: string
         type: "command.executed"
         properties: {
           name: string
@@ -2375,7 +2413,7 @@ export type Command = {
   description?: string
   agent?: string
   model?: string
-  source?: "command" | "mcp" | "skill"
+  source?: "command" | "mcp" | "skill" | "workflow"
   template: string
   subtask?: boolean
   hints: Array<string>
@@ -2752,6 +2790,12 @@ export type WorkspaceWarpError = {
   }
 }
 
+export type WorkflowPhase = {
+  title: string
+  detail?: string
+  model?: string
+}
+
 export type WorkflowArgument = {
   type?: string
   default?: unknown
@@ -2761,7 +2805,8 @@ export type WorkflowArgument = {
 export type WorkflowMeta = {
   name: string
   description?: string
-  phases?: Array<string>
+  whenToUse?: string
+  phases?: Array<string | WorkflowPhase>
   arguments?: {
     [key: string]: WorkflowArgument
   }
@@ -2815,6 +2860,8 @@ export type WorkflowAgentRun = {
   }
   error?: string
   cached?: boolean
+  kind?: "agent" | "question"
+  answer?: string
 }
 
 export type WorkflowRun = {
@@ -2834,6 +2881,11 @@ export type WorkflowRun = {
   result?: unknown
   error?: string
   resume_of?: string
+  pending_question?: {
+    question: string
+    options?: Array<string>
+    asked_at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
 }
 
 export type WorkflowStartPayload = {
@@ -2853,6 +2905,20 @@ export type WorkflowApiError = {
   path?: string
 }
 
+export type WorkflowAnswerPayload = {
+  /**
+   * The human answer to the run's open question.
+   */
+  answer: string
+  permissionSessionID?: string
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
 export type UnauthorizedError = {
   _tag: "UnauthorizedError"
   message: string
@@ -2869,12 +2935,6 @@ export type SessionsResponse = {
 export type InvalidCursorError = {
   _tag: "InvalidCursorError"
   message: string
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type SessionNotFoundError = {
@@ -5174,6 +5234,44 @@ export type EventMcpBrowserOpenFailed = {
   properties: {
     mcpName: string
     url: string
+  }
+}
+
+export type EventWorkflowRunUpdated = {
+  id: string
+  type: "workflow.run.updated"
+  properties: {
+    id: string
+    workflow: string
+    status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+    current_phase: string
+    directory: string
+    agents: {
+      total: number | "NaN" | "Infinity" | "-Infinity"
+      running: number | "NaN" | "Infinity" | "-Infinity"
+      failed: number | "NaN" | "Infinity" | "-Infinity"
+    }
+    pending_question: boolean
+    error: string
+  }
+}
+
+export type EventWorkflowRunFinished = {
+  id: string
+  type: "workflow.run.finished"
+  properties: {
+    id: string
+    workflow: string
+    status: "running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused"
+    current_phase: string
+    directory: string
+    agents: {
+      total: number | "NaN" | "Infinity" | "-Infinity"
+      running: number | "NaN" | "Infinity" | "-Infinity"
+      failed: number | "NaN" | "Infinity" | "-Infinity"
+    }
+    pending_question: boolean
+    error: string
   }
 }
 
@@ -9791,6 +9889,44 @@ export type WorkflowPauseResponses = {
 }
 
 export type WorkflowPauseResponse = WorkflowPauseResponses[keyof WorkflowPauseResponses]
+
+export type WorkflowAnswerData = {
+  body?: WorkflowAnswerPayload
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/answer"
+}
+
+export type WorkflowAnswerErrors = {
+  /**
+   * BadRequest | WorkflowApiError | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | WorkflowApiError | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowAnswerError = WorkflowAnswerErrors[keyof WorkflowAnswerErrors]
+
+export type WorkflowAnswerResponses = {
+  /**
+   * Workflow run after answering its open question
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowAnswerResponse = WorkflowAnswerResponses[keyof WorkflowAnswerResponses]
 
 export type V2HealthGetData = {
   body?: never

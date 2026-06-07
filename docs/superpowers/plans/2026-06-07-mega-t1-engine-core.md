@@ -17,6 +17,7 @@
 ### Task 1: P1 — `parallel()` toleriert fehlschlagende Tasks (`(T|null)[]`)
 
 **Files:**
+
 - Modify: `P` (Typ `parallel` in `WorkflowContext`), `W` (`ContextApi.parallel`-Typ ~Z.392 + Impl ~Z.1144), `T`
 
 - [ ] **Step 1: Failing Test schreiben** (Anker: nachbarschaftlich zu den deterministischen Concurrency-Tests, Suche `PIPELINE_ORDER` in `T`). Workflow-Source des Tests:
@@ -38,10 +39,10 @@ export default {
 Assertions nach `start`+`wait` (Harness vom Anker):
 
 ```ts
-expect(run.status).toBe("completed")                       // Batch überlebt
+expect(run.status).toBe("completed") // Batch überlebt
 expect((run.result as { out: unknown[] }).out).toEqual(["ok-1", null, "ok-3"])
 const dropLog = run.logs.find((l) => l.message.includes("parallel task 2 dropped"))
-expect(dropLog?.message).toContain("boom")                  // Drop wird geloggt, nicht verschluckt
+expect(dropLog?.message).toContain("boom") // Drop wird geloggt, nicht verschluckt
 ```
 
 - [ ] **Step 2: Rot verifizieren**
@@ -113,8 +114,15 @@ export default {
     const calls: string[] = []
     const out = await ctx.pipeline(
       [1, 2, 3],
-      async (prev) => { if (prev === 2) throw new Error("stage1-boom"); calls.push("s1:" + prev); return prev * 10 },
-      async (prev, item) => { calls.push("s2:" + item); return prev + 1 },
+      async (prev) => {
+        if (prev === 2) throw new Error("stage1-boom")
+        calls.push("s1:" + prev)
+        return prev * 10
+      },
+      async (prev, item) => {
+        calls.push("s2:" + item)
+        return prev + 1
+      },
     )
     return { out, calls }
   },
@@ -126,9 +134,11 @@ Assertions:
 ```ts
 expect(run.status).toBe("completed")
 const r = run.result as { out: unknown[]; calls: string[] }
-expect(r.out).toEqual([11, null, 31])                    // nur Item 2 gedroppt
-expect(r.calls).not.toContain("s2:2")                    // Reststufen von Item 2 übersprungen
-expect(run.logs.some((l) => l.message.includes("pipeline item 2 dropped") && l.message.includes("stage1-boom"))).toBe(true)
+expect(r.out).toEqual([11, null, 31]) // nur Item 2 gedroppt
+expect(r.calls).not.toContain("s2:2") // Reststufen von Item 2 übersprungen
+expect(run.logs.some((l) => l.message.includes("pipeline item 2 dropped") && l.message.includes("stage1-boom"))).toBe(
+  true,
+)
 ```
 
 - [ ] **Step 2: Rot verifizieren** — Run wie Task 1 Step 2, Expected: FAIL (Status `failed`).
@@ -170,7 +180,7 @@ Effect.promise(async () => {
 - [ ] **Step 1: Failing Test** — bestehenden Builtin-Load-Test ergänzen (Anker: `the deep-research builtin source compiles`):
 
 ```ts
-expect(source).toContain(".filter(")   // Source filtert Nulls aus parallel-Ergebnissen
+expect(source).toContain(".filter(") // Source filtert Nulls aus parallel-Ergebnissen
 ```
 
 Zusätzlich statisch: `expect(source).not.toMatch(/findings\.some\(\(f\) => \(f\.data/)` schlägt fehl, solange der ungefilterte Zugriff existiert → präziser: nach Step 3 müssen `findings`/`verified` IMMER zuerst gefiltert werden.
@@ -191,6 +201,7 @@ const verified = (await ctx.parallel(..., { concurrencyLimit: 8 })).filter((v) =
 ### Task 4: QW1 — Bus-Events `workflow.run.updated` / `workflow.run.finished`
 
 **Files:**
+
 - Modify: `W` (`persistRun` ~Z.633, `finish`-Pfad), neue Event-Definitionen
 - Test: `T`
 
@@ -204,8 +215,8 @@ Expected: das exakte Publish-Muster (Import + `publish`-Aufruf) der EventV2Bridg
 ```ts
 const seen: Array<{ type: string; status: string; finished: boolean }> = []
 // Subscription nach Anker-Muster auf "workflow.run.updated" + "workflow.run.finished"
-const run = yield* workflow.start({ name: "two-phase" })   // Fixture mit 2 Phasen + 1 Agent-Stub
-yield* workflow.wait({ id: run.id })
+const run = yield * workflow.start({ name: "two-phase" }) // Fixture mit 2 Phasen + 1 Agent-Stub
+yield * workflow.wait({ id: run.id })
 expect(seen.some((e) => e.type === "workflow.run.updated" && e.status === "running")).toBe(true)
 expect(seen.at(-1)).toMatchObject({ type: "workflow.run.finished", status: "completed", finished: true })
 // Schlanke Payload: KEIN agents-Array, nur Zähler
@@ -289,9 +300,12 @@ budget: {
 - [ ] **Step 2: Rot.** · **Step 3: Impl**:
 
 ```ts
-const modelInfo = agentInput.model === "small"
-  ? Provider.parseModel(yield* resolveSmallModel())   // liest config.small_model; Fehler wenn unkonfiguriert: WorkflowInvalidError("model \"small\" requires small_model in config")
-  : agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+const modelInfo =
+  agentInput.model === "small"
+    ? Provider.parseModel(yield * resolveSmallModel()) // liest config.small_model; Fehler wenn unkonfiguriert: WorkflowInvalidError("model \"small\" requires small_model in config")
+    : agentInput.model
+      ? Provider.parseModel(agentInput.model)
+      : selected.model
 ```
 
 (`resolveSmallModel` liest über den bereits injizierten `Config.Service`; exaktes Config-Feld grounden: `grep -rn "small_model" packages/opencode/src/config packages/core/src | head -3`.)
@@ -335,9 +349,12 @@ if (agentInput.isolation === "worktree") {
   const base = path.join(os.tmpdir(), `oc-wf-${active.run.id}-${node.id}`)
   const res = Bun.spawnSync(["git", "worktree", "add", "--detach", base], { cwd: active.directory })
   if (res.exitCode !== 0) throw new WorkflowInvalidError(`isolation: "worktree" requires a git repository (${stderr})`)
-  yield* Effect.addFinalizer(() => Effect.sync(() => {
-    Bun.spawnSync(["git", "worktree", "remove", "--force", base], { cwd: active.directory })
-  }))   // am runScope, nicht am Step — überlebt parallele Steps, räumt bei Cancel auf
+  yield *
+    Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        Bun.spawnSync(["git", "worktree", "remove", "--force", base], { cwd: active.directory })
+      }),
+    ) // am runScope, nicht am Step — überlebt parallele Steps, räumt bei Cancel auf
   sessionDirectory = base
 }
 ```
@@ -374,14 +391,21 @@ Assertions: `run.status === "completed"` (non-zero Exit wirft NICHT), `result.ou
 
 ```ts
 // child.ts
-export default { meta: { name: "child", description: "child" }, async run(args, ctx) {
-  ctx.log("child-ran"); return { doubled: Number(args.n) * 2 }
-} }
+export default {
+  meta: { name: "child", description: "child" },
+  async run(args, ctx) {
+    ctx.log("child-ran")
+    return { doubled: Number(args.n) * 2 }
+  },
+}
 // parent.ts
-export default { meta: { name: "parent", description: "parent" }, async run(_a, ctx) {
-  const r = await ctx.workflow("child", { n: 21 })
-  return { fromChild: (r as { doubled: number }).doubled }
-} }
+export default {
+  meta: { name: "parent", description: "parent" },
+  async run(_a, ctx) {
+    const r = await ctx.workflow("child", { n: 21 })
+    return { fromChild: (r as { doubled: number }).doubled }
+  },
+}
 ```
 
 (a) `parent` → `completed`, `result.fromChild === 42`; es existiert GENAU EIN Run-Row (kein zweiter für child); Parent-Logs enthalten `child: child-ran` (Präfix). (b) Agent-Lifetime-Cap zählt Child-Agenten mit (Fixture: Child dispatcht 1 Agent-Stub, Parent-Limit via Test-Override auf 1 → zweiter Dispatch im Parent schlägt mit `WorkflowAgentLimitError` fehl). (c) `child` ruft selbst `ctx.workflow` → `WorkflowInvalidError` mit `nesting depth`.
@@ -392,6 +416,7 @@ export default { meta: { name: "parent", description: "parent" }, async run(_a, 
 ### Task 12: Migration `pending_question` + Question-Persistenz-Fundament
 
 **Files:**
+
 - Create: `packages/core/src/database/migration/<timestamp>_workflow_run_pending_question.ts` (+ `packages/core/migration/<timestamp>_workflow_run_pending_question/{migration.sql,snapshot.json}` via Generator)
 - Modify: `packages/core/src/workflow/sql.ts` (Spalte), `W` (Run-Schema + persistRun-Snapshot)
 
@@ -445,10 +470,12 @@ Testablauf: `start` → poll `workflow.get` bis `pending_question.question === "
 - [ ] **Step 1: Voll-Gate**
 
 Run:
+
 ```bash
 cd packages/opencode && bun run typecheck && bun test test/workflow/ test/tool/workflow.test.ts --timeout 30000 2>&1 | tail -4
 cd ../plugin && bun run typecheck 2>/dev/null || npx tsgo --noEmit
 ```
+
 Expected: alles grün.
 
 - [ ] **Step 2: Kontrakt-Freeze-Notiz** — am Ende von `docs/superpowers/plans/2026-06-07-workflows-mega-pr-master.md` unter Task 3 die finalen Signaturen (AgentInput, ContextApi, Event-Payloads, answer()-Service) als „Phase-1-Kontrakt (frozen)" einfügen — Input für die T2–T6-Plan-Generierung.

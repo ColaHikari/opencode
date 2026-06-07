@@ -320,6 +320,9 @@ import type {
   VcsGetResponses,
   VcsStatusErrors,
   VcsStatusResponses,
+  WorkflowAnswerErrors,
+  WorkflowAnswerPayload,
+  WorkflowAnswerResponses,
   WorkflowCancelErrors,
   WorkflowCancelResponses,
   WorkflowDeleteErrors,
@@ -5273,6 +5276,45 @@ export class Workflow extends HeyApiClient {
       url: "/workflow/run/{id}/pause",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Answer workflow question
+   *
+   * Answer a run's open human-in-the-loop question. A live run resolves in place; a parked run is resumed.
+   */
+  public answer<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+      workflowAnswerPayload?: WorkflowAnswerPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowAnswerPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowAnswerResponses, WorkflowAnswerErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/answer",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 }
