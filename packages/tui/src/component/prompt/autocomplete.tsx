@@ -515,6 +515,26 @@ export function Autocomplete(props: {
 
     for (const serverCommand of sync.data.command) {
       if (serverCommand.source === "skill") continue
+      // Spec §5.2 (3): a server command with source "workflow" is a discovered
+      // workflow surfaced in Command.list() — it must route via /workflow <name>
+      // (NOT the generic /<name> insertion, which would try to run an empty
+      // template as a prompt). DELTA 5b: the SDK Command.source union does not
+      // carry "workflow" (SDK not regenerated), so compare defensively as a
+      // string; remove the cast after the Phase-3 regen.
+      if ((serverCommand.source as string) === "workflow") {
+        results.push({
+          display: "/" + serverCommand.name,
+          description: serverCommand.description,
+          onSelect: () => {
+            const newText = `${WORKFLOW_COMMAND_PREFIX}${serverCommand.name} `
+            const cursor = props.input().logicalCursor
+            props.input().deleteRange(0, 0, cursor.row, cursor.col)
+            props.input().insertText(newText)
+            props.input().cursorOffset = Bun.stringWidth(newText)
+          },
+        })
+        continue
+      }
       const label = serverCommand.source === "mcp" ? ":mcp" : ""
       results.push({
         display: "/" + serverCommand.name + label,
