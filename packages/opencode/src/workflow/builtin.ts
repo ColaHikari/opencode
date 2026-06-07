@@ -4,6 +4,18 @@
 // string constant, so there is no separate `.ts`/`.js` file that a packaged
 // binary would have to ship alongside itself and locate at runtime.
 //
+// INVARIANT: builtin sources must be SELF-CONTAINED — no imports. start()
+// materializes them as temp modules under the global workflows directory, so a
+// bare specifier would resolve through whatever node_modules sits above that
+// directory: the PUBLISHED `@opencode-ai/plugin` that config.ts installs there,
+// never a dev workspace checkout (PR #2 review: a contributor had to manually
+// link the workspace plugin globally before an import-using builtin would load).
+// Import-free sources load identically in dev, in tests, and in the compiled
+// binary. The wrapper-free `export default { meta, run }` shape is exactly what
+// the plugin's workflow() helper returns at runtime, and the static MetaReader
+// reads it natively (form 2) — the wrapper only ever added editor types, which a
+// string constant cannot benefit from anyway.
+//
 // Discovery treats these as the LOWEST-precedence root (project > global >
 // builtin): a builtin name is only ever surfaced when no project or global file
 // already claims that name (first-wins in `discover`). The static `MetaReader`
@@ -31,13 +43,13 @@ export function isBuiltinPath(path: string) {
 // synthesize a cited report from only the surviving claims. The meta fields are
 // LITERALS so the static meta reader can extract name/description/phases/
 // arguments without executing the module.
-const DEEP_RESEARCH = `import { workflow } from "@opencode-ai/plugin"
-
-export default workflow({
-  name: "deep-research",
-  description: "Research a question across angles with adversarial claim verification",
-  phases: ["plan", "research", "verify", "synthesize"],
-  arguments: { question: { type: "string" } },
+const DEEP_RESEARCH = `export default {
+  meta: {
+    name: "deep-research",
+    description: "Research a question across angles with adversarial claim verification",
+    phases: ["plan", "research", "verify", "synthesize"],
+    arguments: { question: { type: "string" } },
+  },
   async run(args, ctx) {
     const question = String(args.question ?? "")
     if (!question) throw new Error("deep-research needs args.question")
@@ -113,7 +125,7 @@ export default workflow({
 
     return { report: report.text, claims: { verified: surviving.length, rejected: rejected.length } }
   },
-})
+}
 `
 
 // name -> module source text. Keep insertion order stable; discovery sorts by

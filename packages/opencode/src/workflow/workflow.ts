@@ -941,17 +941,16 @@ function tempFileName(file: string): string {
 // `builtinSource`, when given, is the module SOURCE of a built-in workflow whose
 // `file` is the synthetic `builtin:<name>` marker (not a real path). The marker
 // has no source directory, so the temp copy is written into the GLOBAL workflows
-// directory (`<Global.Path.config>/workflows`) rather than `import.meta.dir`: the
-// builtin source does `import { workflow } from "@opencode-ai/plugin"`, and that
-// bare specifier only resolves from inside a tree where the package is installed.
-// In a compiled Bun binary `import.meta.dir` is `/$bunfs/root` (read-only —
-// `Bun.write` throws ENOENT there), whereas the global config dir is the same
-// binary-proven location where config.ts installs `@opencode-ai/plugin` into
-// `<configdir>/node_modules` (resolution via walk-up) and where normal global
-// workflows already load from. The directory is ensured (the workflows subdir may
-// not exist on a cold system) and the temp file keeps TEMP_FILE_RE's name shape so
-// the per-directory sweep in discover() cleans up any orphan. A write failure is a
-// hard error (there is no original file to fall back to).
+// directory (`<Global.Path.config>/workflows`) rather than `import.meta.dir`: in
+// a compiled Bun binary `import.meta.dir` is `/$bunfs/root` (read-only —
+// `Bun.write` throws ENOENT there), whereas the global config dir is a
+// binary-proven writable location where normal global workflows already load
+// from. Builtin sources are SELF-CONTAINED by invariant (no imports — see
+// builtin.ts), so the temp copy depends on no node_modules above it and loads
+// identically in dev and in the binary. The directory is ensured (the workflows
+// subdir may not exist on a cold system) and the temp file keeps TEMP_FILE_RE's
+// name shape so the per-directory sweep in discover() cleans up any orphan. A
+// write failure is a hard error (there is no original file to fall back to).
 async function loadModule(file: string, builtinSource?: string): Promise<Module> {
   const source = builtinSource ?? (await Bun.file(file).text())
   if (builtinSource !== undefined) {
