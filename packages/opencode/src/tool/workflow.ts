@@ -15,6 +15,7 @@ import * as Tool from "./tool"
 import { trimDiff } from "./edit"
 import { Workflow } from "@/workflow/workflow"
 import { MetaReader } from "@/workflow/meta-reader"
+import { Agent } from "@/agent/agent"
 
 const WORKFLOW_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT = 60 * 60 * 1000
@@ -150,6 +151,26 @@ function formatWorkflow(info: Workflow.Info) {
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n")
+}
+
+// QW7: the live agent roster the engine can dispatch as workflow steps. Surfaced
+// in read/create output so the model authors `ctx.agent({ agent })` steps against
+// agents that actually exist, instead of guessing builtin names.
+function formatAgentRoster(list: Agent.Info[]) {
+  // Only subagents the engine can dispatch via ctx.agent({agent}) — hidden and
+  // primary-only agents are not selectable as workflow steps. Sorted for a
+  // stable, scannable list.
+  const usable = list
+    .filter((agent) => agent.hidden !== true && agent.mode !== "primary")
+    .toSorted((a, b) => a.name.localeCompare(b.name))
+  if (usable.length === 0) return "<available_agents>No dispatchable agents are available.</available_agents>"
+  return [
+    "<available_agents>",
+    ...usable.map(
+      (agent) => `  <agent name="${escapeXmlAttr(agent.name)}">${escapeXmlText(agent.description ?? "")}</agent>`,
+    ),
+    "</available_agents>",
+  ].join("\n")
 }
 
 function formatRunSummary(run: Workflow.Run) {
@@ -500,6 +521,7 @@ export const WorkflowTool = Tool.define(
   "workflow",
   Effect.gen(function* () {
     const workflow = yield* Workflow.Service
+    const agents = yield* Agent.Service
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
     const fs = yield* FSUtil.Service
@@ -525,7 +547,7 @@ export const WorkflowTool = Tool.define(
             return {
               title: `Workflow: ${info.name}`,
               metadata: { name: info.name, path: info.path },
-              output: formatWorkflow(info),
+              output: [formatWorkflow(info), formatAgentRoster(yield* agents.list())].join("\n"),
             }
           }
 
@@ -701,6 +723,7 @@ export const WorkflowTool = Tool.define(
                 "Workflow file created and validated.",
                 "",
                 formatWorkflow({ name: params.name, path: filepath, meta: validated.meta, valid: true }),
+                formatAgentRoster(yield* agents.list()),
               ].join("\n"),
             }
           }

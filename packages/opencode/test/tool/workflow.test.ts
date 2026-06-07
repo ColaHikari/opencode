@@ -169,6 +169,28 @@ export async function run(args, ctx) { return { ok: true } }
     ),
   )
 
+  it.live("read output includes the live agent roster (QW7)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello", description: "Say hi." }
+export async function run(args, ctx) { return { ok: true } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "read", name: "hello" }, requestRecorder().ctx)
+        // The roster block exists and lists at least the always-present "general"
+        // subagent the engine can dispatch (agent.ts default subagents).
+        expect(result.output).toContain("<available_agents>")
+        expect(result.output).toContain(`<agent name="general"`)
+      }),
+    ),
+  )
+
   it.live("starts workflow and asks reusable workflow permission", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
@@ -289,6 +311,21 @@ export async function run(args, ctx) { return "ok" }
         // The created file is discoverable and valid through the read action.
         const read = yield* tool.execute({ action: "read", name: "made" }, recorder.ctx)
         expect(read.output).toContain("Created by test.")
+      }),
+    ),
+  )
+
+  it.live("create output includes the live agent roster (QW7)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Made", description: "Created by test." }
+export async function run(args, ctx) { return "ok" }
+`
+        const result = yield* tool.execute({ action: "create", name: "made", source }, recorder.ctx)
+        expect(result.output).toContain("<available_agents>")
+        expect(result.output).toContain(`<agent name="general"`)
       }),
     ),
   )
