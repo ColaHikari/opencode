@@ -25,6 +25,20 @@ export async function run(args, ctx) { return { ok: true } }
     expect(result.meta.arguments).toEqual({ value: { type: "number", description: "A value" } })
   })
 
+  test("extracts whenToUse from literal meta (QW4)", () => {
+    const source = `export const meta = {
+  name: "Deploy",
+  description: "Deploy the app.",
+  whenToUse: "When the user explicitly asks to ship to production."
+}
+export async function run(args, ctx) { return { ok: true } }
+`
+    const result = MetaReader.read(source, FAKE_PATH)
+    expect(result.valid).toBe(true)
+    if (!result.valid) throw new Error("expected valid")
+    expect(result.meta.whenToUse).toBe("When the user explicitly asks to ship to production.")
+  })
+
   test("extracts literal meta from a default object literal (export default { meta, run })", () => {
     const source = `export default {
   meta: { name: "Typed Workflow", phases: ["run"] },

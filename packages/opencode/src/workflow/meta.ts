@@ -50,6 +50,7 @@ const Phases = Schema.Array(PhaseEntry).pipe(
 export const Meta = Schema.Struct({
   name: Schema.String,
   description: Schema.optional(Schema.String),
+  whenToUse: Schema.optional(Schema.String),
   phases: Schema.optional(Phases),
   arguments: Schema.optional(Schema.Record(Schema.String, Argument)),
 }).annotate({ identifier: "WorkflowMeta" })

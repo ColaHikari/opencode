@@ -175,6 +175,7 @@ export type WorkflowPhase = string | { title: string; detail?: string; model?: s
 export function workflow<const Args extends WorkflowArguments | undefined = undefined>(input: {
   name: string
   description?: string
+  whenToUse?: string
   phases?: readonly WorkflowPhase[]
   arguments?: Args
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
@@ -183,6 +184,7 @@ export function workflow<const Args extends WorkflowArguments | undefined = unde
     meta: {
       name: input.name,
       description: input.description,
+      whenToUse: input.whenToUse,
       phases: input.phases,
       arguments: input.arguments,
     },
