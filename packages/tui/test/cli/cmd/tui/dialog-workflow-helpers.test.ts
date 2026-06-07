@@ -3,9 +3,11 @@ import {
   capLogs,
   formatPhase,
   formatShortElapsed,
+  mergeRunEvent,
   parseWorkflowCommand,
   phaseIcon,
   phaseStatus,
+  questionBadge,
   reanchorSelection,
   sanitizeWorkflowFilename,
   saveTargets,
@@ -263,6 +265,54 @@ describe("parseWorkflowCommand (Fund 59 — dispatch, Fund 60 — raw remainder)
   test("non-workflow input is not a workflow command", () => {
     expect(parseWorkflowCommand("/help")).toBeUndefined()
     expect(parseWorkflowCommand("hello")).toBeUndefined()
+  })
+})
+
+describe("mergeRunEvent (event-driven dashboard refresh)", () => {
+  test("overlays a finished event's status onto the matching run without dropping unrelated runs", () => {
+    const runs = [makeRun({ id: "job_a", status: "running" }), makeRun({ id: "job_b", status: "running" })]
+    const next = mergeRunEvent(runs, {
+      kind: "finished",
+      run: {
+        id: "job_a",
+        workflow: "demo",
+        status: "completed",
+        directory: "/ws",
+        agents: { total: 1, running: 0, failed: 0 },
+        pending_question: false,
+      },
+    })
+    expect(next.find((r) => r.id === "job_a")!.status).toBe("completed")
+    expect(next.find((r) => r.id === "job_b")!.status).toBe("running")
+    expect(next.length).toBe(2)
+  })
+
+  test("an event for an unknown run id leaves the list unchanged (a full refetch will pick it up)", () => {
+    const runs = [makeRun({ id: "job_a", status: "running" })]
+    const next = mergeRunEvent(runs, {
+      kind: "updated",
+      run: {
+        id: "job_new",
+        workflow: "demo",
+        status: "running",
+        directory: "/ws",
+        agents: { total: 0, running: 0, failed: 0 },
+        pending_question: false,
+      },
+    })
+    expect(next).toBe(runs)
+  })
+})
+
+describe("questionBadge (Dashboard ⏳ for waiting/parked runs)", () => {
+  test("a running run with pending_question gets the waiting badge", () => {
+    expect(questionBadge({ status: "running", pending_question: { question: "q?", asked_at: 1 } } as never)).toBe("⏳")
+  })
+  test("a paused run with pending_question gets the waiting badge (parked)", () => {
+    expect(questionBadge({ status: "paused", pending_question: { question: "q?", asked_at: 1 } } as never)).toBe("⏳")
+  })
+  test("a run without a pending question gets no badge", () => {
+    expect(questionBadge({ status: "running" } as never)).toBe("")
   })
 })
 
