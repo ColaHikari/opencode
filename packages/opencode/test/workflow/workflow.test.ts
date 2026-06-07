@@ -13,7 +13,13 @@ import { MessageTable } from "@opencode-ai/core/session/sql"
 import { MessageID } from "@opencode-ai/core/v1/session"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { eq, sql } from "drizzle-orm"
-import { TestInstance, provideInstance, tmpdirScoped } from "../fixture/fixture"
+import {
+  TestInstance,
+  provideInstance,
+  tmpdirScoped,
+  reloadInstance,
+  testInstanceStoreLayer,
+} from "../fixture/fixture"
 import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
@@ -1394,6 +1400,21 @@ export async function run(args, ctx) {
   const a = await ctx.question({ question: "go?", timeout: 50 })
   const r = await ctx.agent({ prompt: "after-" + a.answer })
   return { answer: a.answer, agentText: r.text }
+}
+`
+
+// T5 gap (mixed cached replay): a workflow that asks a question THEN dispatches
+// an agent. On the first run both complete (question answered live, agent
+// prompted live). On a resume of the parked/paused run, BOTH must come from the
+// journal: the question is NOT re-asked (no pending_question) and the agent is
+// NOT re-prompted (recordingPromptOps records nothing).
+const MIXED_REPLAY_FIXTURE = "mixed-question-agent"
+const MIXED_REPLAY_WORKFLOW = `export const meta = { name: "${MIXED_REPLAY_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "ship?", options: ["yes", "no"] })
+  const r = await ctx.agent({ prompt: "do-" + a.answer })
+  return { answer: a.answer, work: r.text }
 }
 `
 
@@ -4435,6 +4456,201 @@ export async function run() { return { from: "global" } }
       const agentB = done.agents.find((a) => a.prompt === "agent B")
       expect(agentB?.cached).toBe(true)
     }),
+  )
+
+  // T5 gap (invalidate_agents positional): the existing invalidate test only
+  // rebuilds index [0]. Pin that a NON-zero index reruns ONLY that agent live
+  // while the EARLIER agent stays cached — proving the index is honored
+  // positionally, not "always rerun the first". RESUME_WORKFLOW dispatches A
+  // (index 0) then B (index 1); invalidate_agents:[1] must rerun B live, cache A.
+  it.instance("resume with invalidate_agents reruns a NON-zero index live and caches the earlier agent", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      // completed → paused so it is a legitimate resume source (journal kept).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: RESUME_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        invalidate_agents: [1],
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // Only B (index 1) reran live; A (index 0) came from the journal.
+      expect(prompted).toContain("agent B")
+      expect(prompted).not.toContain("agent A")
+      const agentA = done.agents.find((a) => a.prompt === "agent A")
+      expect(agentA?.cached).toBe(true)
+      const agentB = done.agents.find((a) => a.prompt === "agent B")
+      expect(agentB?.cached).not.toBe(true)
+    }),
+  )
+
+  // T5 gap (mixed journal: agent cached, question re-asked on an ORDINARY resume).
+  // A workflow that asks a question THEN dispatches an agent. On the first run the
+  // question is answered live and the agent runs live. On an ORDINARY resume
+  // (resume_of only — no answer()-seed), the engine replays the completed AGENT
+  // node from the journal (cached, NOT re-prompted) but DELIBERATELY does NOT
+  // journal-replay the question: question replay is the answer()-seeded path only
+  // (workflow.ts ~1967 + q-then-agent test). So the question re-asks LIVE and we
+  // answer it live again; the cached agent proves the agent-journal replay works
+  // alongside a question node, and the live re-ask pins the documented boundary.
+  it.instance("ordinary resume of a mixed journal caches the agent and re-asks the question live", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, MIXED_REPLAY_FIXTURE, MIXED_REPLAY_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // First run: answer the question live, agent runs live with a recorded prompt.
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: MIXED_REPLAY_FIXTURE, args: {}, prompt: firstOps.ops })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(first.id)
+          return current?.pending_question?.question === "ship?" ? current : undefined
+        }),
+        "pending question never appeared",
+      )
+      yield* workflow.answer({ id: first.id, answer: "yes" })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first mixed run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      expect(firstOps.prompted).toContain("do-yes")
+      const firstResult = firstDone.result as { answer: string; work: string }
+      expect(firstResult.answer).toBe("yes")
+
+      // completed → paused so it is a legitimate resume source (journal kept).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
+      // Ordinary resume: the agent is served from the journal; the question
+      // re-asks live (no seed), so we answer it live once it appears.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: MIXED_REPLAY_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+      })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(resumed.id)
+          return current?.pending_question?.question === "ship?" ? current : undefined
+        }),
+        "resumed run never re-asked the question",
+      )
+      yield* workflow.answer({ id: resumed.id, answer: "yes" })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("mixed resume did not finish")))
+      expect(done.status).toBe("completed")
+      // The agent step came from the journal — it was NOT re-prompted on the resume.
+      expect(prompted).not.toContain("do-yes")
+      const anode = done.agents.find((a) => a.prompt === "do-yes")
+      expect(anode?.cached).toBe(true)
+      // The question was re-asked live and answered; no lingering pending_question.
+      expect(done.pending_question).toBeUndefined()
+      const qnode = done.agents.find((a) => a.kind === "question")
+      expect(qnode?.answer).toBe("yes")
+      // Replayed-agent result still matches the first run's structured result.
+      expect(done.result).toEqual(firstResult)
+    }),
+  )
+
+  // T5 gap (resume after engine restart): the resume path is proven within ONE
+  // service lifetime; here we PROVE it survives a process restart. A run parks as
+  // paused (its journal persisted in SQLite, which lives at the test-layer scope —
+  // NOT per-instance), then we reload the instance via the SAME test-layer
+  // InstanceStore (reloadInstance → runDisposers invalidates Workflow's
+  // per-directory InstanceState ScopedCache, so the next access rebuilds a FRESH
+  // runs registry and re-runs the startup orphan sweep over the same DB). The
+  // reload must NOT touch the paused row (it has no live fiber by design but is
+  // parked, not lost), and answer() on the fresh service must still resume and
+  // replay the journaled question from disk.
+  // NOTE (execution-time reconciliation): the plan suggested `reloadTestInstance`,
+  // but that bridges through the process-global AppRuntime's InstanceStore — a
+  // DIFFERENT registry than this test layer's. The faithful in-layer restart is the
+  // test-layer `reloadInstance` (InstanceStore.reload), which disposes+rebuilds the
+  // cached per-directory state. testInstanceStoreLayer supplies InstanceStore.Service
+  // for both provideInstance and reloadInstance.
+  it.live("a resume after an engine restart (instance reload) replays the journaled question from disk", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      yield* Effect.promise(() => writeWorkflow(directory, QUESTION_TIMEOUT_FIXTURE, QUESTION_TIMEOUT_WORKFLOW))
+
+      // Lifetime 1: start the run; its 50ms-timeout question parks it as paused
+      // with the open question persisted on the row.
+      const pausedId = yield* Effect.gen(function* () {
+        const workflow = yield* Workflow.Service
+        const run = yield* workflow.start({ name: QUESTION_TIMEOUT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+        const paused =
+          (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("timeout run did not settle")))
+        expect(paused.status).toBe("paused")
+        expect(paused.pending_question?.question).toBe("deploy?")
+        return run.id
+      }).pipe(provideInstance(directory))
+
+      // Restart: dispose+rebuild the instance over the SAME directory (invalidates
+      // Workflow's per-directory InstanceState → fresh runs registry + startup sweep).
+      yield* reloadInstance({ directory })
+
+      // Lifetime 2: the fresh service ran its startup sweep. The paused row must be
+      // intact (not swept to interrupted), and answer() must start a resume that
+      // replays the question from disk and completes.
+      yield* Effect.gen(function* () {
+        const workflow = yield* Workflow.Service
+        const reloaded = yield* workflow.get(pausedId)
+        expect(reloaded?.status).toBe("paused")
+        expect(reloaded?.pending_question?.question).toBe("deploy?")
+        const resumed = yield* workflow.answer({ id: pausedId, answer: "no" })
+        expect(resumed).toBeDefined()
+        expect(resumed!.resume_of).toBe(pausedId)
+        const done =
+          (yield* workflow.wait({ id: resumed!.id })).run ??
+          (yield* Effect.fail(new Error("post-restart resume did not finish")))
+        expect(done.status).toBe("completed")
+        expect((done.result as { answer: string }).answer).toBe("no")
+        const replayed = done.agents.find((a) => a.kind === "question")
+        expect(replayed?.answer).toBe("no")
+      }).pipe(provideInstance(directory))
+    }).pipe(Effect.provide(testInstanceStoreLayer)),
   )
 
   // Status-Guard (Fund: kein Guard auf dem Resume-Source-Status): nur paused/
