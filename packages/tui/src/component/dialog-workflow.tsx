@@ -90,8 +90,12 @@ export function agentEffectiveEnd(run: WorkflowRun, agent: WorkflowRun["agents"]
 }
 
 function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
+  // Declared phases may be structured entries (string | {title, detail?, model?})
+  // since the encoded meta keeps the back-compat union; the dashboard renders by
+  // TITLE only, so normalize at this single entry point — every downstream
+  // consumer (resultPhase/phaseRows/phaseProgress) keeps seeing plain strings.
   const phases = workflow?.meta.phases?.length
-    ? workflow.meta.phases
+    ? workflow.meta.phases.map((phase) => (typeof phase === "string" ? phase : phase.title))
     : Array.from(
         new Set([
           ...run.logs.flatMap((item) => (item.phase ? [item.phase] : [])),
