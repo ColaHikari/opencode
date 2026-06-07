@@ -20,12 +20,20 @@ const storedSessions: Record<string, Array<{ id: string; title?: string }>> = {}
 const promoted: Array<{ directory: string; sessionID: string }> = []
 const sentShell: string[] = []
 const syncedDirectories: string[] = []
+const workflowStarts: Array<{ name: string; directory?: string; args?: Record<string, unknown>; permission?: string }> =
+  []
+const promptParts: Array<Array<{ type: string; text?: string }>> = []
+let dashboardOpened = 0
+let workflowListData: Array<{ name: string; valid?: boolean; meta: { name: string; arguments?: any } }> = []
+let workflowStartSessionId: string | undefined
 
 let params: { id?: string } = {}
 let selected = "/repo/worktree-a"
 let variant: string | undefined
+let ultracodeSession = false
+let keywordEnabled = true
 
-const promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
+let promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
 
 const clientFor = (directory: string) => {
   createdClients.push(directory)
@@ -45,9 +53,24 @@ const clientFor = (directory: string) => {
         return { data: undefined }
       },
       prompt: async () => ({ data: undefined }),
-      promptAsync: async () => ({ data: undefined }),
+      promptAsync: async (input: { parts: Array<{ type: string; text?: string }> }) => {
+        promptParts.push(input.parts)
+        return { data: undefined }
+      },
       command: async () => ({ data: undefined }),
       abort: async () => ({ data: undefined }),
+    },
+    workflow: {
+      list: async () => ({ data: workflowListData }),
+      start: async (input: { name: string; directory?: string; workflowStartPayload?: any }) => {
+        workflowStarts.push({
+          name: input.name,
+          directory: input.directory,
+          args: input.workflowStartPayload?.args,
+          permission: input.workflowStartPayload?.permissionSessionID,
+        })
+        return { data: { id: "run-1", session_id: workflowStartSessionId } }
+      },
     },
     worktree: {
       create: async () => ({ data: { directory: `${directory}/new` } }),
@@ -71,6 +94,10 @@ beforeAll(async () => {
   }))
 
   mock.module("@opencode-ai/ui/toast", () => ({
+    showToast: () => 0,
+  }))
+
+  mock.module("@/utils/toast", () => ({
     showToast: () => 0,
   }))
 
@@ -141,7 +168,10 @@ beforeAll(async () => {
 
   mock.module("@/context/sync", () => ({
     useSync: () => ({
-      data: { command: [] },
+      data: {
+        command: [],
+        config: { workflows: { ultracode_keyword: keywordEnabled } },
+      },
       session: {
         optimistic: {
           add: (value: {
@@ -212,8 +242,16 @@ beforeEach(() => {
   params = {}
   sentShell.length = 0
   syncedDirectories.length = 0
+  workflowStarts.length = 0
+  promptParts.length = 0
+  dashboardOpened = 0
+  workflowListData = []
+  workflowStartSessionId = undefined
   selected = "/repo/worktree-a"
   variant = undefined
+  ultracodeSession = false
+  keywordEnabled = true
+  promptValue = [{ type: "text", content: "ls", start: 0, end: 2 }]
   for (const key of Object.keys(storedSessions)) delete storedSessions[key]
 })
 
@@ -225,6 +263,8 @@ describe("prompt submit worktree selection", () => {
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "shell",
+      ultracodeSession: () => false,
+      openWorkflowDashboard: () => undefined,
       working: () => false,
       editor: () => undefined,
       queueScroll: () => undefined,
@@ -262,6 +302,8 @@ describe("prompt submit worktree selection", () => {
       commentCount: () => 0,
       autoAccept: () => true,
       mode: () => "shell",
+      ultracodeSession: () => false,
+      openWorkflowDashboard: () => undefined,
       working: () => false,
       editor: () => undefined,
       queueScroll: () => undefined,
@@ -292,6 +334,8 @@ describe("prompt submit worktree selection", () => {
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",
+      ultracodeSession: () => false,
+      openWorkflowDashboard: () => undefined,
       working: () => false,
       editor: () => undefined,
       queueScroll: () => undefined,
@@ -323,6 +367,8 @@ describe("prompt submit worktree selection", () => {
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",
+      ultracodeSession: () => false,
+      openWorkflowDashboard: () => undefined,
       working: () => false,
       editor: () => undefined,
       queueScroll: () => undefined,
@@ -342,5 +388,147 @@ describe("prompt submit worktree selection", () => {
 
     expect(storedSessions["/repo/worktree-a"]).toEqual([{ id: "session-1", title: "New session 1" }])
     expect(optimisticSeeded).toEqual([true])
+  })
+})
+
+const event = { preventDefault: () => undefined } as unknown as Event
+
+// handleSubmit fires the prompt send / workflow start as a floating promise and
+// returns before it settles. Flush several microtask + macrotask ticks so the
+// floating async work (list → start, or buildRequestParts → promptAsync) lands
+// before assertions.
+const flush = async () => {
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+const workflowInput = () => ({
+  info: () => ({ id: "session-1" }),
+  imageAttachments: () => [],
+  commentCount: () => 0,
+  autoAccept: () => false,
+  mode: () => "normal" as const,
+  ultracodeSession: () => ultracodeSession,
+  openWorkflowDashboard: () => {
+    dashboardOpened += 1
+  },
+  working: () => false,
+  editor: () => undefined,
+  queueScroll: () => undefined,
+  promptLength: (value: Prompt) =>
+    value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+  addToHistory: () => undefined,
+  resetHistoryNavigation: () => undefined,
+  setMode: () => undefined,
+  setPopover: () => undefined,
+  onSubmit: () => undefined,
+})
+
+describe("workflow command routing on submit", () => {
+  test("/workflows opens the dashboard and never sends a prompt", async () => {
+    params = { id: "session-1" }
+    promptValue = [{ type: "text", content: "/workflows", start: 0, end: 10 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    expect(dashboardOpened).toBe(1)
+    expect(workflowStarts).toEqual([])
+    expect(promptParts).toEqual([])
+  })
+
+  test("/workflow with no name opens the dashboard", async () => {
+    params = { id: "session-1" }
+    promptValue = [{ type: "text", content: "/workflow", start: 0, end: 9 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    expect(dashboardOpened).toBe(1)
+    expect(workflowStarts).toEqual([])
+  })
+
+  test("/workflow <name> starts the run with declared-type-coerced args", async () => {
+    params = { id: "session-1" }
+    workflowListData = [{ name: "review", valid: true, meta: { name: "review", arguments: { count: { type: "number" } } } }]
+    promptValue = [{ type: "text", content: "/workflow review count=3 tag=v1.0", start: 0, end: 33 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    expect(workflowStarts).toHaveLength(1)
+    expect(workflowStarts[0]).toMatchObject({
+      name: "review",
+      directory: "/repo/main",
+      args: { count: 3, tag: "v1.0" },
+      permission: "session-1",
+    })
+    expect(promptParts).toEqual([])
+  })
+})
+
+describe("ultracode injection on submit", () => {
+  test("prepends the session directive when session mode is on", async () => {
+    params = { id: "session-1" }
+    ultracodeSession = true
+    promptValue = [{ type: "text", content: "fix the bug", start: 0, end: 11 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    expect(promptParts).toHaveLength(1)
+    const text = promptParts[0]
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("")
+    expect(text).toContain("Ultracode session mode is ON")
+    expect(text).toContain("fix the bug")
+  })
+
+  test("strips the keyword and injects the prompt directive when keyword detected", async () => {
+    params = { id: "session-1" }
+    promptValue = [{ type: "text", content: "ultracode fix the bug", start: 0, end: 21 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    const text = promptParts[0]
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("")
+    expect(text).toContain("opted into workflow orchestration")
+    expect(text).toContain("fix the bug")
+    // The directive legitimately mentions "(ultracode)"; the USER's text (the
+    // trailing segment after the directive's blank-line separator) is stripped.
+    const userText = text.split("\n\n").at(-1) ?? ""
+    expect(userText).toBe("fix the bug")
+    expect(userText).not.toMatch(/\bultracode\b/i)
+  })
+
+  test("does not inject when the config keyword flag is off and session mode is off", async () => {
+    params = { id: "session-1" }
+    keywordEnabled = false
+    promptValue = [{ type: "text", content: "ultracode fix the bug", start: 0, end: 21 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    const text = promptParts[0]
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("")
+    expect(text).toContain("ultracode fix the bug")
+    expect(text).not.toContain("opted into workflow orchestration")
   })
 })

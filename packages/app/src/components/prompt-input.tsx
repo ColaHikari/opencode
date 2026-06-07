@@ -1238,6 +1238,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     autoAccept: () => accepting(),
     mode: () => store.mode,
     ultracodeSession: () => store.ultracodeSession,
+    openWorkflowDashboard: () => void openWorkflowDashboard(dialog),
     working,
     editor: () => editorRef,
     queueScroll,
