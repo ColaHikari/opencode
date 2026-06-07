@@ -873,6 +873,26 @@ export async function run(args, ctx) {
 }
 `
 
+// ctx.budget (Claude-Code-Parität) MIT gesetztem Budget: liest total/spent()/
+// remaining() OHNE Agent-Step, sodass spent()===0 und remaining()===total gilt.
+const BUDGET_API_FIXTURE = "budget-api"
+const BUDGET_API_WORKFLOW = `export const meta = { name: "${BUDGET_API_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  return { total: ctx.budget.total, spent: ctx.budget.spent(), remaining: ctx.budget.remaining() }
+}
+`
+
+// ctx.budget OHNE Budget: total ist null und remaining() ist Infinity. Infinity
+// überlebt JSON nicht, daher gibt das Fixture stattdessen einen Booleschen zurück.
+const BUDGET_API_UNLIMITED_FIXTURE = "budget-api-unlimited"
+const BUDGET_API_UNLIMITED_WORKFLOW = `export const meta = { name: "${BUDGET_API_UNLIMITED_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  return { total: ctx.budget.total, remainingFinite: Number.isFinite(ctx.budget.remaining()) }
+}
+`
+
 // Fund 18/19/20 (Argument-Koerzierung & Defaults): ein Workflow, der die
 // deklarierten args UND deren JS-Laufzeittypen 1:1 ins Resultat zurückgibt.
 // Über `typeof` kann der Test beweisen, dass die Engine String-eingehende args
@@ -2724,6 +2744,42 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const done = yield* workflow.wait({ id: run.id })
       expect(done.run?.status).toBe("completed")
       expect((done.run?.result as { unlimited: boolean }).unlimited).toBe(true)
+    }),
+  )
+
+  // ctx.budget (Claude-Code-Parität) neben ctx.budgetRemaining: mit gesetztem
+  // Budget liefert total den Startwert, spent() den bisher ausgegebenen Betrag
+  // (0 ohne Agent-Step) und remaining() den Rest (== total bei spent()===0).
+  it.instance("ctx.budget exposes total/spent()/remaining() when started with a budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_API_FIXTURE, BUDGET_API_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: BUDGET_API_FIXTURE, args: {}, budget: 5 })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { total: number; spent: number; remaining: number }
+      expect(result.total).toBe(5)
+      expect(result.spent).toBe(0)
+      expect(result.remaining).toBe(5)
+    }),
+  )
+
+  // Ohne Budget: ctx.budget.total ist null und remaining() ist Infinity (nicht
+  // endlich). Infinity überlebt JSON nicht, deshalb prüft das Fixture per Boolean.
+  it.instance("ctx.budget.total is null and remaining() is Infinity without a budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, BUDGET_API_UNLIMITED_FIXTURE, BUDGET_API_UNLIMITED_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: BUDGET_API_UNLIMITED_FIXTURE, args: {} })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { total: number | null; remainingFinite: boolean }
+      expect(result.total).toBe(null)
+      expect(result.remainingFinite).toBe(false)
     }),
   )
 

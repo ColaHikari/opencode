@@ -418,6 +418,8 @@ export type PipelineFn = WorkflowPipelineFn
 
 export type ContextApi = {
   readonly budgetRemaining: number
+  /** Cost budget (USD) in Claude-Code API shape: `total` (null when unlimited), `spent()` so far, `remaining()` (Infinity when unlimited). */
+  readonly budget: { readonly total: number | null; spent(): number; remaining(): number }
   readonly setPhase: (phase: string) => void
   readonly log: (message: string) => void
   readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<(T | null)[]>
@@ -491,6 +493,19 @@ type Active = {
    * Read by `ctx.budgetRemaining`; gated against in `ctx.agent`.
    */
   budgetRemaining: number
+  /**
+   * Original cost cap (USD) the run was started with, or `undefined` when no
+   * budget was set. Distinct from `budget` (which coerces "unset" to `Infinity`
+   * for the gate): this keeps the unset case as `undefined` so `ctx.budget.total`
+   * can report `null`. Read-only after `start()`.
+   */
+  budgetTotal?: number
+  /**
+   * Total cost (USD) actually spent so far, accumulated at the same site that
+   * decrements `budgetRemaining` — but ALWAYS, even with no budget set, so
+   * `ctx.budget.spent()` works regardless. Starts at 0. Read by `ctx.budget`.
+   */
+  costSpent: number
   /**
    * Run-wide concurrency gate over EVERY `ctx.agent` dispatch (agent/parallel/
    * pipeline all funnel through ctx.agent). Sized to the host CPU count clamped
@@ -1205,6 +1220,20 @@ function createContext(input: {
     get budgetRemaining() {
       return input.active.budgetRemaining
     },
+    // Claude-Code API-shape view over the same spend the run tracks. `total` is
+    // the cap (null when unlimited), `spent()` the running total charged so far,
+    // `remaining()` the headroom (Infinity when unlimited). All read live so a
+    // workflow sees them change across agent steps, mirroring `budgetRemaining`.
+    budget: {
+      get total() {
+        return input.active.budgetTotal ?? null
+      },
+      spent: () => input.active.costSpent,
+      remaining: () =>
+        input.active.budgetTotal === undefined
+          ? Infinity
+          : Math.max(0, input.active.budgetTotal - input.active.costSpent),
+    },
     setPhase(phase: string) {
       input.active.run.current_phase = phase
       input.persist()
@@ -1694,6 +1723,10 @@ export const layer = Layer.effect(
         // no-op, preserving the previous unlimited behavior exactly.
         budget: input.budget ?? Number.POSITIVE_INFINITY,
         budgetRemaining: input.budget ?? Number.POSITIVE_INFINITY,
+        // Kept as the raw validated budget (undefined ⇒ no budget) so
+        // `ctx.budget.total` reports `null` rather than coercing to Infinity.
+        budgetTotal: input.budget,
+        costSpent: 0,
         agentSemaphore,
         agentStarted: 0,
         agentLimit: agentLimitOverride ?? DEFAULT_AGENT_LIMIT,
@@ -2004,7 +2037,13 @@ export const layer = Layer.effect(
                 // A pausing run is treated like a cancelling one: an interrupted
                 // step did not really spend, so it must not be charged.
                 if (active.cancelling || active.removed || active.pausing) return
+                // Charge the SAME cost to BOTH the live remaining budget (gated)
+                // and the lifetime spend accumulator. costSpent accrues regardless
+                // of whether a budget was set, so `ctx.budget.spent()` works without
+                // a budget; keeping it on the same guard/cost as `budgetRemaining`
+                // makes `spent()`/`remaining()`/`total` mutually consistent.
                 active.budgetRemaining -= node.cost ?? 0
+                active.costSpent += node.cost ?? 0
               }),
             ),
             // Run-wide concurrency cap (Spec §5.1): acquire one permit around

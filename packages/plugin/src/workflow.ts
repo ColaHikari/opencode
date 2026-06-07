@@ -85,6 +85,8 @@ export type WorkflowContext = {
    * with a budget error once this reaches zero.
    */
   readonly budgetRemaining: number
+  /** Cost budget (USD) in Claude-Code API shape: `total` (null when unlimited), `spent()` so far, `remaining()` (Infinity when unlimited). */
+  readonly budget: { readonly total: number | null; spent(): number; remaining(): number }
   setPhase(phase: string): void
   log(message: string): void
   /**
