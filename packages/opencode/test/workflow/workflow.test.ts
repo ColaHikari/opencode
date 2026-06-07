@@ -585,6 +585,47 @@ const EVENTS_WORKFLOW = `export const meta = { name: "${EVENTS_FIXTURE}", phases
 export async function run(args, ctx) { ctx.setPhase("run"); return { ok: true } }
 `
 
+// Finding 15: a fixture that dispatches TWO agents — one that COMPLETES (plaintext)
+// and one with a schema that FAILS (no structured output, caught by the body) — so
+// the run still ends `completed` but with a NON-trivial agents split: total 2,
+// failed 1, running 0. This makes the slim-payload `agents` COUNT object falsifiable
+// (the zero-agent EVENTS fixture could not distinguish a swapped running/failed
+// filter from the all-zero case).
+const EVENTS_AGENTS_FIXTURE = "events-agents"
+const EVENTS_AGENTS_WORKFLOW = `export const meta = { name: "${EVENTS_AGENTS_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "completes" })
+  try {
+    await ctx.agent({ prompt: "fails", schema: { type: "object" } })
+  } catch (e) {}
+  return { ok: true }
+}
+`
+
+// Finding 15 prompt-ops: a schema request (input.format set) returns a message
+// with NO structured output → the engine fails that node (failed). A plain request
+// returns a normal reply → that node completes. Net: one completed + one failed
+// agent node on a run the body still completes.
+function eventsAgentsPromptOps(db: Database.Interface["db"]) {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        const wantsSchema = input.format?.type === "json_schema"
+        const last = yield* persistTurns(db, input.sessionID, [
+          { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+        ])
+        // Schema agent: no `structured` → engine marks the node failed. Plain agent:
+        // a text part → node completes.
+        const parts = wantsSchema ? [] : [{ type: "text", text: "done" }]
+        return { info: last.info, parts } as unknown as SessionV1.WithParts
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
 // N2/N13-Fixture: ein Workflow, dessen Rückgabewert NICHT strukturell klonbar ist
 // (eine Funktion ist weder JSON-serialisierbar noch structuredClone-fähig). Der
 // frühere structuredClone-Snapshot warf hier (DOMException) und strandete jeden
@@ -1584,6 +1625,56 @@ describe("Workflow", () => {
       // The slim payload carries a `pending_question` flag (false for a run with
       // no open human-in-the-loop question — Tasks 12/13).
       expect(last.data["pending_question"]).toBe(false)
+    }),
+  )
+
+  // Finding 15: the zero-agent fixture above only ever asserts the slim-payload
+  // `agents` count in its trivial all-zero state, so a regression that swapped the
+  // `running`/`failed` filters or always emitted zeros would still pass. Drive a run
+  // that dispatches TWO agents — one completed, one failed (caught) — and assert the
+  // emitted `agents` object carries the real NON-zero split, so the count
+  // COMPUTATION (not just the "it's a count object" shape) is falsifiable.
+  it.instance("the slim-payload agents count reflects a real non-zero total/running/failed split", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, EVENTS_AGENTS_FIXTURE, EVENTS_AGENTS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const events = yield* EventV2Bridge.Service
+      const { db } = yield* Database.Service
+      const seen: Array<{ type: string; data: Record<string, unknown> }> = []
+      const unsub = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === "workflow.run.updated" || event.type === "workflow.run.finished")
+            seen.push({ type: event.type, data: event.data as Record<string, unknown> })
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsub)
+
+      const started = yield* workflow.start({ name: EVENTS_AGENTS_FIXTURE, args: {}, prompt: eventsAgentsPromptOps(db) })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("events-agents workflow did not finish")))
+      // The body caught the schema failure, so the run completes...
+      expect(done.status).toBe("completed")
+      // ...with exactly one completed and one failed agent node.
+      expect(done.agents.length).toBe(2)
+      expect(done.agents.filter((a) => a.status === "completed").length).toBe(1)
+      expect(done.agents.filter((a) => a.status === "failed").length).toBe(1)
+
+      // The terminal slim payload's `agents` COUNT reflects that real split — a
+      // swapped running/failed filter or an always-zero emitter would fail here.
+      const last = seen.at(-1) ?? (yield* Effect.fail(new Error("no workflow.run events seen")))
+      expect(last.type).toBe("workflow.run.finished")
+      expect(last.data["agents"]).toEqual({ total: 2, running: 0, failed: 1 })
+      expect(Array.isArray(last.data["agents"])).toBe(false)
+
+      // The `running` filter is also exercised live: at least one mid-run `updated`
+      // event must have carried a running agent count >= 1 (a dispatched agent is
+      // `running` until it settles), so swapping running<->failed would be caught
+      // both at the terminal event AND on a live update.
+      const runningCounts = seen
+        .filter((e) => e.type === "workflow.run.updated")
+        .map((e) => (e.data["agents"] as { running: number }).running)
+      expect(runningCounts.some((n) => n >= 1)).toBe(true)
     }),
   )
 
