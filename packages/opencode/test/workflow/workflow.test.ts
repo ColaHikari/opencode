@@ -311,6 +311,20 @@ export async function run(args, ctx) {
 }
 `
 
+// Task 11a (deterministic non-LLM shell step): ctx.shell runs a command in the
+// run's workspace and returns { output, exitCode } WITHOUT consuming an LLM turn
+// or budget. A non-zero exit is mapped to the return value (never thrown), and
+// ctx.budget.spent() stays 0 because shell never touches the cost accumulator.
+const SHELL_FIXTURE = "shell-step"
+const SHELL_WORKFLOW = `export const meta = { name: "${SHELL_FIXTURE}", phases: ["run"] }
+export async function run(_args, ctx) {
+  ctx.setPhase("run")
+  const ok = await ctx.shell("echo hello-workflow")
+  const fail = await ctx.shell("exit 3")
+  return { out: ok.output.trim(), okCode: ok.exitCode, failCode: fail.exitCode, spent: ctx.budget.spent() }
+}
+`
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -4596,6 +4610,31 @@ export async function run() { return { from: "global" } }
       expect(node?.status).toBe("failed")
       // The prompt was never dispatched (no worktree to run in).
       expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 11a: ctx.shell runs a real command in the run's workspace and returns
+  // { output, exitCode } without an LLM turn. A successful command reports
+  // exitCode 0 and its stdout; a non-zero exit is returned (failCode === 3), never
+  // thrown; and ctx.budget.spent() is 0 because shell never touches the budget.
+  it.instance("ctx.shell runs a deterministic non-LLM step returning output + exitCode without touching budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_FIXTURE, SHELL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: SHELL_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("shell workflow did not finish")))
+
+      expect(done.status).toBe("completed")
+      const result = done.result as { out: string; okCode: number; failCode: number; spent: number }
+      expect(result.out).toBe("hello-workflow")
+      expect(result.okCode).toBe(0)
+      // A non-zero exit is mapped to the return value, NOT a throw.
+      expect(result.failCode).toBe(3)
+      // Shell does not touch the budget — spend stays at 0.
+      expect(result.spent).toBe(0)
     }),
   )
 })

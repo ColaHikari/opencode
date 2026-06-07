@@ -48,6 +48,8 @@ import { WorkflowRunTable } from "./workflow.sql"
 import { MetaReader } from "./meta-reader"
 import { Meta } from "./meta"
 import { BUILTIN_WORKFLOWS, builtinPath } from "./builtin"
+import { Process } from "@/util/process"
+import { Shell } from "@/shell/shell"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
 // / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a
@@ -438,6 +440,16 @@ export type ContextApi = {
   readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<(T | null)[]>
   readonly pipeline: PipelineFn
   readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  /**
+   * Deterministic non-LLM step: run a shell command in the run's workspace and
+   * resolve to `{ output, exitCode }`. Does NOT consume an LLM turn or the run's
+   * budget (`ctx.budget.spent()` is unaffected). A non-zero exit is mapped to the
+   * returned `exitCode`, NOT thrown.
+   */
+  readonly shell: (
+    command: string,
+    opts?: { timeout?: number; cwd?: string },
+  ) => Promise<{ output: string; exitCode: number }>
 }
 
 // `ContextApi` is the engine-side view of the run context handed to a workflow
@@ -1208,6 +1220,7 @@ function projectConfigDir(ctx: { directory: string; worktree: string }) {
 function createContext(input: {
   active: Active
   agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  shell: ContextApi["shell"]
   permissionSessionID?: SessionID
   persist: () => void
   /** AbortSignal of the run fiber; fires when the run is interrupted/cancelled. */
@@ -1345,6 +1358,7 @@ function createContext(input: {
       )
     }) as ContextApi["pipeline"],
     agent: input.agent,
+    shell: input.shell,
   }
 }
 
@@ -2276,6 +2290,34 @@ export const layer = Layer.effect(
         )
       }
 
+      // Deterministic non-LLM step. Runs a shell command in the run's workspace
+      // (or an explicit `cwd`) and resolves to `{ output, exitCode }` WITHOUT
+      // touching `costSpent`/budget or starting an agent — it deliberately does
+      // NOT go through `agent()`, the budget gate, or the lifetime cap. The work
+      // runs as a child of the run scope (via `dispatch`), so a cancel/remove that
+      // closes the run scope interrupts an in-flight shell; a `checkpoint()`-style
+      // guard before dispatch refuses to start a new shell once a cancel/pause has
+      // landed. A non-zero exit is returned (`nothrow`), never thrown.
+      const shell: ContextApi["shell"] = (command, opts) => {
+        if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
+        const cwd = opts?.cwd ?? active.directory
+        return dispatch(
+          Effect.gen(function* () {
+            const cfg = yield* config.get()
+            const sh = Shell.preferred(cfg.shell)
+            const result = yield* Effect.tryPromise(() =>
+              Process.run([sh, ...Shell.args(sh, command, cwd)], {
+                cwd,
+                nothrow: true,
+                timeout: opts?.timeout,
+              }),
+            ).pipe(Effect.orDie)
+            const output = Buffer.concat([result.stdout, result.stderr]).toString()
+            return { output, exitCode: result.code }
+          }),
+        )
+      }
+
       // Fund 5 (TOCTOU): a cancel/remove can land during the startup window —
       // after the run was registered but before the body fiber exists. In that
       // window abortRun set `cancelling`/closed the run scope and finish() already
@@ -2295,6 +2337,7 @@ export const layer = Layer.effect(
           createContext({
             active,
             agent,
+            shell,
             persist: () => void persistInScope(active, bridge, db, events),
             signal: () => runSignal,
             dispatch,

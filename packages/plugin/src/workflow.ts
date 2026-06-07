@@ -130,6 +130,14 @@ export type WorkflowContext = {
   parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<(T | null)[]>
   pipeline: WorkflowPipelineFn
   agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult>
+  /**
+   * Deterministic non-LLM step: run a shell command in the run's workspace (or an
+   * explicit `cwd`) and resolve to `{ output, exitCode }`. Unlike `agent()`, this
+   * consumes NO LLM turn and does NOT touch the run's budget — `budget.spent()`
+   * is unaffected. A non-zero exit is returned as `exitCode`, never thrown, so
+   * inspect `exitCode` to branch on failure.
+   */
+  shell(command: string, opts?: { timeout?: number; cwd?: string }): Promise<{ output: string; exitCode: number }>
 }
 
 export function workflow<const Args extends WorkflowArguments | undefined = undefined>(input: {
