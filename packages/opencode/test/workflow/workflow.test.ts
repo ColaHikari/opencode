@@ -222,6 +222,18 @@ export async function run(args, ctx) {
 }
 `
 
+// model:"small" fixture (Task 7): a single agent step that requests the magic
+// "small" model. The engine must resolve this to the configured small_model and
+// dispatch the prompt against that provider/model.
+const SMALL_MODEL_FIXTURE = "small-model-step"
+const SMALL_MODEL_WORKFLOW = `export const meta = { name: "${SMALL_MODEL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", model: "small" })
+  return { ok: true }
+}
+`
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -4161,6 +4173,56 @@ export async function run() { return { from: "global" } }
       // Exactly one real agent dispatch, carrying the requested variant.
       expect(inputs.length).toBe(1)
       expect(inputs[0]?.variant).toBe("max")
+    }),
+  )
+
+  // Task 7: ctx.agent({ model: "small" }) must resolve to the configured
+  // small_model and dispatch the prompt against that provider/model. The
+  // capturing prompt-ops record the real PromptInput, so the resolved model is
+  // asserted directly against the configured small_model's providerID/modelID.
+  it.instance(
+    'ctx.agent model:"small" routes to the configured small_model',
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, SMALL_MODEL_FIXTURE, SMALL_MODEL_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, inputs } = capturingPromptOps()
+
+        const started = yield* workflow.start({ name: SMALL_MODEL_FIXTURE, args: {}, prompt: ops })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("small-model workflow did not finish")))
+        expect(done.status).toBe("completed")
+
+        // The dispatch resolved to the configured small_model, not the default agent model.
+        expect(inputs.length).toBe(1)
+        expect(String(inputs[0]?.model?.providerID)).toBe("smallprov")
+        expect(String(inputs[0]?.model?.modelID)).toBe("small-model")
+      }),
+    { config: { small_model: "smallprov/small-model" } },
+  )
+
+  // Task 7 (error path): requesting model:"small" with NO small_model configured
+  // is an authoring error. The agent step must fail with a clear message rather
+  // than silently falling back; the prompt is never dispatched.
+  it.instance("ctx.agent model:\"small\" fails clearly when no small_model is configured", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SMALL_MODEL_FIXTURE, SMALL_MODEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SMALL_MODEL_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("small-model workflow did not finish")))
+
+      // The run failed because the only agent step could not resolve a model.
+      expect(done.status).toBe("failed")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      expect(node?.error).toContain("small_model")
+      // The prompt was never dispatched (no model to run against).
+      expect(inputs.length).toBe(0)
     }),
   )
 })

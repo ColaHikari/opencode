@@ -1826,7 +1826,25 @@ export const layer = Layer.effect(
         return dispatch(
           Effect.gen(function* () {
             const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
-            const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+            // Model resolution: the magic `model: "small"` routes to the
+            // configured `small_model` (read from the already-injected
+            // Config.Service — the same config the engine resolves for
+            // discovery). An explicit `model` string is parsed as-is; otherwise
+            // the selected agent's model is used. Requesting "small" without a
+            // configured `small_model` is an authoring error, so fail the step
+            // with a clear WorkflowInvalidError rather than silently falling back.
+            const smallModel = agentInput.model === "small" ? (yield* config.get()).small_model : undefined
+            if (agentInput.model === "small" && !smallModel) {
+              return yield* new InvalidError({
+                path: active.run.workflow,
+                message: 'ctx.agent({ model: "small" }) requires "small_model" to be configured',
+              })
+            }
+            const modelInfo = smallModel
+              ? Provider.parseModel(smallModel)
+              : agentInput.model
+                ? Provider.parseModel(agentInput.model)
+                : selected.model
             // Per-step model reasoning variant (e.g. "max"). opencode keeps the
             // variant SEPARATE from the model ref (model ids legitimately contain
             // slashes, so it is never peeled from the model string here — that is
