@@ -93,9 +93,7 @@ export const WorkflowRunTable = sqliteTable(
     // `cancelled`/`interrupted` (both terminal): a paused run is neither finished
     // nor lost, it is parked. Keep this union in lockstep with the engine's
     // `Status` schema (asserted assignable at compile time over there).
-    status: text()
-      .$type<"running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused">()
-      .notNull(),
+    status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused">().notNull(),
     started_at: integer().notNull(),
     completed_at: integer(),
     current_phase: text(),

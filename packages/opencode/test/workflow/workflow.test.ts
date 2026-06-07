@@ -457,7 +457,10 @@ function persistTurns(db: Database.Interface["db"], sessionID: string, turns: As
         } as unknown as typeof MessageTable.$inferInsert)
         .run()
         .pipe(Effect.orDie)
-      last = { info: { id, sessionID, ...data }, parts: [{ type: "text", text: "ok" }] } as unknown as SessionV1.WithParts
+      last = {
+        info: { id, sessionID, ...data },
+        parts: [{ type: "text", text: "ok" }],
+      } as unknown as SessionV1.WithParts
     }
     return last!
   })
@@ -548,7 +551,10 @@ function resolveOnAbortPromptOps(options?: { delayMs?: number }) {
   const started = new Set<string>()
   const gates = new Map<string, Deferred.Deferred<void>>()
   const abortedReply = (): SessionV1.WithParts =>
-    ({ info: { role: "assistant", error: { name: "MessageAbortedError", data: {} } }, parts: [] }) as unknown as SessionV1.WithParts
+    ({
+      info: { role: "assistant", error: { name: "MessageAbortedError", data: {} } },
+      parts: [],
+    }) as unknown as SessionV1.WithParts
   const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
     prompt: (input) =>
       Effect.gen(function* () {
@@ -1568,9 +1574,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
   it.instance("completed run closes a still-running detached agent node and aborts its session", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, DETACHED_AGENT_FIXTURE, DETACHED_AGENT_WORKFLOW),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, DETACHED_AGENT_FIXTURE, DETACHED_AGENT_WORKFLOW))
       const workflow = yield* Workflow.Service
       const { ops, aborted, started } = hangingPromptOps()
 
@@ -2032,18 +2036,42 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
       // Live-Snapshot (Run ist noch in der Registry): keine internen Felder.
       const live = yield* workflow.get(run.id)
       const liveAny = live as unknown as Record<string, unknown>
-      for (const internal of ["directory", "done", "runScope", "fiber", "sessions", "cancelSession", "cancelling", "removed", "budget", "budgetRemaining"]) {
+      for (const internal of [
+        "directory",
+        "done",
+        "runScope",
+        "fiber",
+        "sessions",
+        "cancelSession",
+        "cancelling",
+        "removed",
+        "budget",
+        "budgetRemaining",
+      ]) {
         expect(internal in liveAny).toBe(false)
       }
       // Exakt die deklarierten Run-Schlüssel (Teilmenge: optionale können fehlen).
       const allowed = new Set([
-        "id", "session_id", "workflow", "args", "definition", "status",
-        "started_at", "completed_at", "current_phase", "logs", "agents", "result", "error", "resume_of",
+        "id",
+        "session_id",
+        "workflow",
+        "args",
+        "definition",
+        "status",
+        "started_at",
+        "completed_at",
+        "current_phase",
+        "logs",
+        "agents",
+        "result",
+        "error",
+        "resume_of",
       ])
-      for (const key of Object.keys(liveAny)) expect(allowed.has(key)).toBe(true)
+      for (const key of Object.keys(liveAny))
+        expect(allowed.has(key)).toBe(true)
 
-      // Defensive Projektion: das verschachtelte args mutieren darf den internen
-      // Zustand NICHT beeinflussen.
+        // Defensive Projektion: das verschachtelte args mutieren darf den internen
+        // Zustand NICHT beeinflussen.
       ;(live!.args as { nested: { value: number } }).nested.value = 999
       const again = yield* workflow.get(run.id)
       expect((again!.args as { nested: { value: number } }).nested.value).toBe(1)
@@ -2072,9 +2100,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
   it.instance("snapshot severs agents[].tokens aliasing on a live run", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, AGENT_THEN_HANG_FIXTURE, AGENT_THEN_HANG_WORKFLOW),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, AGENT_THEN_HANG_FIXTURE, AGENT_THEN_HANG_WORKFLOW))
       const workflow = yield* Workflow.Service
       const { db } = yield* Database.Service
       const run = yield* workflow.start({ name: AGENT_THEN_HANG_FIXTURE, args: {}, prompt: tokensPromptOps(db) })
@@ -2150,9 +2176,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
   it.instance("a circular workflow result finishes with the $unserializable placeholder", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() =>
-        writeWorkflow(test.directory, CIRCULAR_RESULT_FIXTURE, CIRCULAR_RESULT_WORKFLOW),
-      )
+      yield* Effect.promise(() => writeWorkflow(test.directory, CIRCULAR_RESULT_FIXTURE, CIRCULAR_RESULT_WORKFLOW))
       const workflow = yield* Workflow.Service
       const run = yield* workflow.start({ name: CIRCULAR_RESULT_FIXTURE, args: {} })
 
@@ -2177,9 +2201,15 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
   it.instance("null and undefined workflow results survive persistence distinctly", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, HELLO_FIXTURE, `export const meta = { name: "Hello" }
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          HELLO_FIXTURE,
+          `export const meta = { name: "Hello" }
 export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
-`))
+`,
+        ),
+      )
       yield* Effect.promise(() => writeWorkflow(test.directory, NULL_RESULT_FIXTURE, NULL_RESULT_WORKFLOW))
       yield* Effect.promise(() => writeWorkflow(test.directory, VOID_RESULT_FIXTURE, VOID_RESULT_WORKFLOW))
       const workflow = yield* Workflow.Service
@@ -2218,10 +2248,12 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       // NOT NULL with no SQL-level default (the default lives in the Drizzle
       // Timestamps helper, which a raw INSERT bypasses), so they must be set here.
       const seedRaw = (id: string, raw: string | null) =>
-        db.run(
-          sql`INSERT INTO ${WorkflowRunTable} (id, workflow, directory, status, started_at, completed_at, logs, agents, result, time_created, time_updated)
+        db
+          .run(
+            sql`INSERT INTO ${WorkflowRunTable} (id, workflow, directory, status, started_at, completed_at, logs, agents, result, time_created, time_updated)
               VALUES (${id}, ${HELLO_FIXTURE}, ${test.directory}, 'completed', ${now}, ${now}, '[]', '[]', ${raw}, ${now}, ${now})`,
-        ).pipe(Effect.orDie)
+          )
+          .pipe(Effect.orDie)
       yield* seedRaw("job_result_real", JSON.stringify({ value: 7 }))
       yield* seedRaw("job_result_null", "null")
       yield* seedRaw("job_result_void", null)
@@ -2953,9 +2985,7 @@ export async function run() { return { ok: true } }
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
       const workflow = yield* Workflow.Service
-      const failed = yield* workflow
-        .start({ name: COERCE_FIXTURE, args: { count: "abc" } })
-        .pipe(Effect.flip)
+      const failed = yield* workflow.start({ name: COERCE_FIXTURE, args: { count: "abc" } }).pipe(Effect.flip)
       expect(failed._tag).toBe("WorkflowInvalidError")
       const invalid =
         failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
@@ -2970,9 +3000,7 @@ export async function run() { return { ok: true } }
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, COERCE_FIXTURE, COERCE_WORKFLOW))
       const workflow = yield* Workflow.Service
-      const failed = yield* workflow
-        .start({ name: COERCE_FIXTURE, args: { flag: "maybe" } })
-        .pipe(Effect.flip)
+      const failed = yield* workflow.start({ name: COERCE_FIXTURE, args: { flag: "maybe" } }).pipe(Effect.flip)
       expect(failed._tag).toBe("WorkflowInvalidError")
     }),
   )
@@ -3128,12 +3156,10 @@ export async function run() { return { ok: true } }
       // read until the row (and its derived permission) is visible. A not-yet-
       // projected row fails get() with NotFound → map to undefined to keep polling.
       const child = yield* pollWithTimeout(
-        sessions
-          .get(SessionID.make(childSessionID!))
-          .pipe(
-            Effect.map((s) => (s.permission ? s : undefined)),
-            Effect.catchCause(() => Effect.succeed(undefined)),
-          ),
+        sessions.get(SessionID.make(childSessionID!)).pipe(
+          Effect.map((s) => (s.permission ? s : undefined)),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        ),
         "child session permission never populated",
       )
       const rules = child.permission ?? []
@@ -3191,7 +3217,9 @@ export async function run() { return { ok: true } }
     // deklariert, anhand des Typ-Headers + Feldnamens.
     const fieldLine = (typeName: string, field: string) => {
       const block = source.slice(source.indexOf(`export type ${typeName} = {`))
-      const line = block.split("\n").find((l) => l.trimStart().startsWith(`${field}:`) || l.trimStart().startsWith(`${field}?:`))
+      const line = block
+        .split("\n")
+        .find((l) => l.trimStart().startsWith(`${field}:`) || l.trimStart().startsWith(`${field}?:`))
       return line ?? ""
     }
     for (const [typeName, field] of [
@@ -3310,10 +3338,7 @@ export async function run() { return { from: "global" } }
     // Syntax-/Compile-Fehler im Source-Literal auf.
     const workflowsDir = path.join(Global.Path.config, "workflows")
     await fs.mkdir(workflowsDir, { recursive: true })
-    const file = path.join(
-      workflowsDir,
-      `.deep-research.${Date.now()}.${Math.random().toString(16).slice(2)}.mts`,
-    )
+    const file = path.join(workflowsDir, `.deep-research.${Date.now()}.${Math.random().toString(16).slice(2)}.mts`)
     await Bun.write(file, source)
     try {
       const imported = (await import(pathToFileURL(file).href)) as {
@@ -3323,7 +3348,9 @@ export async function run() { return { from: "global" } }
       expect(mod.meta?.name).toBe("deep-research")
       expect(typeof mod.run).toBe("function")
     } finally {
-      await Bun.file(file).delete().catch(() => {})
+      await Bun.file(file)
+        .delete()
+        .catch(() => {})
     }
     // Temp-Datei wurde im globalen workflows-Verzeichnis geladen und ist danach
     // wieder weg (kein Orphan zurückgelassen).
@@ -3580,7 +3607,8 @@ export async function run() { return { from: "global" } }
         resume_of: first.id,
         budget: 10,
       })
-      const done = (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
       expect(done.status).toBe("completed")
       // A kam aus dem Journal: KEIN neuer Prompt "agent A" wurde gefeuert.
       expect(prompted).not.toContain("agent A")

@@ -335,9 +335,7 @@ function waitForWorkflowHonoringAbort(
     waitForWorkflow(workflow, run, timeout),
     awaitAbort(abort).pipe(
       Effect.andThen(
-        workflow
-          .cancel(run.id)
-          .pipe(Effect.map((cancelled) => ({ run: cancelled ?? run, timedOut: false }))),
+        workflow.cancel(run.id).pipe(Effect.map((cancelled) => ({ run: cancelled ?? run, timedOut: false }))),
       ),
     ),
   )
