@@ -6,6 +6,7 @@ import { Global } from "@opencode-ai/core/global"
 import { useProject } from "../context/project"
 import { useRoute } from "../context/route"
 import { useSDK } from "../context/sdk"
+import { useEvent } from "../context/event"
 import { selectedForeground, useTheme } from "../context/theme"
 import { useDialog } from "../ui/dialog"
 import { useToast } from "../ui/toast"
@@ -30,6 +31,7 @@ import {
   statusIcon,
   timestamp,
 } from "./dialog-workflow-helpers"
+import { asWorkflowRunEvent } from "./dialog-workflow-client"
 
 // Re-exported so existing pure derivations keep a single import surface.
 export { phaseStatus } from "./dialog-workflow-helpers"
@@ -346,6 +348,7 @@ function scrollIndexIntoView(scroll: ScrollBoxRenderable | undefined, index: num
 export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string; openAgentID?: string }) {
   const dialog = useDialog()
   const sdk = useSDK()
+  const events = useEvent()
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
@@ -408,6 +411,18 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
         notifyClose: false,
       },
     )
+  })
+
+  onMount(() => {
+    // QW1 (Spec §5.2 (1)): subscribe to workflow.run.updated/finished so the
+    // dashboard refreshes instantly on a server that emits them. The 1s poll
+    // below STAYS as the degraded-but-correct fallback against an older server
+    // that does not (Delta 10) — a double read is harmless (only network).
+    const off = events.subscribe((evt) => {
+      if (!asWorkflowRunEvent(evt)) return
+      void refetch()
+    })
+    onCleanup(off)
   })
 
   onMount(() => {
@@ -762,6 +777,7 @@ function DialogWorkflowRun(props: {
   const dialog = useDialog()
   const route = useRoute()
   const sdk = useSDK()
+  const events = useEvent()
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
@@ -876,6 +892,18 @@ function DialogWorkflowRun(props: {
     const index = store.selectedAgent
     if (selectedResult()) return
     requestAnimationFrame(() => scrollIndexIntoView(agentScroll, index))
+  })
+
+  onMount(() => {
+    // QW1 (Spec §5.2 (1)): refetch the detail view the moment THIS run emits an
+    // updated/finished event. The 1s running-only poll below STAYS as the
+    // fallback against a server that does not emit (Delta 10).
+    const off = events.subscribe((evt) => {
+      const wf = asWorkflowRunEvent(evt)
+      if (!wf || wf.run.id !== props.id) return
+      void refetch()
+    })
+    onCleanup(off)
   })
 
   onMount(() => {

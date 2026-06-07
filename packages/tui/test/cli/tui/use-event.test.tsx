@@ -6,6 +6,7 @@ import { onMount } from "solid-js"
 import { ProjectProvider, useProject } from "../../../src/context/project"
 import { SDKProvider } from "../../../src/context/sdk"
 import { useEvent } from "../../../src/context/event"
+import { asWorkflowRunEvent } from "../../../src/component/dialog-workflow-client"
 import { createEventSource, createFetch, directory } from "../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
 
@@ -46,6 +47,23 @@ function update(version: string): Event {
       version,
     },
   }
+}
+
+function workflowFinished(id: string): Event {
+  // Wire shape from WORKFLOWSVC EventV2.define; not in the SDK Event union, so
+  // cast through unknown exactly like production code does.
+  return {
+    id: `evt_wf_${id}`,
+    type: "workflow.run.finished",
+    properties: {
+      id,
+      workflow: "demo",
+      status: "completed",
+      directory,
+      agents: { total: 1, running: 0, failed: 0 },
+      pending_question: false,
+    },
+  } as unknown as Event
 }
 
 async function mount() {
@@ -141,6 +159,19 @@ describe("useEvent", () => {
       await wait(() => seen.length === 1)
 
       expect(seen).toEqual([update("1.2.3")])
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("delivers workflow.run.finished frames to a subscriber and they narrow", async () => {
+    const { app, emit, seen } = await mount()
+    try {
+      emit(event(workflowFinished("job_x"), { directory, project: projectID, workspace: "ws_a" }))
+      await wait(() => seen.length === 1)
+      const narrowed = asWorkflowRunEvent(seen[0])
+      expect(narrowed?.kind).toBe("finished")
+      expect(narrowed?.run.id).toBe("job_x")
     } finally {
       app.renderer.destroy()
     }
