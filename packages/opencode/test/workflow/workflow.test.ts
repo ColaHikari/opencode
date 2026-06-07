@@ -210,6 +210,18 @@ export async function run(args, ctx) {
 }
 `
 
+// Per-step reasoning variant fixture (Task 6): a single agent step that passes a
+// `variant` through to the engine. The engine must thread that variant into the
+// underlying prompt run (PromptInput.variant) unchanged.
+const VARIANT_FIXTURE = "variant-step"
+const VARIANT_WORKFLOW = `export const meta = { name: "${VARIANT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", variant: "max" })
+  return { ok: true }
+}
+`
+
 // Prompt-ops that resolve every agent prompt immediately (no hang), so the run
 // reaches `completed` and the child session is fully created/projected.
 function immediatePromptOps() {
@@ -218,6 +230,25 @@ function immediatePromptOps() {
     cancel: () => Effect.void,
   }
   return ops
+}
+
+// Capturing prompt-ops: resolve every agent prompt immediately (like
+// immediatePromptOps) but capture each real (non-noReply) PromptInput so a test
+// can assert on what the engine actually dispatched (e.g. its resolved `variant`
+// or `model`). The initial "Workflow started" noReply message is skipped so only
+// genuine ctx.agent dispatches are recorded. Named distinctly from the journal
+// `recordingPromptOps` below so the two never collide via function hoisting.
+function capturingPromptOps() {
+  const inputs: SessionPrompt.PromptInput[] = []
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.sync(() => {
+        if (!input.noReply) inputs.push(input)
+        return assistantReply()
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, inputs }
 }
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
@@ -4108,6 +4139,28 @@ export async function run() { return { from: "global" } }
       // Der Agent-Node ist NICHT als cached markiert (Cache-MISS → Live-Lauf).
       const node = done.agents.find((a) => a.prompt === "drift agent")
       expect(node?.cached).not.toBe(true)
+    }),
+  )
+
+  // Task 6: a per-step reasoning `variant` passed to ctx.agent must be threaded
+  // verbatim into the underlying prompt run. The recording prompt-ops capture the
+  // real PromptInput, so the dispatched `variant` is asserted directly — proving
+  // ctx.agent({ prompt, variant }) reaches SessionPrompt.prompt as input.variant.
+  it.instance("ctx.agent variant is threaded into the prompt run", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, VARIANT_FIXTURE, VARIANT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: VARIANT_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("variant workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      // Exactly one real agent dispatch, carrying the requested variant.
+      expect(inputs.length).toBe(1)
+      expect(inputs[0]?.variant).toBe("max")
     }),
   )
 })

@@ -402,6 +402,7 @@ export type AgentInput = {
   agent?: string
   prompt: string
   model?: string
+  variant?: string
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
 }
@@ -1826,6 +1827,12 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             const selected = agentInput.agent ? yield* agents.get(agentInput.agent) : yield* agents.defaultInfo()
             const modelInfo = agentInput.model ? Provider.parseModel(agentInput.model) : selected.model
+            // Per-step model reasoning variant (e.g. "max"). opencode keeps the
+            // variant SEPARATE from the model ref (model ids legitimately contain
+            // slashes, so it is never peeled from the model string here — that is
+            // the registry-aware job of the model picker); it rides alongside the
+            // model into both the child session and the prompt run.
+            const variant = agentInput.variant
             // Resume replay: when this run has a journal (started with
             // resume_of), consume the next unused source agent for this call's
             // key (occurrence order) and replay it verbatim — NO session, NO
@@ -1907,7 +1914,7 @@ export const layer = Layer.effect(
               parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
               title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
               agent: selected.name,
-              model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID } : undefined,
+              model: modelInfo ? { id: modelInfo.modelID, providerID: modelInfo.providerID, variant } : undefined,
               permission: callerSession
                 ? deriveSubagentSessionPermission({
                     parentSessionPermission: callerSession.permission ?? [],
@@ -1936,6 +1943,7 @@ export const layer = Layer.effect(
               permissionSessionID: agentInput.permissionSessionID ?? input.permissionSessionID,
               agent: selected.name,
               model: modelInfo,
+              variant,
               format: agentInput.schema ? { type: "json_schema", schema: agentInput.schema } : undefined,
               parts: [{ type: "text", text: agentInput.prompt }],
             })

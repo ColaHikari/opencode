@@ -22,6 +22,8 @@ export type WorkflowAgentInput = {
   prompt: string
   agent?: string
   model?: string
+  /** Per-step model reasoning variant (e.g. "max"), threaded into the underlying prompt run. */
+  variant?: string
   schema?: unknown
   permissionSessionID?: string
 }
