@@ -4212,6 +4212,98 @@ export async function run() { return { from: "global" } }
     }),
   )
 
+  // T5 gap (sweep vs parked question): the existing "leaves paused rows untouched"
+  // test uses a paused row WITHOUT a pending_question. A run parked by an
+  // unanswered ctx.question carries a persisted pending_question; the sweep must
+  // leave BOTH the paused status AND the question intact so a later answer() can
+  // still resume it.
+  it.instance("sweep leaves a paused run that carries a pending_question untouched (status + question preserved)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const pausedId = "job_paused_pending_question"
+      const now = Date.now()
+      yield* db
+        .insert(WorkflowRunTable)
+        .values({
+          id: pausedId,
+          workflow: HELLO_FIXTURE,
+          status: "paused",
+          started_at: now,
+          directory: test.directory,
+          logs: [],
+          agents: [
+            {
+              id: "1",
+              status: "completed",
+              started_at: now,
+              completed_at: now,
+              kind: "question",
+              prompt: "deploy?",
+              answer: undefined,
+            },
+          ],
+          pending_question: { question: "deploy?", options: ["yes", "no"], asked_at: now },
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      yield* workflow.sweep()
+
+      const row = yield* fetchRunRow(pausedId)
+      expect(row.status).toBe("paused")
+      // The persisted question survives the sweep.
+      expect(row.pending_question?.question).toBe("deploy?")
+      expect(row.pending_question?.options).toEqual(["yes", "no"])
+      // The open question node is not flipped to failed (it is a parked question,
+      // not a lost running agent).
+      const qnode = row.agents.find((a) => a.kind === "question")
+      expect(qnode?.status).not.toBe("failed")
+    }),
+  )
+
+  // T5 gap (sweep vs live-waiting question): a run blocked LIVE on ctx.question
+  // has a real fiber by design — the sweep (which only heals fiber-less zombie
+  // running rows) must NOT interrupt it. Start the question run, wait until its
+  // pending_question is live, sweep, and assert it is still running and still
+  // answerable.
+  it.instance("sweep does not interrupt a run waiting live on a question", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_FIXTURE, QUESTION_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const run = yield* workflow.start({ name: QUESTION_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.pending_question?.question === "deploy?" ? current : undefined
+        }),
+        "pending question never appeared",
+      )
+
+      // sweep() keys off the live-id set; the live-waiting run must be protected.
+      yield* workflow.sweep()
+
+      const afterSweep = yield* workflow.get(run.id)
+      expect(afterSweep?.status).toBe("running")
+      expect(afterSweep?.pending_question?.question).toBe("deploy?")
+      // The DB row itself must NOT have been flipped to interrupted (get() reads the
+      // live registry snapshot, so assert the persisted row directly — this is what
+      // bites if sweepOrphans were called with an empty/incorrect live-id set).
+      const rowAfterSweep = yield* fetchRunRow(run.id)
+      expect(rowAfterSweep.status).toBe("running")
+
+      // Still answerable: the live fiber resolves and the run completes.
+      yield* workflow.answer({ id: run.id, answer: "yes" })
+      const done =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("live question run did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("yes")
+    }),
+  )
+
   // Spec §5.3 (cancel auf paused → cancelled): ein cancel auf einen pausierten Run
   // überführt ihn in den terminalen Status cancelled.
   it.instance("cancel on a paused run transitions it to cancelled", () =>
