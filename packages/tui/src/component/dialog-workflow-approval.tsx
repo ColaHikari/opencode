@@ -44,6 +44,7 @@ export function DialogWorkflowApproval(props: {
 
   const phases = createMemo(() => props.info.meta.phases ?? [])
   const description = createMemo(() => props.info.meta.description)
+  const whenToUse = createMemo(() => props.info.meta.whenToUse)
 
   function move(delta: number) {
     setActive((prev) => (prev + delta + OPTIONS.length) % OPTIONS.length)
@@ -88,6 +89,10 @@ export function DialogWorkflowApproval(props: {
 
       <Show when={description()}>
         <text fg={theme.textMuted}>{description()}</text>
+      </Show>
+
+      <Show when={whenToUse()}>
+        <text fg={theme.textMuted}>{`When to use: ${whenToUse()}`}</text>
       </Show>
 
       <box flexDirection="column">
