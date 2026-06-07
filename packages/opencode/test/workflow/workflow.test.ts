@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Workflow } from "@/workflow/workflow"
+import { BUILTIN_WORKFLOWS } from "@/workflow/builtin"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
 import { Permission } from "@/permission"
@@ -2158,6 +2159,75 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
         (yield* Effect.fail(new Error("second inline workflow did not finish")))
       expect(done2.status).toBe("completed")
       expect(done2.result).toEqual({ value: 8 })
+    }),
+  )
+
+  // A NAMED on-disk run must carry its module SOURCE in `definition.source` (not
+  // just inline starts). The dashboard's save-as-command and any run-detail source
+  // view read `run.definition.source`; before the fix only inline starts populated
+  // it (`source: input.source`), so a named/on-disk run had `source: undefined` and
+  // "save as command" / source view were blank for every real workflow.
+  it.instance("a named on-disk run carries its file source in definition.source", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const source = `export const meta = { name: "SourceCarry" }
+export async function run(args, ctx) { ctx.setPhase("run"); return { value: args.value } }
+`
+      yield* Effect.promise(() => writeWorkflow(test.directory, "source-carry", source))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "source-carry", args: { value: 5 } })
+      const waited = yield* workflow.wait({ id: run.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("workflow did not finish")))
+      expect(done.definition?.source).toBe(source)
+    }),
+  )
+
+  // A BUILTIN run must carry the bundled module string in `definition.source` so
+  // save-as-command works for a builtin too (its `path` is a synthetic marker, not
+  // a readable file).
+  it.instance("a builtin run carries the bundled source in definition.source", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "deep-research", args: { question: "x" } })
+      // The builtin body needs no model to populate definition at START time — the
+      // run's definition.source is set synchronously by start(), so cancel and
+      // assert without waiting for the (model-dependent) body to finish.
+      yield* workflow.cancel(run.id)
+      expect(run.definition?.source).toBe(BUILTIN_WORKFLOWS["deep-research"])
+    }),
+  )
+
+  // Source-availability read seam (Vasya's "CODE PREVIEW shows nothing"): the
+  // pre-run approval preview has no run yet, so it cannot read run.definition.source.
+  // workflow.read(name) returns the resolved module source for a NAME — file text
+  // for an on-disk workflow, the bundled string for a builtin — without a raw
+  // file.read({absolutePath}) (which failed for absolute paths and returned "" for
+  // synthetic builtin markers).
+  it.instance("read() returns the file source for an on-disk workflow", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const source = `export const meta = { name: "ReadSeam" }
+export async function run() { return {} }
+`
+      yield* Effect.promise(() => writeWorkflow(test.directory, "read-seam", source))
+      const workflow = yield* Workflow.Service
+      const read = yield* workflow.read("read-seam")
+      expect(read?.source).toBe(source)
+    }),
+  )
+
+  it.instance("read() returns the bundled source for a builtin", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      const read = yield* workflow.read("deep-research")
+      expect(read?.source).toBe(BUILTIN_WORKFLOWS["deep-research"])
+    }),
+  )
+
+  it.instance("read() returns undefined for an unknown workflow name", () =>
+    Effect.gen(function* () {
+      const workflow = yield* Workflow.Service
+      expect(yield* workflow.read("does-not-exist-xyz")).toBeUndefined()
     }),
   )
 

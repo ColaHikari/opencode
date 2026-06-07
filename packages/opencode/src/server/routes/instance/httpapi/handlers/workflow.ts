@@ -36,6 +36,16 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       return yield* workflow.runs()
     })
 
+    const source = Effect.fn("WorkflowHttpApi.source")(function* (ctx: { params: { name: string } }) {
+      // read() resolves the named workflow's source through the same discovery
+      // precedence start() uses; undefined ⇒ unknown name → 404 (matching the
+      // *NotFound → 404 convention). Reading source never executes the module, so
+      // there is no load-failure mapping here.
+      const result = yield* workflow.read(ctx.params.name)
+      if (!result) return yield* notFound(`Workflow not found: ${ctx.params.name}`)
+      return result
+    })
+
     const get = Effect.fn("WorkflowHttpApi.get")(function* (ctx: { params: { id: Workflow.RunID } }) {
       // The route param is validated/branded by the params schema (RunID), so a
       // malformed id is a 400 at decode time and never reaches this handler. An
@@ -156,6 +166,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
     return handlers
       .handle("list", list)
       .handle("runs", runs)
+      .handle("source", source)
       .handle("get", get)
       .handle("start", start)
       .handle("cancel", cancel)

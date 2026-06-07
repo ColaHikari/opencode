@@ -134,8 +134,13 @@ export function DialogWorkflowApproval(props: {
 }
 
 // Read-only pager for a workflow's source. The source is fetched lazily through
-// the existing SDK file-read endpoint (Info.path) — no workflow engine change and
-// it works against a remote server too.
+// the workflow source endpoint BY NAME (`sdk.client.workflow.source`) — the server
+// resolves the bundled string for a builtin and the file text for an on-disk
+// workflow. The previous `file.read({ path: info.path })` was broken for every
+// real workflow: an ABSOLUTE on-disk path errored and a synthetic `builtin:`/
+// `inline:` marker read back empty, so the preview showed nothing. Works against a
+// remote server too. A failed/empty fetch degrades to "No source recorded." rather
+// than throwing the pager.
 function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void }) {
   const sdk = useSDK()
   const { theme } = useTheme()
@@ -143,9 +148,9 @@ function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void })
   let scroll: ScrollBoxRenderable | undefined
 
   const [source] = createResource(async () => {
-    const result = await sdk.client.file.read({ path: props.info.path })
-    if (result.error || !result.data) return undefined
-    return result.data.content
+    const result = await sdk.client.workflow.source({ name: props.info.name }).catch(() => undefined)
+    if (!result || result.error || !result.data) return undefined
+    return result.data.source
   })
 
   useBindings(() => ({

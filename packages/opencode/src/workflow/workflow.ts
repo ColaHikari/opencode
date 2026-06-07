@@ -92,6 +92,21 @@ export const Info = Schema.Struct({
 }).annotate({ identifier: "WorkflowInfo" })
 export type Info = Schema.Schema.Type<typeof Info>
 
+// The resolved module SOURCE of a single named workflow, returned by `read(name)`
+// / `GET /workflow/:name/source` for the pre-run approval preview. Kept SEPARATE
+// from `Info` (and off `list()`) on purpose: `list()` is hit for autocomplete and
+// the slash popover and returns EVERY workflow, so inlining each one's full module
+// text would bloat that hot, name+meta-only payload — whereas the source is only
+// needed lazily when an operator opens the "View script" preview for one workflow.
+// `source_kind: "builtin"` is mirrored from Info so a consumer can label a builtin.
+export const Source = Schema.Struct({
+  name: Schema.String,
+  path: Schema.String,
+  source: Schema.String,
+  source_kind: Schema.optional(Schema.Literals(["builtin"])),
+}).annotate({ identifier: "WorkflowSource" })
+export type Source = Schema.Schema.Type<typeof Source>
+
 export const Definition = Schema.Struct({
   name: Schema.String,
   path: Schema.String,
@@ -576,6 +591,12 @@ void _contextApiCheck
 type Module = {
   meta: Meta
   run: (args: Record<string, unknown>, ctx: ContextApi) => Promise<unknown>
+  // The RESOLVED module source string this module was loaded from — the file text
+  // for an on-disk workflow, the bundled/inline string for a builtin/inline start.
+  // loadModule already reads this to materialize the import; threading it out lets
+  // start() stamp `definition.source` for EVERY run (not just inline starts), which
+  // is what powers save-as-command and the run-detail source view.
+  source: string
 }
 
 type Active = {
@@ -707,6 +728,17 @@ export interface Interface {
   // Never fails: a file that cannot be loaded is reported as an invalid Info
   // entry rather than aborting the whole list.
   readonly list: () => Effect.Effect<Info[]>
+  /**
+   * Resolves a single workflow's module SOURCE by name, for the pre-run approval
+   * preview (which has no run yet, so it cannot read `run.definition.source`).
+   * Returns the file text for an on-disk workflow or the bundled string for a
+   * builtin — WITHOUT a raw `file.read({path})` (which failed for an absolute path
+   * and returned "" for a synthetic `builtin:`/`inline:` marker). `list()` stays
+   * lean (name + meta only); the heavier source is fetched on-demand only when the
+   * operator actually opens the source view. Returns `undefined` for an unknown
+   * name (the HTTP handler maps that to 404).
+   */
+  readonly read: (name: string) => Effect.Effect<Source | undefined>
   readonly runs: () => Effect.Effect<Run[]>
   readonly get: (id: RunID) => Effect.Effect<Run | undefined>
   readonly start: (input: StartOptions) => Effect.Effect<Run, InvalidError | NotFoundError>
@@ -1361,7 +1393,7 @@ async function loadModule(file: string, inlineSource?: string): Promise<Module> 
     const imported = (await import(pathToFileURL(cachePath).href).finally(() =>
       Bun.file(cachePath).delete(),
     )) as Record<string, unknown>
-    return finishModule(imported, file)
+    return finishModule(imported, file, source)
   }
   const dir = path.dirname(file)
   const cachePath = path.join(dir, tempFileName(file))
@@ -1383,14 +1415,14 @@ async function loadModule(file: string, inlineSource?: string): Promise<Module> 
     cleanup = () => Promise.resolve()
   }
   const imported = (await import(pathToFileURL(importPath).href).finally(cleanup)) as Record<string, unknown>
-  return finishModule(imported, file)
+  return finishModule(imported, file, source)
 }
 
 // Unwraps the imported module (default-object vs named exports), validates its
 // meta against the same `Meta` schema, and asserts a `run` function — shared by
 // the file and built-in load paths so both fail identically (InvalidError naming
 // the source) when meta is bad or `run` is missing.
-function finishModule(imported: Record<string, unknown>, file: string): Module {
+function finishModule(imported: Record<string, unknown>, file: string, source: string): Module {
   const module = (
     typeof imported.default === "object" && imported.default !== null ? imported.default : imported
   ) as Record<string, unknown>
@@ -1400,6 +1432,7 @@ function finishModule(imported: Record<string, unknown>, file: string): Module {
   return {
     meta: parsed.value,
     run: module.run as Module["run"],
+    source,
   }
 }
 
@@ -1888,6 +1921,25 @@ export const layer = Layer.effect(
       )
     })
 
+    const read: Interface["read"] = Effect.fn("Workflow.read")(function* (name) {
+      // Resolve the single named target through the SAME discovery precedence
+      // start() uses (project > global > builtin), so the preview shows exactly the
+      // source that would run. A builtin carries its module string inline
+      // (workflow.source); an on-disk workflow's source is its file text. Neither
+      // executes the module — this is a pure source read, like list()'s meta pass.
+      const discovered = yield* discoverWorkflows()
+      const found = discovered.find((item) => item.name === name)
+      if (!found) return undefined
+      const source =
+        found.source !== undefined ? found.source : yield* Effect.promise(() => Bun.file(found.path).text())
+      return {
+        name: found.name,
+        path: found.path,
+        source,
+        ...(found.source !== undefined ? ({ source_kind: "builtin" } as const) : {}),
+      }
+    })
+
     const runs: Interface["runs"] = Effect.fn("Workflow.runs")(function* () {
       return yield* readRuns()
     })
@@ -2179,7 +2231,14 @@ export const layer = Layer.effect(
             name: target.name,
             path: target.path,
             meta: mutableMeta(module.meta),
-            source: input.source,
+            // The RESOLVED module source for EVERY run, not just inline starts:
+            // `module.source` is the file text for an on-disk workflow and the
+            // bundled/inline string for a builtin/inline start (it equals
+            // input.source on the inline path, so this is a strict superset of the
+            // old `source: input.source`). Carrying it makes save-as-command and the
+            // run-detail source view work for named/on-disk and builtin runs too,
+            // which previously got `source: undefined`.
+            source: module.source,
             temporary: input.temporary,
           },
           status: "running",
@@ -3448,7 +3507,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, runs, get, start, wait, cancel, pause, answer, save, remove, sweep })
+    return Service.of({ list, read, runs, get, start, wait, cancel, pause, answer, save, remove, sweep })
   }),
 )
 

@@ -63,6 +63,7 @@ const it = testEffect(
                 valid: true,
               },
             ]),
+          read: () => Effect.succeed(undefined),
           runs: () => Effect.succeed([]),
           get: () => Effect.succeed(undefined),
           start: () => Effect.fail(new Workflow.NotFoundError({ name: "test" })),

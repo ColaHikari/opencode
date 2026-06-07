@@ -18,8 +18,8 @@ function formatArgs(args: Record<string, unknown>) {
 
 // Web parity with the TUI DialogWorkflowApproval: shows the workflow's
 // description / when-to-use / phases / args plus Yes / Yes-always / View script /
-// No. `View script` swaps to a read-only source pager (fetched via the file-read
-// endpoint, like the TUI) without resolving the promise; Yes / Yes-always / No
+// No. `View script` swaps to a read-only source pager (fetched by NAME via the
+// workflow source endpoint, like the TUI) without resolving the promise; Yes / Yes-always / No
 // resolve and close. Backdrop/Esc dismissal resolves `cancel` so a start is always
 // abort-safe (the single-shot `decide` guards a stray onClose during teardown).
 const DialogWorkflowApproval: Component<{
@@ -36,12 +36,17 @@ const DialogWorkflowApproval: Component<{
   const whenToUse = createMemo(() => props.info.meta.whenToUse)
 
   // Lazily fetched only when the operator opens the source view (parity with the
-  // TUI's createResource on showSource).
+  // TUI's createResource on showSource). Fetched BY NAME via the workflow source
+  // endpoint — the server resolves the bundled string for a builtin and the file
+  // text for an on-disk workflow. The previous `file.read({ path: info.path })` was
+  // broken for every real workflow (an ABSOLUTE on-disk path errored; a synthetic
+  // `builtin:`/`inline:` marker read back empty), so the preview showed nothing. A
+  // failed/empty fetch degrades to the noSource message, never throws the view.
   const [source] = createResource(
-    () => (view() === "source" ? props.info.path : undefined),
-    async (path) => {
-      const result = await sdk.client.file.read({ path }).catch(() => undefined)
-      return result?.data?.content
+    () => (view() === "source" ? props.info.name : undefined),
+    async (name) => {
+      const result = await sdk.client.workflow.source({ name }).catch(() => undefined)
+      return result?.data?.source
     },
   )
 

@@ -228,6 +228,38 @@ export async function run(args, ctx) { return { ok: true } }
     }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
   )
 
+  it.live("source -> resolves on-disk file text, builtin string, and 404 for unknown through the httpapi", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      const source = `export const meta = { name: "http-source", description: "source preview" }
+export async function run(args, ctx) { return { ok: true } }
+`
+      yield* Effect.promise(() => writeWorkflow(directory, "http-source", source))
+
+      // On-disk workflow: the source route returns the exact file text (NOT a raw
+      // file.read of an absolute path, which failed before the fix).
+      const onDiskRes = yield* requestInDirectory("/workflow/http-source/source", directory)
+      expect(onDiskRes.status).toBe(200)
+      const onDisk = yield* bodyJson(onDiskRes)
+      expect(onDisk["name"]).toBe("http-source")
+      expect(onDisk["source"]).toBe(source)
+      expect(onDisk["source_kind"]).toBeUndefined()
+
+      // Builtin: the source route returns the bundled string and flags it builtin,
+      // even though its `path` is a synthetic `builtin:` marker (no real file).
+      const { BUILTIN_WORKFLOWS } = yield* Effect.promise(() => import("@/workflow/builtin"))
+      const builtinRes = yield* requestInDirectory("/workflow/deep-research/source", directory)
+      expect(builtinRes.status).toBe(200)
+      const builtin = yield* bodyJson(builtinRes)
+      expect(builtin["source"]).toBe(BUILTIN_WORKFLOWS["deep-research"])
+      expect(builtin["source_kind"]).toBe("builtin")
+
+      // Unknown name → 404 (matching the *NotFound → 404 convention).
+      const missingRes = yield* requestInDirectory("/workflow/does-not-exist-xyz/source", directory)
+      expect(missingRes.status).toBe(404)
+    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+  )
+
   it.live("start -> cancel (live-waiting question) transitions to cancelled through the httpapi", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true })

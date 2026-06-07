@@ -88,6 +88,11 @@ export const WorkflowPaths = {
   // (not a `:param`) so it can never collide with the `:name/start` shape.
   save: `${root}/save`,
   get: `${root}/run/:id`,
+  // Resolve a single named workflow's module SOURCE for the pre-run approval
+  // preview. `:name/source` is the source counterpart to `:name/start`; the
+  // engine resolves builtin string vs file text by name, so the preview never
+  // does a raw file.read of an absolute path or a synthetic `builtin:` marker.
+  source: `${root}/:name/source`,
   start: `${root}/:name/start`,
   cancel: `${root}/run/:id/cancel`,
   pause: `${root}/run/:id/pause`,
@@ -156,6 +161,25 @@ export const WorkflowApi = HttpApi.make("workflow")
             identifier: "workflow.get",
             summary: "Get workflow run",
             description: "Get details for a workflow execution run.",
+          }),
+        ),
+        HttpApiEndpoint.get("source", WorkflowPaths.source, {
+          params: { name: Schema.String },
+          query: WorkspaceRoutingQuery,
+          // 200 + the resolved module source for the named workflow. An unknown
+          // name is a 404 (ApiNotFoundError), matching the repo-wide *NotFound →
+          // 404 convention and the start route's name-not-found mapping. Reading
+          // source never executes the module, so there is no load-failure 400 here
+          // (unlike start): a syntactically broken file's text is still returned
+          // verbatim for the preview to show.
+          success: described(Workflow.Source, "Workflow source"),
+          error: [ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.source",
+            summary: "Read workflow source",
+            description:
+              "Resolve a single named workflow's module source (file text for an on-disk workflow, the bundled string for a builtin) for the pre-run approval preview.",
           }),
         ),
         HttpApiEndpoint.post("start", WorkflowPaths.start, {
