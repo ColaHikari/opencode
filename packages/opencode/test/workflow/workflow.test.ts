@@ -4919,6 +4919,60 @@ export async function run() { return { from: "global" } }
     }),
   )
 
+  // Finding 11 (cross-workflow resume): the start route accepts the workflow NAME
+  // and the resume source `resume_of` INDEPENDENTLY. Resuming a paused run of
+  // workflow A while requesting a DIFFERENT workflow B must be rejected — otherwise
+  // B would replay A's journaled agent output/cost wherever a journal key collides,
+  // and record resume_of pointing at an unrelated workflow. We start A
+  // (RESUME_FIXTURE), park it as `paused` (a VALID resume status, so only the
+  // identity guard can reject), then attempt to resume it under name B
+  // (SINGLE_AGENT_FIXTURE). Expectation: WorkflowInvalidError naming BOTH workflows.
+  // The status guard alone would NOT catch this (the source is a legitimate paused
+  // resume source). This guards both the HTTP and tool start paths.
+  it.instance("resume of workflow A's run while requesting workflow B fails with WorkflowInvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Start A and let it complete, then park it as `paused` so it is a valid
+      // resume source (only the workflow-identity guard should reject the resume).
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
+      // Resume A's run while requesting workflow B → cross-workflow, must fail.
+      const { ops: resumeOps } = recordingPromptOps(db, 0)
+      const failed = yield* workflow
+        .start({ name: SINGLE_AGENT_FIXTURE, args: {}, prompt: resumeOps, resume_of: first.id })
+        .pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+      const invalid =
+        failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
+      // The message names BOTH the source workflow (A) and the requested one (B).
+      expect(invalid.message).toContain(RESUME_FIXTURE)
+      expect(invalid.message).toContain(SINGLE_AGENT_FIXTURE)
+      expect(invalid.message).toContain(first.id)
+    }),
+  )
+
   // Status-Guard / cancel-paused-Race: ein CANCELLED Quell-Run (hier: hängender Run
   // → pause → cancel, exakt die cancel-of-a-paused-run-Semantik) darf NICHT resumt
   // werden. Ein direkter DB-UPDATE auf cancelled (die Race) wäre sonst re-resumebar.

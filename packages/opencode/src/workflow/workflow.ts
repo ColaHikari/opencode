@@ -2063,6 +2063,22 @@ export const layer = Layer.effect(
               message: `Cannot resume run ${input.resume_of}: status is ${sourceRow.status} (only paused or interrupted runs can be resumed)`,
             })
           }
+          // Finding 11: identity guard. The HTTP start route lets the caller choose
+          // the workflow NAME (path param) and the resume source (`resume_of` body)
+          // INDEPENDENTLY. Without this check, POST /workflow/B/start with
+          // {resume_of: <paused run of A>} would run B but replay A's journaled
+          // agent output/cost/answers wherever a journal key collides — silently
+          // serving one workflow's recorded results to a different workflow's steps,
+          // and recording resume_of pointing at an unrelated workflow. Require the
+          // source run's workflow to MATCH the workflow being started. The answer()
+          // resume path satisfies this by construction (name/source come from the
+          // same source row). HTTP maps WorkflowInvalidError to 400.
+          if (sourceRow.workflow !== target.name) {
+            return yield* new InvalidError({
+              path: target.path,
+              message: `Cannot resume run ${input.resume_of}: it belongs to workflow "${sourceRow.workflow}", not "${target.name}"`,
+            })
+          }
           const invalidate = new Set(input.invalidate_agents ?? [])
           sourceRow.agents.forEach((node, index) => {
             // A `kind:"question"` node is replayed from the SEEDED answer (not the
