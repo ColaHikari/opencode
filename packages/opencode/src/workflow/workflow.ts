@@ -17,7 +17,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
 import type { WorkflowAgentRow, WorkflowDefinitionRow, WorkflowLogRow } from "@opencode-ai/core/workflow/sql"
 import { Glob } from "@opencode-ai/core/util/glob"
-import { and, desc, eq, notInArray } from "drizzle-orm"
+import { and, desc, eq, isNotNull, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
 import fs from "fs/promises"
 import os from "os"
@@ -825,6 +825,11 @@ let failNextTerminalPersist = false
 // a tiny limit (e.g. 5) instead of dispatching 1.000 agents. `undefined` ⇒ the
 // default. Inert in production (never called). Captured per-run at start().
 let agentLimitOverride: number | undefined
+// Instance-aware test seam (Finding 10): set inside the layer once `state` exists.
+// Lets a test flip a live run's `pausing` flag exactly as `abortRun(active,"pause")`
+// does synchronously — reproducing the narrow window where a run is unwinding to
+// paused but its open question is still live — without racing the real scope close.
+let setPausingHook: ((id: string) => Effect.Effect<boolean>) | undefined
 export const __testHooks = {
   failNextTerminalPersist: () => {
     failNextTerminalPersist = true
@@ -832,6 +837,13 @@ export const __testHooks = {
   agentLimit: (limit: number) => {
     agentLimitOverride = limit
   },
+  /**
+   * Flip the live registry entry's `pausing` flag for `id`, mirroring the first
+   * synchronous step of `pause()`/`abortRun`. Returns `true` if a live entry was
+   * found and flipped. Used to deterministically drive Finding 10's race.
+   */
+  setPausing: (id: string): Effect.Effect<boolean> =>
+    setPausingHook ? setPausingHook(id) : Effect.succeed(false),
 }
 
 class TerminalPersistTestError extends Error {
@@ -1649,6 +1661,15 @@ export const layer = Layer.effect(
         }
       }),
     )
+
+    // Wire the instance-aware test seam now that `state` exists (Finding 10).
+    setPausingHook = (id: string) =>
+      Effect.gen(function* () {
+        const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
+        if (!active) return false
+        active.pausing = true
+        return true
+      })
 
     const readRuns = Effect.fn("Workflow.readRuns")(function* () {
       const active = yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)
@@ -3033,7 +3054,25 @@ export const layer = Layer.effect(
       // the question node + clear the persisted pending_question + persist, THEN
       // resolve the Deferred so the parked ctx.question wakes and hands { answer }
       // to the body. The returned snapshot already reflects the cleared question.
-      if (active && active.run.status === "running" && active.pendingQuestion) {
+      //
+      // Finding 10: refuse the live branch when the run is ALREADY unwinding to
+      // paused/cancelled/removed (`pausing`/`cancelling`/`removed` set). An in-flight
+      // pause() sets `active.pausing` synchronously and only LATER clears
+      // `pendingQuestion` (via the scope-close → question reject). In that window the
+      // live branch would otherwise clear+persist `pending_question` on a run that
+      // then finishes `paused`, stranding an un-resumable paused row (no
+      // pending_question). Mirrors the gate used by agent()/shell()/question(): a run
+      // that is suspending does not have its open question consumed mid-abort. The
+      // caller gets `undefined` (HTTP → 409) so it does not believe the answer stuck;
+      // once the run settles `paused`, a subsequent answer() resumes it normally.
+      if (
+        active &&
+        active.run.status === "running" &&
+        active.pendingQuestion &&
+        !active.pausing &&
+        !active.cancelling &&
+        !active.removed
+      ) {
         const { deferred, node } = active.pendingQuestion
         active.pendingQuestion = undefined
         active.run.pending_question = undefined
@@ -3057,17 +3096,56 @@ export const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (!row || row.status !== "paused" || !row.pending_question) return undefined
+      // Capture the question text BEFORE consuming the row (the seed key) so the
+      // claim's clearing of pending_question cannot lose it.
+      const question = row.pending_question.question
+      // Finding 1 (consume-once): atomically CLAIM the source row before starting
+      // the resume so a repeated/concurrent answer() cannot spawn a SECOND resume run
+      // (which would re-replay the journal and burn budget twice). A single
+      // conditional UPDATE clears `pending_question` only while the row is still
+      // `paused` with an open question; `.returning()` reports whether THIS call won
+      // the claim. A losing second answer() gets 0 rows back → undefined, mirroring
+      // cancel()'s consume-once on a paused row. Status stays `paused` so the resume
+      // start() below still passes its paused/interrupted source-status guard, and
+      // the journal replay reads `agents` (the question node), not this column.
+      const now = yield* Clock.currentTimeMillis
+      const claimed = yield* db
+        .update(WorkflowRunTable)
+        .set({ pending_question: null, time_updated: now })
+        .where(
+          and(
+            eq(WorkflowRunTable.id, id),
+            eq(WorkflowRunTable.directory, directory),
+            eq(WorkflowRunTable.status, "paused"),
+            isNotNull(WorkflowRunTable.pending_question),
+          ),
+        )
+        .returning({ id: WorkflowRunTable.id })
+        .all()
+        .pipe(Effect.orDie)
+      if (claimed.length === 0) return undefined
       // Resume: re-run the SAME workflow, replaying the agent journal AND serving
       // the seeded answer to the question node. The caller's execution options
       // (prompt-ops vector, permissionSessionID, caller, budget) are forwarded
       // UNCHANGED so a workflow that asks a question and then dispatches more
       // `ctx.agent` steps can run those steps live on the resumed run — without
       // them the post-question agent step would fail ("requires prompt operations").
+      //
+      // Finding 9: an INLINE-source run persists its module body on
+      // definition.source and its NAME is never discoverable. Thread the persisted
+      // source (and `temporary`) back so start() takes the inline-source LOAD path
+      // and re-runs the SAME module — otherwise the named-discovery branch would
+      // fail NotFound (or worse, load a foreign same-named workflow). Pass `name`
+      // ONLY when there is no inline source (start()'s inline branch requires
+      // `name === undefined`).
+      const inlineSource = row.definition?.source
       return yield* start({
-        name: row.workflow,
+        name: inlineSource !== undefined ? undefined : row.workflow,
+        source: inlineSource,
+        temporary: row.definition?.temporary,
         args: row.args ?? undefined,
         resume_of: id,
-        questionAnswers: { [row.pending_question.question]: input.answer },
+        questionAnswers: { [question]: input.answer },
         prompt: input.prompt,
         permissionSessionID: input.permissionSessionID,
         caller: input.caller,

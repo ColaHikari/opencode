@@ -4849,6 +4849,119 @@ export async function run() { return { from: "global" } }
     }),
   )
 
+  // Finding 1 (consume-once): answer() on a PAUSED run with a persisted
+  // pending_question must consume the source row exactly once — a second answer()
+  // with the same id must NOT spawn a duplicate resume run (which would re-replay
+  // the journal and burn budget twice). The first answer() starts the resume; the
+  // second finds the source no longer has an open pending_question and returns
+  // undefined. Only ONE resume run is ever created.
+  it.instance("answer() on a paused run consumes the source once: a second answer() spawns no duplicate resume", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_TIMEOUT_FIXTURE, QUESTION_TIMEOUT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      // Park the run as paused with an open pending_question (50ms timeout).
+      const run = yield* workflow.start({ name: QUESTION_TIMEOUT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("timeout run did not park")))
+      expect(paused.status).toBe("paused")
+      expect(paused.pending_question?.question).toBe("deploy?")
+
+      // First answer() resumes (consumes the source).
+      const firstResume = yield* workflow.answer({ id: run.id, answer: "yes" })
+      expect(firstResume).toBeDefined()
+      expect(firstResume!.resume_of).toBe(run.id)
+
+      // Second answer() must find the source already consumed → undefined, NO
+      // second resume run.
+      const secondResume = yield* workflow.answer({ id: run.id, answer: "yes" })
+      expect(secondResume).toBeUndefined()
+
+      // Exactly ONE resume run exists for this source (plus the source itself).
+      const allRuns = yield* workflow.runs()
+      const resumes = allRuns.filter((r) => r.resume_of === run.id)
+      expect(resumes.length).toBe(1)
+    }),
+  )
+
+  // Finding 9 (inline-source resume): a paused run that was started via the
+  // INLINE-source path (start({ source }) with no name) persists its module body
+  // ONLY on definition.source — its workflow NAME is never written to disk and is
+  // not discoverable. answer() must thread that source back into the resume start
+  // so it re-runs the SAME module, instead of taking the named-discovery branch
+  // and failing NotFound (or running a foreign same-named workflow).
+  it.instance("answer() resume of a paused INLINE-source workflow threads the source and resumes", () =>
+    Effect.gen(function* () {
+      yield* TestInstance
+      const workflow = yield* Workflow.Service
+      // Inline workflow whose meta NAME is deliberately NOT on disk anywhere, so a
+      // named-discovery resume would NotFound. 50ms-timeout question parks it.
+      const source = `export const meta = { name: "InlineQ", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.question({ question: "deploy?", options: ["yes", "no"], timeout: 50 })
+  return { answer: a.answer }
+}
+`
+      const run = yield* workflow.start({ source, args: {}, prompt: immediatePromptOps() })
+      const paused =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("inline run did not park")))
+      expect(paused.status).toBe("paused")
+      expect(paused.pending_question?.question).toBe("deploy?")
+
+      // answer() must resume the inline workflow (threading the persisted source).
+      const resumed = yield* workflow.answer({ id: run.id, answer: "no" })
+      expect(resumed).toBeDefined()
+      expect(resumed!.resume_of).toBe(run.id)
+      const done =
+        (yield* workflow.wait({ id: resumed!.id })).run ??
+        (yield* Effect.fail(new Error("inline resume did not finish")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { answer: string }).answer).toBe("no")
+    }),
+  )
+
+  // Finding 10 (live answer loses to an in-flight pause): answer()'s live-writer
+  // branch must NOT consume the open question of a run that is already unwinding
+  // to paused (active.pausing set). Otherwise it clears+persists pending_question
+  // on a run that finishes `paused`, leaving a paused row with NO pending_question
+  // that can never be resumed via answer(). Drive it deterministically by setting
+  // active.pausing on the live registry entry while the run is parked on the
+  // question, then calling answer().
+  it.instance("answer() declines a live run that is already pausing, leaving it resumable", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, QUESTION_FIXTURE, QUESTION_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const run = yield* workflow.start({ name: QUESTION_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.pending_question?.question === "deploy?" ? current : undefined
+        }),
+        "pending question never appeared",
+      )
+
+      // Simulate an in-flight pause(): flip the live registry entry's pausing flag
+      // exactly as abortRun(active,"pause") does synchronously, BEFORE the scope
+      // close clears pendingQuestion — the precise window Finding 10 describes.
+      yield* Workflow.__testHooks.setPausing(run.id)
+
+      // answer() must DECLINE (not consume the open question) because the run is
+      // unwinding to paused.
+      const answered = yield* workflow.answer({ id: run.id, answer: "yes" })
+      expect(answered).toBeUndefined()
+
+      // Now finish the pause for real and assert the run is paused WITH its
+      // pending_question intact (so it is still resumable via answer()).
+      const paused = yield* workflow.pause(run.id)
+      expect(paused?.status).toBe("paused")
+      expect(paused?.pending_question?.question).toBe("deploy?")
+    }),
+  )
+
   // Schema/Journal-Drift (Fund: ungeschütztes JSON.parse(cached.output)): der
   // Journal-Key ignoriert das Schema. Ein PLAINTEXT-Quell-Node kann beim Resume
   // eine Schema-Anfrage matchen, wenn die Workflow-Datei zwischen Lauf und Resume
