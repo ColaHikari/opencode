@@ -65,6 +65,10 @@ export type WorkflowAgentRow = {
     }
   }
   error?: string
+  // `true` when this agent node was replayed from a resumed run's persisted
+  // journal rather than executed live. Omitted for a live step. Keep this in
+  // lockstep with the engine's `AgentRun` schema (asserted at compile time).
+  cached?: boolean
 }
 
 export const WorkflowRunTable = sqliteTable(
@@ -72,8 +76,24 @@ export const WorkflowRunTable = sqliteTable(
   {
     id: text().primaryKey(),
     session_id: text(),
+    // The workspace directory the run was started in (InstanceState.directory).
+    // The DB is process-global (one opencode.db under Global.Path.data) but the
+    // workflow endpoints are per-directory (WorkspaceRoutingMiddleware), so every
+    // read/delete/sweep is scoped to this column — a run started in directory A
+    // must never leak into / be deleted from directory B (Fund 6/17). Legacy rows
+    // written before this column existed get the `""` default and stay visible as
+    // "global/legacy" (no crash on old DBs); never NULL so the scoping equality
+    // comparison is total.
+    directory: text().notNull().default(""),
     workflow: text().notNull(),
-    status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted">().notNull(),
+    // `paused` is a non-terminal status: a run the user explicitly suspended via
+    // pause() (sessions aborted, scope closed, fiber interrupted — like cancel),
+    // but whose persisted agent journal is kept intact so a later resume can
+    // replay the completed agents instead of re-running them. Distinct from
+    // `cancelled`/`interrupted` (both terminal): a paused run is neither finished
+    // nor lost, it is parked. Keep this union in lockstep with the engine's
+    // `Status` schema (asserted assignable at compile time over there).
+    status: text().$type<"running" | "completed" | "failed" | "cancelled" | "interrupted" | "paused">().notNull(),
     started_at: integer().notNull(),
     completed_at: integer(),
     current_phase: text(),
@@ -81,8 +101,26 @@ export const WorkflowRunTable = sqliteTable(
     definition: text({ mode: "json" }).$type<WorkflowDefinitionRow>(),
     logs: text({ mode: "json" }).notNull().$type<WorkflowLogRow[]>(),
     agents: text({ mode: "json" }).notNull().$type<WorkflowAgentRow[]>(),
-    result: text({ mode: "json" }).$type<unknown>(),
+    // Plain `text` (NOT `mode: "json"`) on purpose (Fund 42): Drizzle's JSON mode
+    // decodes BOTH the SQL value NULL and the literal JSON text `"null"` to JS
+    // `null`, collapsing two distinct states — a result that was never recorded
+    // (column empty) vs. a workflow that genuinely returned `null`. The engine
+    // must tell them apart (empty → reported `undefined` / "No result recorded.";
+    // real null → reported `null`), so it owns the JSON serialization explicitly:
+    // it writes SQL NULL for an unset result and the text `"null"` for a real one,
+    // and parses the text back in `fromRow`. The on-disk type is unchanged (`text`
+    // either way), so no migration is required. JSON mode stays on logs/agents,
+    // which never carry that null/undefined ambiguity.
+    result: text(),
     error: text(),
+    // Nullable back-reference to the run this run was resumed FROM (a previous
+    // paused/interrupted run id). When set, start() loaded the source run's
+    // persisted agent journal and replayed every completed agent it could match
+    // instead of re-prompting them — so a resume is cheap and cross-restart
+    // (the journal lives in the DB, not in memory). NULL for an ordinary
+    // (non-resume) start. Purely a provenance/audit field on the row; the engine
+    // reads it back as `resume_of` on the public Run.
+    resume_of: text(),
     ...Timestamps,
   },
   (table) => [

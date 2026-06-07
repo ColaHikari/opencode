@@ -33,7 +33,7 @@ import {
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
 import { runScenario } from "./runner"
-import { disposeApps } from "./backend"
+import { disposeApps, request } from "./backend"
 import { runtime } from "./runtime"
 import { type Scenario } from "./types"
 
@@ -57,6 +57,39 @@ function locationData(validate: (value: any) => void) {
     object(body.location.project)
     validate(body.data)
   }
+}
+
+// A minimal, runnable workflow fixture. It declares valid `meta` and a `run`
+// that returns synchronously WITHOUT calling `ctx.agent`, so a started run needs
+// no LLM and settles on its own. Seeded into the scenario project's
+// `.opencode/workflows/<name>.ts`, which is exactly where the engine's discovery
+// globs (`workflows/*.ts`) for the calling workspace.
+const WORKFLOW_FIXTURE_NAME = "httpapi-fixture"
+// The fixture stays running while `args.hang` is set (a long, abort-aware sleep)
+// so the pause scenario can deterministically catch it in the `running` state;
+// without that arg it returns synchronously and settles on its own (no LLM
+// needed), which every other workflow scenario relies on.
+const workflowFixtureSource = [
+  `export const meta = { name: "${WORKFLOW_FIXTURE_NAME}", description: "httpapi exercise fixture" }`,
+  `export async function run(args) {`,
+  `  if (args && args.hang) await new Promise((resolve) => setTimeout(resolve, 30000))`,
+  `  return { ok: true, args }`,
+  `}`,
+  ``,
+].join("\n")
+
+function seedWorkflow(ctx: { file: (name: string, content: string) => Effect.Effect<void> }) {
+  return ctx.file(`.opencode/workflows/${WORKFLOW_FIXTURE_NAME}.ts`, workflowFixtureSource)
+}
+
+function isWorkflowRun(value: any): { id: string; status: string } {
+  object(value)
+  check(typeof value.id === "string" && value.id.startsWith("job"), `run id should start with "job"`)
+  check(value.workflow === WORKFLOW_FIXTURE_NAME, "run should reference the fixture workflow")
+  check(typeof value.status === "string", "run should carry a status")
+  check(Array.isArray(value.agents), "run should carry an agents array")
+  check(Array.isArray(value.logs), "run should carry a logs array")
+  return { id: value.id, status: value.status }
 }
 
 const scenarios: Scenario[] = [
@@ -672,6 +705,7 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({ path: "/api/fs/read?path=hello.txt", headers: ctx.headers() }))
     .json(200, locationData(object)),
   http.protected.get("/api/fs/list", "v2.fs.list").json(200, locationData(array)),
+  http.protected.get("/reference", "reference.list").json(200, array),
   http.protected
     .get("/api/provider/{providerID}", "v2.provider.get")
     .at((ctx) => ({ path: route("/api/provider/{providerID}", { providerID: "missing" }), headers: ctx.headers() }))
@@ -687,18 +721,18 @@ const scenarios: Scenario[] = [
     array(body.data)
   }),
   http.protected
-    .get("/api/session/{sessionID}/permission/request", "v2.session.permission.list")
+    .get("/api/session/{sessionID}/permission", "v2.session.permission.list")
     .seeded((ctx) => ctx.session({ title: "Permission list owner" }))
     .at((ctx) => ({
-      path: route("/api/session/{sessionID}/permission/request", { sessionID: ctx.state.id }),
+      path: route("/api/session/{sessionID}/permission", { sessionID: ctx.state.id }),
       headers: ctx.headers(),
     }))
     .json(200, data(array)),
   http.protected
-    .post("/api/session/{sessionID}/permission/request/{requestID}/reply", "v2.session.permission.reply")
+    .post("/api/session/{sessionID}/permission/{requestID}/reply", "v2.session.permission.reply")
     .seeded((ctx) => ctx.session({ title: "Permission owner" }))
     .at((ctx) => ({
-      path: route("/api/session/{sessionID}/permission/request/{requestID}/reply", {
+      path: route("/api/session/{sessionID}/permission/{requestID}/reply", {
         sessionID: ctx.state.id,
         requestID: "per_httpapi_missing",
       }),
@@ -707,10 +741,10 @@ const scenarios: Scenario[] = [
     }))
     .json(404, object, "status"),
   http.protected
-    .post("/api/session/{sessionID}/question/request/{requestID}/reply", "v2.session.question.reply")
+    .post("/api/session/{sessionID}/question/{requestID}/reply", "v2.session.question.reply")
     .seeded((ctx) => ctx.session({ title: "Question reply owner" }))
     .at((ctx) => ({
-      path: route("/api/session/{sessionID}/question/request/{requestID}/reply", {
+      path: route("/api/session/{sessionID}/question/{requestID}/reply", {
         sessionID: ctx.state.id,
         requestID: "que_httpapi_missing",
       }),
@@ -719,10 +753,10 @@ const scenarios: Scenario[] = [
     }))
     .json(404, object, "status"),
   http.protected
-    .post("/api/session/{sessionID}/question/request/{requestID}/reject", "v2.session.question.reject")
+    .post("/api/session/{sessionID}/question/{requestID}/reject", "v2.session.question.reject")
     .seeded((ctx) => ctx.session({ title: "Question reject owner" }))
     .at((ctx) => ({
-      path: route("/api/session/{sessionID}/question/request/{requestID}/reject", {
+      path: route("/api/session/{sessionID}/question/{requestID}/reject", {
         sessionID: ctx.state.id,
         requestID: "que_httpapi_missing",
       }),
@@ -840,8 +874,9 @@ const scenarios: Scenario[] = [
     .json(404, object, "status"),
   http.protected
     .get("/api/session/{sessionID}/message", "v2.session.messages.cursor.invalid")
+    .seeded((ctx) => ctx.session({ title: "Invalid message cursor owner" }))
     .at((ctx) => ({
-      path: `${route("/api/session/{sessionID}/message", { sessionID: "ses_httpapi_missing" })}?${new URLSearchParams({
+      path: `${route("/api/session/{sessionID}/message", { sessionID: ctx.state.id })}?${new URLSearchParams({
         cursor: cursor({ id: "msg_httpapi_missing", time: 0, order: "desc", direction: "next" }),
         order: "asc",
       })}`,
@@ -850,8 +885,9 @@ const scenarios: Scenario[] = [
     .status(400, undefined, "none"),
   http.protected
     .post("/api/session/{sessionID}/prompt", "v2.session.prompt.invalid")
+    .seeded((ctx) => ctx.session({ title: "Invalid prompt owner" }))
     .at((ctx) => ({
-      path: route("/api/session/{sessionID}/prompt", { sessionID: "ses_httpapi_missing" }),
+      path: route("/api/session/{sessionID}/prompt", { sessionID: ctx.state.id }),
       headers: ctx.headers(),
       body: {},
     }))
@@ -1475,9 +1511,14 @@ const scenarios: Scenario[] = [
     .status(400),
   http.protected
     .get("/workflow", "workflow.list")
+    .seeded((ctx) => seedWorkflow(ctx))
     .at((ctx) => ({ path: "/workflow", headers: ctx.headers() }))
     .json(200, (body) => {
       array(body)
+      check(
+        body.some((item) => isRecord(item) && item.name === WORKFLOW_FIXTURE_NAME && item.valid === true),
+        "seeded workflow should be listed as valid",
+      )
     }),
   http.protected
     .get("/workflow/run", "workflow.runs")
@@ -1485,15 +1526,65 @@ const scenarios: Scenario[] = [
     .json(200, (body) => {
       array(body)
     }),
+  // Real-run happy path keyed to the start route: seed a runnable workflow,
+  // start it over HTTP (200 + running Run), then drive get/cancel/remove for the
+  // SAME run id over HTTP so every handler success branch is exercised, plus the
+  // budget + permissionSessionID payload fields are forwarded without error.
   http.protected
-    .get("/workflow/run/{id}", "workflow.get.missing")
-    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "job_httpapi_missing" }), headers: ctx.headers() }))
-    .json(200, (body) => {
-      check(body === null, "missing workflow run should be null")
-    }),
+    .post("/workflow/{name}/start", "workflow.start")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        yield* seedWorkflow(ctx)
+        const session = yield* ctx.session({ title: "Workflow permission owner" })
+        return { session }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: { args: { topic: "coverage" }, budget: 1.5, permissionSessionID: ctx.state.session.id },
+    }))
+    .jsonEffect(
+      200,
+      (body, ctx) =>
+        Effect.gen(function* () {
+          const started = isWorkflowRun(body)
+          check(started.status === "running", "freshly started run should report running")
+          const id = started.id
+          const headers = ctx.headers()
+
+          const got = yield* request({ method: "GET", path: route("/workflow/run/{id}", { id }), headers })
+          check(got.status === 200, `get of a started run should be 200, got ${got.status}`)
+          isWorkflowRun(got.body)
+
+          const cancelled = yield* request({
+            method: "POST",
+            path: route("/workflow/run/{id}/cancel", { id }),
+            headers,
+            body: {},
+          })
+          check(cancelled.status === 200, `cancel of a started run should be 200, got ${cancelled.status}`)
+          isWorkflowRun(cancelled.body)
+
+          const removed = yield* request({
+            method: "DELETE",
+            path: route("/workflow/run/{id}", { id }),
+            headers,
+          })
+          check(removed.status === 200, `remove of a known run should be 200, got ${removed.status}`)
+          check(removed.body === true, "removing a known run should report true")
+        }),
+      "status",
+    ),
   http.protected
-    .get("/workflow/run/{id}", "workflow.get.invalid")
-    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "not-a-run-id" }), headers: ctx.headers() }))
+    .post("/workflow/{name}/start", "workflow.start.invalidBudget")
+    .seeded((ctx) => seedWorkflow(ctx))
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: { budget: -1 },
+    }))
     .status(400),
   http.protected
     .post("/workflow/{name}/start", "workflow.start.missing")
@@ -1502,6 +1593,14 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
       body: {},
     }))
+    .status(404),
+  http.protected
+    .get("/workflow/run/{id}", "workflow.get.missing")
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "job_httpapi_missing" }), headers: ctx.headers() }))
+    .status(404),
+  http.protected
+    .get("/workflow/run/{id}", "workflow.get.invalid")
+    .at((ctx) => ({ path: route("/workflow/run/{id}", { id: "not-a-run-id" }), headers: ctx.headers() }))
     .status(400),
   http.protected
     .post("/workflow/run/{id}/cancel", "workflow.cancel.missing")
@@ -1510,9 +1609,79 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
       body: {},
     }))
-    .json(200, (body) => {
-      check(body === null, "cancelling a missing run should be null")
-    }),
+    .status(404),
+  http.protected
+    .post("/workflow/run/{id}/pause", "workflow.pause.missing")
+    .at((ctx) => ({
+      path: route("/workflow/run/{id}/pause", { id: "job_httpapi_missing" }),
+      headers: ctx.headers(),
+      body: {},
+    }))
+    .status(404),
+  // Pause + resume happy path keyed to the pause route: start a HANGING run (so it
+  // is deterministically `running`), pause it over HTTP (200 + a paused Run), then
+  // resume-start a fresh (non-hanging) run with `resume_of` pointing at the paused
+  // run and drive it to `completed`. Exercises the pause handler's success branch
+  // plus the start handler forwarding `resume_of`.
+  http.protected
+    .post("/workflow/run/{id}/pause", "workflow.pause")
+    .mutating()
+    .seeded((ctx) => seedWorkflow(ctx))
+    .at((ctx) => ({
+      path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+      headers: ctx.headers(),
+      body: { args: { hang: true } },
+    }))
+    .jsonEffect(
+      200,
+      (body, ctx) =>
+        Effect.gen(function* () {
+          const started = isWorkflowRun(body)
+          check(started.status === "running", "hanging run should report running")
+          const id = started.id
+          const headers = ctx.headers()
+
+          // Poll the pause endpoint until the run is observed `paused` (the body
+          // fork may still be settling the initial state on the first call).
+          let pausedStatus = ""
+          for (let attempt = 0; attempt < 50 && pausedStatus !== "paused"; attempt++) {
+            const paused = yield* request({
+              method: "POST",
+              path: route("/workflow/run/{id}/pause", { id }),
+              headers,
+              body: {},
+            })
+            check(paused.status === 200, `pause of a running run should be 200, got ${paused.status}`)
+            pausedStatus = isRecord(paused.body) && typeof paused.body.status === "string" ? paused.body.status : ""
+            if (pausedStatus !== "paused") yield* Effect.sleep("50 millis")
+          }
+          check(pausedStatus === "paused", `run should be paused, got "${pausedStatus}"`)
+
+          // Resume: start a fresh, non-hanging run referencing the paused source.
+          const resumed = yield* request({
+            method: "POST",
+            path: route("/workflow/{name}/start", { name: WORKFLOW_FIXTURE_NAME }),
+            headers,
+            body: { resume_of: id },
+          })
+          check(resumed.status === 200, `resume start should be 200, got ${resumed.status}`)
+          const resumedId = isRecord(resumed.body) && typeof resumed.body.id === "string" ? resumed.body.id : ""
+          check(resumedId.startsWith("job"), "resumed run should have a run id")
+
+          let resumedStatus = ""
+          for (let attempt = 0; attempt < 50 && resumedStatus !== "completed"; attempt++) {
+            const got = yield* request({
+              method: "GET",
+              path: route("/workflow/run/{id}", { id: resumedId }),
+              headers,
+            })
+            resumedStatus = isRecord(got.body) && typeof got.body.status === "string" ? got.body.status : ""
+            if (resumedStatus !== "completed") yield* Effect.sleep("50 millis")
+          }
+          check(resumedStatus === "completed", `resumed run should complete, got "${resumedStatus}"`)
+        }),
+      "status",
+    ),
   http.protected
     .delete("/workflow/run/{id}", "workflow.remove.missing")
     .mutating()

@@ -33,6 +33,9 @@ const getBase = (): Configuration => ({
     buildResources: "resources",
   },
   files: ["out/**/*", "resources/**/*"],
+  // The server bundle + its wasm assets are loaded at runtime via the Node ESM
+  // loader / fs reads and must live on the real filesystem, not inside the asar.
+  asarUnpack: ["out/main/opencode-server.mjs", "out/main/*.wasm"],
   extraResources: [
     {
       from: "native/",
