@@ -3288,36 +3288,28 @@ export async function run() { return { from: "global" } }
   // Track C: der Builtin-Source kompiliert real und lädt über denselben
   // loadModule-Pfad — `run` ist eine Funktion und die Meta ist nach dem echten
   // Import konsistent. KEIN Live-Lauf (deep-research braucht Web-Tools); nur die
-  // Lade-Integrität wird geprüft, indem ein gleichnamiger Wrapper-Builtin im
-  // Projektverzeichnis NICHT existiert und der Builtin-Source via Datei real
+  // Lade-Integrität wird geprüft, indem der Builtin-Source via Datei real
   // importiert wird (identische loadModule-Mechanik wie zur Laufzeit).
   test("the deep-research builtin source compiles and exports a real run() via loadModule", async () => {
     const { BUILTIN_WORKFLOWS } = await import("@/workflow/builtin")
     const source = BUILTIN_WORKFLOWS["deep-research"]
     expect(typeof source).toBe("string")
+    // INVARIANTE (PR #2 review): Builtin-Sources sind SELF-CONTAINED — keine
+    // Imports. Der Temp-Copy wird unter dem GLOBALEN workflows-Verzeichnis
+    // materialisiert; ein bare specifier würde dort über `<config>/node_modules`
+    // aufgelöst — die PUBLIZIERTE @opencode-ai/plugin, die config.ts installiert,
+    // nie der Dev-Workspace (der Reviewer musste das Workspace-Plugin manuell
+    // global verlinken, bevor der Builtin lud). Import-frei lädt der Source
+    // identisch in Dev, Tests und kompilierter Binary.
+    expect(source).not.toMatch(/^\s*import\b/m)
     // Realer Import: in eine Temp-Datei schreiben und dynamisch laden (identisch
-    // zur loadModule-Mechanik). Das Modul-Top-Level wird ausgeführt, also deckt
-    // dies Syntax-/Compile-Fehler im Source-Literal auf. Die Datei MUSS in einem
-    // Baum liegen, in dem `@opencode-ai/plugin` installiert ist (NICHT in
-    // os.tmpdir()), weil der Source `import { workflow } from "@opencode-ai/plugin"`
-    // macht und dieser bare specifier nur per Walk-up auflöst. loadModule schreibt
-    // den Builtin-Temp-Copy genau deshalb ins GLOBALE workflows-Verzeichnis
-    // (`<Global.Path.config>/workflows`) — der binary-erprobte Pfad, der in der
-    // kompilierten Bun-Binary anders als `import.meta.dir` (/$bunfs/root, read-only)
-    // beschreibbar ist. Wir spiegeln exakt diesen Pfad: Verzeichnis sicherstellen,
-    // mit TEMP_FILE_RE-Namensschema schreiben, laden, danach löschen.
+    // zur loadModule-Mechanik: GLOBALES workflows-Verzeichnis — der in der
+    // kompilierten Bun-Binary beschreibbare Ort, anders als `import.meta.dir`
+    // (/$bunfs/root, read-only) — mit TEMP_FILE_RE-Namensschema, laden, danach
+    // löschen. Das Modul-Top-Level wird ausgeführt, also deckt dies
+    // Syntax-/Compile-Fehler im Source-Literal auf.
     const workflowsDir = path.join(Global.Path.config, "workflows")
     await fs.mkdir(workflowsDir, { recursive: true })
-    // Zur Laufzeit installiert config.ts `@opencode-ai/plugin` nach
-    // `<Global.Path.config>/node_modules`, sodass der Builtin den `workflow`-Export
-    // per Walk-up von `<config>/workflows` auflöst. Wir spiegeln genau diese
-    // Resolution, indem wir das Workspace-Plugin (das `workflow` exportiert) dorthin
-    // verlinken — der real publizierte Stand wird mit dem Binary mit-veröffentlicht.
-    const pluginRoot = path.dirname(Bun.resolveSync("@opencode-ai/plugin/package.json", process.cwd()))
-    const pluginLink = path.join(Global.Path.config, "node_modules", "@opencode-ai", "plugin")
-    await fs.mkdir(path.dirname(pluginLink), { recursive: true })
-    await fs.rm(pluginLink, { recursive: true, force: true }).catch(() => {})
-    await fs.symlink(pluginRoot, pluginLink, "dir").catch(() => {})
     const file = path.join(
       workflowsDir,
       `.deep-research.${Date.now()}.${Math.random().toString(16).slice(2)}.mts`,
