@@ -961,6 +961,7 @@ Expected: clean (all task commits already landed). If anything dangling, commit 
 - There is NO gitlab command/webhook/trigger handler under `src/cli/cmd/` (only `github.handler.ts` / `github*.ts` exist).
 - The "engine-bypass" concern the review raised (a handler that starts work by driving `Session`/`SessionPrompt` directly instead of going through the workflow engine) applies ONLY to `src/cli/cmd/github.handler.ts`. That file imports `Session`, `SessionPrompt`, `EventV2Bridge` and dispatches prompts itself — a deliberate CI/automation path, not a workflow-engine consumer.
 - **Conclusion:** no gitlab equivalent exists, so there is nothing to bring onto (or bypass) the workflow engine for gitlab. No T5 code change. If a gitlab handler appears in a future upstream sync, re-open this as a real audit (compare against the github bypass).
+- **Execution-time re-verification (T5 run):** confirmed at HEAD `ee96042cb`+ — `grep -rln "gitlab" packages/opencode/src --include="*.ts"` → `src/plugin/index.ts`, `src/provider/provider.ts`, `src/session/llm.ts` only; `ls packages/opencode/src/cli/cmd/ | grep -iE "gitlab|github"` → `github.handler.ts`, `github.shared.ts`, `github.ts`, NO `gitlab*` file. Finding holds; finding-only, no code.
 
 ---
 
