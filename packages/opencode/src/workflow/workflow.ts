@@ -19,6 +19,7 @@ import type { WorkflowAgentRow, WorkflowDefinitionRow, WorkflowLogRow } from "@o
 import { Glob } from "@opencode-ai/core/util/glob"
 import { and, desc, eq, isNotNull, notInArray } from "drizzle-orm"
 import { APICallError } from "ai"
+import { spawnSync } from "child_process"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -1451,7 +1452,7 @@ function tempFileName(file: string): string {
 // path. The marker has no source directory, so the temp copy is written into the
 // GLOBAL workflows directory (`<Global.Path.config>/workflows`) rather than
 // `import.meta.dir`: in a compiled Bun binary `import.meta.dir` is `/$bunfs/root`
-// (read-only — `Bun.write` throws ENOENT there), whereas the global config dir is
+// (read-only — writing there throws ENOENT), whereas the global config dir is
 // a binary-proven writable location where normal global workflows already load
 // from. Builtin sources are SELF-CONTAINED by invariant (no imports — see
 // builtin.ts); an inline source is authored by the model/user and likewise
@@ -1462,7 +1463,7 @@ function tempFileName(file: string): string {
 // orphan; the random temp suffix means two concurrent inline starts never collide.
 // A write failure is a hard error (there is no original file to fall back to).
 async function loadModule(file: string, inlineSource?: string): Promise<Module> {
-  const source = inlineSource ?? (await Bun.file(file).text())
+  const source = inlineSource ?? (await fs.readFile(file, "utf8"))
   if (inlineSource !== undefined) {
     const configDir = path.join(Global.Path.config, "workflows")
     await fs.mkdir(configDir, { recursive: true })
@@ -1478,9 +1479,9 @@ async function loadModule(file: string, inlineSource?: string): Promise<Module> 
     // Strip the synthetic `<scheme>:` marker prefix (builtin:/inline:) so the temp
     // file name is just a sanitized basename, not a path with a colon in it.
     const cachePath = path.join(workflowsDir, tempFileName(`${file.replace(/^[a-z]+:/, "")}.ts`))
-    await Bun.write(cachePath, source)
+    await fs.writeFile(cachePath, source)
     const imported = (await import(pathToFileURL(cachePath).href).finally(() =>
-      Bun.file(cachePath).delete(),
+      fs.rm(cachePath, { force: true }),
     )) as Record<string, unknown>
     return finishModule(imported, file, source)
   }
@@ -1494,8 +1495,8 @@ async function loadModule(file: string, inlineSource?: string): Promise<Module> 
   // read-only dir may serve a stale module — acceptable, since a read-only dir
   // is not being edited in place anyway.
   let importPath = cachePath
-  let cleanup = () => Bun.file(cachePath).delete()
-  const wrote = await Bun.write(cachePath, source).then(
+  let cleanup = () => fs.rm(cachePath, { force: true })
+  const wrote = await fs.writeFile(cachePath, source).then(
     () => true,
     () => false,
   )
@@ -1574,12 +1575,12 @@ async function sweepWorktrees(directory: string) {
         // Detach the registration from the owning repo (best-effort), then remove
         // the leaked dir. `remove --force` covers the common case; the explicit rm
         // is the backstop for a dir git no longer recognizes as a worktree.
-        Bun.spawnSync(["git", "worktree", "remove", "--force", full], { cwd: directory })
+        spawnSync("git", ["worktree", "remove", "--force", full], { cwd: directory })
         await fs.rm(full, { recursive: true, force: true }).catch(() => undefined)
       }),
   )
   // Reclaim any dangling worktree registrations whose dir is already gone.
-  Bun.spawnSync(["git", "worktree", "prune"], { cwd: directory })
+  spawnSync("git", ["worktree", "prune"], { cwd: directory })
 }
 
 // Fund 2: a discovered file must really live inside its workflows directory.
@@ -1986,7 +1987,7 @@ export const layer = Layer.effect(
           // through the identical static (never-executed) path. `source_kind` is
           // stamped only on builtins so consumers can tell them apart.
           Effect.promise(() =>
-            workflow.source !== undefined ? Promise.resolve(workflow.source) : Bun.file(workflow.path).text(),
+            workflow.source !== undefined ? Promise.resolve(workflow.source) : fs.readFile(workflow.path, "utf8"),
           ).pipe(
             Effect.map((source): Info => {
               const kind = workflow.source !== undefined ? ({ source_kind: "builtin" } as const) : {}
@@ -2020,7 +2021,7 @@ export const layer = Layer.effect(
       const found = discovered.find((item) => item.name === name)
       if (!found) return undefined
       const source =
-        found.source !== undefined ? found.source : yield* Effect.promise(() => Bun.file(found.path).text())
+        found.source !== undefined ? found.source : yield* Effect.promise(() => fs.readFile(found.path, "utf8"))
       return {
         name: found.name,
         path: found.path,
@@ -2535,7 +2536,15 @@ export const layer = Layer.effect(
             for (const file of agentInput.files ?? []) {
               if (file.length === 0) continue
               const resolved = path.isAbsolute(file) ? file : path.resolve(active.directory, file)
-              const exists = yield* Effect.promise(() => Bun.file(resolved).exists())
+              // Must exist AND be a regular file: a directory is not an attachable
+              // source, so it fails here cleanly rather than being sent as a broken
+              // `file://` part (matches the prior `Bun.file(dir).exists()` -> false).
+              const exists = yield* Effect.promise(() =>
+                fs
+                  .stat(resolved)
+                  .then((s) => s.isFile())
+                  .catch(() => false),
+              )
               if (!exists) {
                 return yield* new InvalidError({
                   path: active.run.workflow,
@@ -2692,15 +2701,20 @@ export const layer = Layer.effect(
               // worktree is reclaimed on next start.
               const base = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), WORKTREE_PREFIX)))
               yield* Effect.promise(() => fs.chmod(base, 0o700)).pipe(Effect.ignore)
-              const res = Bun.spawnSync(["git", "worktree", "add", "--detach", base], { cwd: instanceCtx.directory })
-              if (res.exitCode !== 0) {
+              const res = spawnSync("git", ["worktree", "add", "--detach", base], { cwd: instanceCtx.directory })
+              if (res.status !== 0) {
+                // node's spawnSync reports the exit code on `status` (not `exitCode`);
+                // on a spawn failure (e.g. git not on PATH) `status` is null and the
+                // reason is on `res.error`, with `stderr` possibly null — surface
+                // whichever is present so the message is never empty.
+                const detail = res.stderr ? new TextDecoder().decode(res.stderr) : (res.error?.message ?? "")
                 // The mkdtemp dir is orphaned when `git worktree add` fails (e.g. a
                 // non-git workspace); remove it so a failed isolation request does
                 // not leak an empty private dir into tmp.
                 yield* Effect.promise(() => fs.rm(base, { recursive: true, force: true })).pipe(Effect.ignore)
                 return yield* new InvalidError({
                   path: active.run.workflow,
-                  message: `ctx.agent isolation:"worktree" requires a git repository (${new TextDecoder().decode(res.stderr).trim()})`,
+                  message: `ctx.agent isolation:"worktree" requires a git repository (${detail.trim()})`,
                 })
               }
               // Cleanup on the RUN scope: survives parallel steps, fires on
@@ -2716,7 +2730,7 @@ export const layer = Layer.effect(
               yield* Scope.addFinalizer(
                 active.runScope,
                 Effect.sync(() => {
-                  Bun.spawnSync(["git", "worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
+                  spawnSync("git", ["worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
                   // `git worktree remove` deletes the worktree dir on success; force
                   // a recursive rm as a backstop so the private base never lingers
                   // even if the git removal was partial (e.g. dirty/locked tree).
@@ -3552,7 +3566,7 @@ export const layer = Layer.effect(
       if (exists) return yield* Effect.fail(new SaveConflictError({ name: input.name, path: filepath }))
       yield* Effect.promise(async () => {
         await fs.mkdir(path.dirname(filepath), { recursive: true })
-        await Bun.write(filepath, input.source)
+        await fs.writeFile(filepath, input.source)
       })
       return { path: filepath }
     })

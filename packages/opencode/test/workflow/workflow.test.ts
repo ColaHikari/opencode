@@ -353,6 +353,20 @@ export async function run(args, ctx) {
 }
 `
 
+// Directory variant of the Task 10 fixture: an attachment path that resolves to a
+// DIRECTORY (not a regular file) must fail the run the same way a missing file
+// does. This pins the corrected portable `exists` check (fs.stat().isFile()),
+// which preserves the prior `Bun.file(dir).exists()` -> false semantics — a
+// directory is never an attachable source.
+const FILES_DIR_FIXTURE = "files-dir-step"
+const FILES_DIR_WORKFLOW = `export const meta = { name: "${FILES_DIR_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", files: ["./ATTACH_DIR"] })
+  return { ok: true }
+}
+`
+
 // Task 11: a single agent step requesting worktree isolation. When the workspace
 // is a git repository the engine runs the subagent inside a fresh `git worktree`
 // (auto-cleaned on the run scope); a non-git workspace fails the step with a
@@ -5744,6 +5758,32 @@ export async function run(args, ctx) {
       expect(node?.status).toBe("failed")
       expect(node?.error).toContain("DOES_NOT_EXIST.md")
       // The prompt was never dispatched (the attachment could not be resolved).
+      expect(inputs.length).toBe(0)
+    }),
+  )
+
+  // Task 10 (directory path): an attachment that resolves to a directory is NOT a
+  // regular file and must fail the step cleanly — same as a missing file — instead
+  // of being dispatched as a broken file:// part. Pins the corrected portable
+  // existence check: fs.stat().isFile() (a directory -> false), matching the prior
+  // Bun.file(dir).exists() behaviour. A naive fs.access() would WRONGLY pass here.
+  it.instance("ctx.agent files fails clearly when an attachment is a directory", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => fs.mkdir(path.join(test.directory, "ATTACH_DIR"), { recursive: true }))
+      yield* Effect.promise(() => writeWorkflow(test.directory, FILES_DIR_FIXTURE, FILES_DIR_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: FILES_DIR_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("files-dir workflow did not finish")))
+
+      expect(done.status).toBe("failed")
+      const node = done.agents[0]
+      expect(node?.status).toBe("failed")
+      expect(node?.error).toContain("ATTACH_DIR")
+      // The prompt was never dispatched (the directory is not an attachable file).
       expect(inputs.length).toBe(0)
     }),
   )
