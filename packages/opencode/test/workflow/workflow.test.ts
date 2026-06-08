@@ -6376,6 +6376,62 @@ export async function run(args, ctx) { ctx.setPhase("setup"); return { ok: true 
     }),
   )
 
+  // (A) Non-mutation invariant: `encodeDefinitionForRow` runs on EVERY persist
+  // (each setPhase/log forks a progress write), so it must NEVER mutate the LIVE
+  // in-memory run — only the persisted bytes change. Drive a still-RUNNING run
+  // (a hanging agent step) whose phases are plain strings; by the time the agent
+  // is live at least one persist has already encoded the definition. A mid-run
+  // get() returns snapshot(active), i.e. the LIVE definition: its phases must
+  // still be the canonical OBJECT form. A mutating encode would have rewritten
+  // active.run.definition.meta.phases to strings and this would observe them.
+  it.instance("persist does not mutate the live run's in-memory object phases", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SLOW_FIXTURE, SLOW_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops } = hangingPromptOps()
+      const run = yield* workflow.start({ name: SLOW_FIXTURE, args: {}, prompt: ops })
+
+      // Poll until the agent step is live — guarantees a progress persist (which
+      // calls encodeDefinitionForRow) has already run at least once.
+      const live = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running") ? current : undefined
+        }),
+        "agent never started",
+      )
+      // SLOW_WORKFLOW declares `phases: ["agent","after"]` (authored as strings),
+      // normalized to objects in memory. The live snapshot must STILL be objects.
+      expect(live.definition?.meta.phases).toEqual([{ title: "agent" }, { title: "after" }])
+
+      yield* workflow.cancel(run.id)
+    }),
+  )
+
+  // (A) `definition.source` survival: the prior fix populates `source` for every
+  // run (named/builtin/inline), and `encodeDefinitionForRow` only rewrites
+  // `meta.phases` — it must leave `source` byte-identical through persist→read.
+  // A blank source here would re-break "save as command" / the source preview.
+  it.instance("definition.source survives the phase-encode persist round-trip intact", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const source = `export const meta = { name: "SourceThroughEncode", phases: ["setup", "run"] }
+export async function run(args, ctx) { ctx.setPhase("setup"); return { ok: true } }
+`
+      yield* Effect.promise(() => writeWorkflow(test.directory, "source-through-encode", source))
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "source-through-encode", args: {} })
+      yield* workflow.wait({ id: run.id })
+
+      // Read back through the DB->fromRow path (the run is evicted post-terminal):
+      // source must be intact AND phases must round-trip to the object form.
+      const persisted = yield* workflow.get(run.id)
+      expect(persisted?.definition?.source).toBe(source)
+      expect(persisted?.definition?.meta.phases).toEqual([{ title: "setup" }, { title: "run" }])
+    }),
+  )
+
   // (C) Per-row resilience: a single un-decodable/foreign row (here, `phases` is
   // a malformed shape the decode rejects) must NOT blow up the whole list. The
   // OTHER valid row must still come back. The fix COERCES the poison row (keeps

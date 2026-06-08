@@ -831,6 +831,15 @@ function encodeDefinitionForRow(definition: Definition): Definition {
   }
 }
 
+// (C) De-dupe seam: a persistently-bad row would otherwise re-warn on EVERY
+// runs()/get() (every dashboard poll re-reads it), so a single foreign row would
+// spam the log forever. Warn at most ONCE per row id per process — a plain
+// module-level Set keyed by id, which is total and never unbounded in practice
+// (one entry per distinct bad row, which is a tiny finite set). Lives at module
+// scope (not per-instance) deliberately: the warn is a developer diagnostic, not
+// per-workspace state, so once-per-process is the right granularity.
+const warnedBadDefinitionRows = new Set<string>()
+
 // (B)+(C) Read-time normalize with per-row resilience. Decode the stored
 // definition so its phases land in the canonical object form regardless of
 // whether the row holds strings (old/encoded) or objects (older un-encoded
@@ -840,16 +849,25 @@ function encodeDefinitionForRow(definition: Definition): Definition {
 // history list, so we degrade that one field and keep the row's id/status/logs
 // visible. (Skipping the row was the alternative; coercing is the friendlier
 // graceful-degradation choice — the run still shows up, just without phases.)
-function normalizeDefinition(definition: Definition | undefined): Definition | undefined {
+//
+// `runId` is threaded in only to de-dupe the warn (see above); it is not part of
+// the normalization itself, so it is optional (a caller without a row id — none
+// today — simply warns every time, which is the old behavior).
+function normalizeDefinition(definition: Definition | undefined, runId?: string): Definition | undefined {
   if (definition === undefined) return undefined
   const decoded = decodeDefinition(definition)
   if (Exit.isSuccess(decoded)) return decoded.value as Definition
   // Diagnostic only — never rethrow: the whole point of (C) is that ONE bad row
-  // cannot fail the list/get response. `console.warn` (not an Effect logger)
+  // cannot fail the list/get response; we COERCE the row (keep it, degrade its
+  // phases to empty) rather than drop it. `console.warn` (not an Effect logger)
   // because this is a pure, synchronous row-mapping helper outside any fiber.
-  console.warn(
-    `[workflow] dropping un-decodable definition phases for "${definition.name}": ${Cause.pretty(decoded.cause)}`,
-  )
+  // De-duped per row id so a persistently-bad row warns once, not on every poll.
+  if (runId === undefined || !warnedBadDefinitionRows.has(runId)) {
+    if (runId !== undefined) warnedBadDefinitionRows.add(runId)
+    console.warn(
+      `[workflow] coercing un-decodable definition phases to empty for "${definition.name}": ${Cause.pretty(decoded.cause)}`,
+    )
+  }
   return { ...definition, meta: { ...definition.meta, phases: [] } }
 }
 
@@ -911,8 +929,9 @@ function fromRow(row: Row): Run {
     // (B)+(C): normalize the stored definition's phases to the canonical OBJECT
     // form (the row may hold the old string shape from another branch) and
     // coerce — never throw — if the definition is foreign/un-decodable, so one
-    // bad row never blanks the whole list/get response (@VasyaYovbak).
-    definition: normalizeDefinition(row.definition ?? undefined),
+    // bad row never blanks the whole list/get response (@VasyaYovbak). The row id
+    // is passed so a persistently-bad row's coerce-warn is de-duped per id.
+    definition: normalizeDefinition(row.definition ?? undefined, row.id),
     status: row.status,
     started_at: row.started_at,
     completed_at: row.completed_at ?? undefined,
