@@ -55,3 +55,15 @@ export const Meta = Schema.Struct({
   arguments: Schema.optional(Schema.Record(Schema.String, Argument)),
 }).annotate({ identifier: "WorkflowMeta" })
 export type Meta = Schema.Schema.Type<typeof Meta>
+
+// The same back-compat ENCODE rule the `Phases` schema applies, extracted as a
+// plain function so the persistence layer (`workflow.ts`) can re-emit a stored
+// definition's phases in the WIRE form (a title-only phase → the bare string,
+// a phase carrying detail/model → the object) WITHOUT round-tripping the whole
+// `Definition` through `Schema.encode` (which also touches `source`/`path` and
+// is needless risk for a field-local transform). DECODE normalizes every entry
+// to an object; ENCODE is the inverse for the back-compatible cross-version
+// shape. Kept here, beside the schema, so the rule lives in exactly ONE place.
+export function encodePhase(phase: Phase): string | Phase {
+  return phase.detail === undefined && phase.model === undefined ? phase.title : phase
+}

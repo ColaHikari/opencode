@@ -17,7 +17,7 @@ import { eq, sql } from "drizzle-orm"
 import { TestInstance, provideInstance, tmpdirScoped, reloadInstance, testInstanceStoreLayer } from "../fixture/fixture"
 import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import fs from "fs/promises"
 import path from "path"
@@ -119,6 +119,34 @@ function fetchRawResult(id: string) {
       .get()
       .pipe(Effect.orDie)
     return row?.raw ?? null
+  })
+}
+
+// Seeds a completed run whose persisted `definition.meta` is supplied RAW —
+// bypassing the engine so a test can pin EXACTLY how an older/foreign branch
+// would have left the row's phases on disk (bare strings, malformed shapes,
+// etc.). The `as never` casts thread an arbitrary on-disk JSON shape past the
+// strongly-typed `WorkflowDefinitionRow` column type — the whole point is to
+// reproduce a row the current row-type would never WRITE but might still READ.
+function seedRowWithRawMeta(id: string, directory: string, meta: unknown) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* db
+      .insert(WorkflowRunTable)
+      .values({
+        id,
+        workflow: HELLO_FIXTURE,
+        status: "completed",
+        started_at: now,
+        completed_at: now,
+        directory,
+        logs: [],
+        agents: [],
+        definition: { name: HELLO_FIXTURE, path: "/p/.opencode/workflows/hello.js", meta } as never,
+      })
+      .run()
+      .pipe(Effect.orDie)
   })
 }
 
@@ -6273,6 +6301,105 @@ describe("Workflow.save", () => {
         Bun.file(path.join(test.directory, ".opencode", "workflows", "bad-meta.ts")).exists(),
       )
       expect(wrote).toBe(false)
+    }),
+  )
+
+  // Cross-version phases compatibility (@VasyaYovbak): a migration/version
+  // mismatch between branches leaves old `workflow_run` rows in the local DB
+  // whose `definition.meta.phases` is the OLD wire shape (bare strings, e.g.
+  // `["setup","run"]`) instead of the normalized object form. The three tests
+  // below pin the round-trip the fix must hold across schema versions.
+
+  // (B) Normalize on READ: an OLD row whose phases are bare strings must be
+  // read back through get()/runs() as the canonical OBJECT form, AND that
+  // in-memory run must re-encode cleanly through the public `Run` schema (the
+  // shape the HTTP layer serializes) with no `undefined` title and no error —
+  // the failure the reviewer saw was the `Run` encode choking on string phases.
+  it.instance("reads an old string-phases row back as normalized object phases that re-encode cleanly", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const id = Workflow.RunID.make("job_oldstringphases")
+      // The OLD on-disk shape produced by a branch whose `phases` was `string[]`.
+      yield* seedRowWithRawMeta(id, test.directory, { name: HELLO_FIXTURE, phases: ["setup", "run"] })
+
+      const viaGet = yield* workflow.get(id)
+      const run = viaGet ?? (yield* Effect.fail(new Error("run not read")))
+      // Canonical object form regardless of the stored (string) shape.
+      expect(run.definition?.meta.phases).toEqual([{ title: "setup" }, { title: "run" }])
+
+      // runs() (the list path) must normalize identically.
+      const listed = yield* workflow.runs()
+      const fromList = listed.find((r) => r.id === id) ?? (yield* Effect.fail(new Error("run not listed")))
+      expect(fromList.definition?.meta.phases).toEqual([{ title: "setup" }, { title: "run" }])
+
+      // The public `Run` encode (the HTTP response shape) succeeds — pre-fix this
+      // threw / produced an `undefined` title because the run still held strings.
+      const encoded = Schema.encodeUnknownExit(Workflow.Run)(run)
+      expect(Exit.isSuccess(encoded)).toBe(true)
+    }),
+  )
+
+  // (A) Persist back-compat ENCODED form: a freshly started run with plain
+  // string phases must be PERSISTED as bare strings (`["setup"]`), NOT the
+  // in-memory normalized objects — so an OLDER reader whose schema still expects
+  // `phases: string[]` can decode our row. A phase carrying detail/model has no
+  // back-compat string form, so it stays an object.
+  it.instance("persists plain phases as back-compat strings while keeping structured phases as objects", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "phase-encode",
+          `export const meta = { name: "PhaseEncode", phases: ["setup", { title: "verify", model: "stub/mini" }] }
+export async function run(args, ctx) { ctx.setPhase("setup"); return { ok: true } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: "phase-encode", args: {} })
+      yield* workflow.wait({ id: run.id })
+
+      // Read the RAW DB row — the persisted bytes, not the engine projection.
+      const row = yield* fetchRunRow(run.id)
+      const phases = (row.definition?.meta.phases ?? []) as unknown[]
+      // A title-only phase is stored as the bare STRING (decodable by an old
+      // `string[]` reader); a phase with a model stays a structured object.
+      expect(phases[0]).toBe("setup")
+      expect(phases[1]).toEqual({ title: "verify", model: "stub/mini" })
+
+      // The in-memory snapshot is still the NORMALIZED object form (only the
+      // persisted bytes change) — the live run keeps its canonical shape.
+      const snap = yield* workflow.get(run.id)
+      expect(snap?.definition?.meta.phases).toEqual([{ title: "setup" }, { title: "verify", model: "stub/mini" }])
+    }),
+  )
+
+  // (C) Per-row resilience: a single un-decodable/foreign row (here, `phases` is
+  // a malformed shape the decode rejects) must NOT blow up the whole list. The
+  // OTHER valid row must still come back. The fix COERCES the poison row (keeps
+  // it, with safe phases) rather than dropping it, so a user's run never silently
+  // vanishes from history — degrade, don't disappear.
+  it.instance("a poison definition row does not fail the whole list; valid rows still return", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const goodId = Workflow.RunID.make("job_resilientgood")
+      const poisonId = Workflow.RunID.make("job_resilientpoison")
+      // A valid (old-string-phases) row and a poison row whose `phases` is a
+      // shape neither a string nor a `{title}` object — the decode must reject it.
+      yield* seedRowWithRawMeta(goodId, test.directory, { name: HELLO_FIXTURE, phases: ["setup"] })
+      yield* seedRowWithRawMeta(poisonId, test.directory, { name: HELLO_FIXTURE, phases: [{ nope: 123 }, 42] })
+
+      // The list must not throw and must still surface the valid run.
+      const listed = yield* workflow.runs()
+      const good = listed.find((r) => r.id === goodId) ?? (yield* Effect.fail(new Error("valid run dropped")))
+      expect(good.definition?.meta.phases).toEqual([{ title: "setup" }])
+      // The poison row is coerced (kept, but with safe/empty phases), so it is
+      // still present and the whole list survived.
+      const poison = listed.find((r) => r.id === poisonId)
+      expect(poison).toBeDefined()
     }),
   )
 })

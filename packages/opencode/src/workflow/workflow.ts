@@ -71,7 +71,7 @@ export type RunID = Schema.Schema.Type<typeof RunID>
 // here so the engine's public `Workflow.Meta` / `Workflow.Argument` API is
 // unchanged.
 export { Argument, Meta, Phase } from "./meta"
-import { Phase } from "./meta"
+import { Phase, encodePhase } from "./meta"
 
 export const Info = Schema.Struct({
   name: Schema.String,
@@ -796,6 +796,63 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Wo
 
 const decodeMeta = Schema.decodeUnknownExit(Meta)
 
+// Cross-version phases compatibility (@VasyaYovbak). The `definition` JSON column
+// is the one place the phases shape drifted between branches: an older branch
+// stored `meta.phases` as bare strings (`["setup"]`), a newer one as normalized
+// objects (`[{title:"setup"}]`). Switching branches leaves the OTHER shape's rows
+// in the shared local DB. Two halves close the gap, both routed through the SAME
+// `Definition`/`Meta` schema whose `phases` union (`string | object`) already
+// accepts BOTH shapes:
+//
+// (A) PERSIST writes the back-compat ENCODED form. `encodeDefinitionForRow`
+//     re-emits a title-only phase as the bare STRING (a structured phase stays an
+//     object) so an OLDER reader expecting `phases: string[]` can still decode our
+//     plain-phase rows. Only `meta.phases` is rewritten — a targeted, total
+//     transform — instead of a full `Schema.encode(Definition)` round-trip, which
+//     would needlessly re-run the codec over `source`/`path` and risk throwing on
+//     a definition that drifted; the bytes for every OTHER field are untouched.
+//
+// (B) READ normalizes back to the canonical OBJECT form. `decodeDefinition` runs
+//     the stored definition through the schema decode (the union accepts strings
+//     OR objects), so the in-memory `Run` is ALWAYS object-phased and the public
+//     `Run` encode (the HTTP response) never trips over a string phase producing
+//     an `undefined` title — the exact failure the reviewer reported.
+const decodeDefinition = Schema.decodeUnknownExit(Definition)
+
+// (A) Persist-time encode: return a row-shaped definition whose `meta.phases` is
+// the back-compat WIRE form. Total and field-local — we touch only `meta.phases`
+// and leave every other field (name/path/source/temporary, all other meta keys)
+// byte-identical, so this can never throw on a well-formed in-memory definition.
+function encodeDefinitionForRow(definition: Definition): Definition {
+  if (!definition.meta.phases) return definition
+  return {
+    ...definition,
+    meta: { ...definition.meta, phases: definition.meta.phases.map(encodePhase) as Definition["meta"]["phases"] },
+  }
+}
+
+// (B)+(C) Read-time normalize with per-row resilience. Decode the stored
+// definition so its phases land in the canonical object form regardless of
+// whether the row holds strings (old/encoded) or objects (older un-encoded
+// rows). A row whose definition the schema REJECTS (a foreign/malformed shape
+// from some other branch) is COERCED — not dropped — to a safe definition with
+// EMPTY phases: a corrupt phases blob must never blank a user's run out of the
+// history list, so we degrade that one field and keep the row's id/status/logs
+// visible. (Skipping the row was the alternative; coercing is the friendlier
+// graceful-degradation choice — the run still shows up, just without phases.)
+function normalizeDefinition(definition: Definition | undefined): Definition | undefined {
+  if (definition === undefined) return undefined
+  const decoded = decodeDefinition(definition)
+  if (Exit.isSuccess(decoded)) return decoded.value as Definition
+  // Diagnostic only — never rethrow: the whole point of (C) is that ONE bad row
+  // cannot fail the list/get response. `console.warn` (not an Effect logger)
+  // because this is a pure, synchronous row-mapping helper outside any fiber.
+  console.warn(
+    `[workflow] dropping un-decodable definition phases for "${definition.name}": ${Cause.pretty(decoded.cause)}`,
+  )
+  return { ...definition, meta: { ...definition.meta, phases: [] } }
+}
+
 // N13: the public `Run` projection of a live run. The spread copies ONLY the
 // `Run` fields (`active.run` is exactly the `Run` shape — the engine-internal
 // fields like `directory`/`runScope`/`budget` live on `Active`, never on
@@ -851,7 +908,11 @@ function fromRow(row: Row): Run {
     session_id: row.session_id ?? undefined,
     workflow: row.workflow,
     args: row.args ?? undefined,
-    definition: row.definition ?? undefined,
+    // (B)+(C): normalize the stored definition's phases to the canonical OBJECT
+    // form (the row may hold the old string shape from another branch) and
+    // coerce — never throw — if the definition is foreign/un-decodable, so one
+    // bad row never blanks the whole list/get response (@VasyaYovbak).
+    definition: normalizeDefinition(row.definition ?? undefined),
     status: row.status,
     started_at: row.started_at,
     completed_at: row.completed_at ?? undefined,
@@ -1000,7 +1061,16 @@ function persistRun(
       completed_at: active.run.completed_at ?? null,
       current_phase: active.run.current_phase ?? null,
       args: active.run.args ?? null,
-      definition: active.run.definition ?? null,
+      // (A): persist the definition with its phases in the back-compat WIRE form
+      // (a title-only phase → the bare string), so an OLDER reader whose schema
+      // expects `phases: string[]` can still decode our rows (@VasyaYovbak). Only
+      // `meta.phases` is rewritten; `snapshot()` still returns the normalized
+      // OBJECT form, so only the PERSISTED bytes change. The cast threads the
+      // back-compat string|object phases past the row type (whose `phases` is
+      // typed as objects only); on READ `normalizeDefinition` decodes it back.
+      definition: active.run.definition
+        ? (encodeDefinitionForRow(active.run.definition) as unknown as WorkflowDefinitionRow)
+        : null,
       logs: active.run.logs,
       agents: active.run.agents,
       // Fund 42: the `result` column is plain text and the engine owns its JSON
