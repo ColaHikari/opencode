@@ -1291,4 +1291,133 @@ export async function run() { return "ok" }
       }),
     ),
   )
+
+  // LLMs routinely emit a boolean tool argument as the JSON STRING "true"/"false"
+  // instead of a boolean. A bare Schema.Boolean rejected the string with an
+  // InvalidArgumentsError; the model then re-emitted the same stringified value,
+  // looped on the identical invalid call, and the session eventually aborted. The
+  // arg boundary must coerce "true"/"false" so the first call proceeds.
+  it.live("create tolerates overwrite supplied as the string \"true\" (no InvalidArgumentsError)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        // A file already exists: with overwrite truthy the create must PROCEED
+        // (overwrite the file), not fail at arg validation and not hit the
+        // "already exists" guard.
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "loose",
+            `export const meta = { name: "Old" }\nexport async function run() { return "old" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "New", description: "Replaced." }\nexport async function run() { return "new" }\n`
+        const result = yield* tool.execute({ action: "create", name: "loose", source, overwrite: "true" }, recorder.ctx)
+        // The call proceeded: the file was overwritten and re-validated.
+        expect(result.output).toContain("Workflow file created and validated.")
+        const written = yield* Effect.promise(() =>
+          fs.readFile(path.join(dir, ".opencode", "workflows", "loose.ts"), "utf8"),
+        )
+        expect(written).toContain(`name: "New"`)
+      }),
+    ),
+  )
+
+  it.live("create with overwrite=\"false\" (string) decodes to false and hits the already-exists guard", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "loosefalse",
+            `export const meta = { name: "Dup" }\nexport async function run() { return "ok" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const exit = yield* Effect.exit(
+          tool.execute(
+            {
+              action: "create",
+              name: "loosefalse",
+              source: `export const meta = { name: "Dup" }\nexport async function run() { return "ok" }\n`,
+              overwrite: "false",
+            },
+            recorder.ctx,
+          ),
+        )
+        expect(Exit.isFailure(exit)).toBe(true)
+        const pretty = Exit.isFailure(exit) ? Cause.pretty(exit.cause) : ""
+        // It decoded to a real `false` (already-exists guard), NOT an arg-validation failure.
+        expect(pretty).toContain("Workflow already exists: loosefalse")
+        expect(pretty).not.toContain("invalid arguments")
+      }),
+    ),
+  )
+
+  it.live("create still accepts a native boolean overwrite=true", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "nativebool",
+            `export const meta = { name: "Old" }\nexport async function run() { return "old" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "New" }\nexport async function run() { return "new" }\n`
+        const result = yield* tool.execute(
+          { action: "create", name: "nativebool", source, overwrite: true },
+          recorder.ctx,
+        )
+        expect(result.output).toContain("Workflow file created and validated.")
+      }),
+    ),
+  )
+
+  // The same stringified-arg failure class applies to the numeric caps. The
+  // coercion must accept a numeric string while STILL rejecting non-finite /
+  // negative values so the budget/timeout guards stay honest.
+  it.live("budget supplied as the string \"5\" is accepted (coerces to a finite cap)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "budgeted",
+            `export const meta = { name: "Budgeted" }\nexport async function run() { return "ok" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const result = yield* tool.execute({ action: "start", name: "budgeted", budget: "5" }, recorder.ctx)
+        expect(result.output).toContain(`state="completed"`)
+      }),
+    ),
+  )
+
+  it.live("budget=\"abc\"/\"Infinity\"/\"-1\" (strings) are still rejected by the schema guards", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "budgeted",
+            `export const meta = { name: "Budgeted" }\nexport async function run() { return "ok" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        for (const bad of ["abc", "Infinity", "NaN", "-1"]) {
+          const exit = yield* Effect.exit(
+            tool.execute({ action: "start", name: "budgeted", budget: bad }, recorder.ctx),
+          )
+          expect(Exit.isFailure(exit)).toBe(true)
+        }
+      }),
+    ),
+  )
 })

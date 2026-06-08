@@ -9,7 +9,7 @@ import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { createTwoFilesPatch } from "diff"
 import path from "path"
-import { Cause, Effect, Schema, Scope } from "effect"
+import { Cause, Effect, Schema, SchemaGetter, Scope } from "effect"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import * as Tool from "./tool"
 import { trimDiff } from "./edit"
@@ -22,6 +22,35 @@ const DEFAULT_TIMEOUT = 60 * 60 * 1000
 
 const Action = Schema.Literals(["read", "start", "wait", "inspect", "create"])
 const InspectView = Schema.Literals(["summary", "logs", "agents", "agent", "result", "all"])
+
+// LLMs routinely emit a boolean tool argument as the JSON STRING "true"/"false"
+// instead of a boolean. A bare Schema.Boolean rejects that with an
+// InvalidArgumentsError; the model then re-emits the same stringified value,
+// loops on the identical invalid call, and the session eventually aborts. Accept
+// either form and decode to a real boolean. (Mirrors QueryBoolean in the HTTP
+// query helpers, but also passes a native boolean through unchanged.)
+const LooseBoolean = Schema.Union([Schema.Boolean, Schema.Literals(["true", "false"])]).pipe(
+  Schema.decodeTo(Schema.Boolean, {
+    decode: SchemaGetter.transform((value) => value === true || value === "true"),
+    encode: SchemaGetter.transform((value) => value),
+  }),
+)
+
+// Same stringified-arg failure class for the numeric caps (budget/timeout):
+// accept either a native number or a numeric string, then re-apply the SAME
+// finite + non-negative refinement to the decoded value. Union([Number,
+// NumberFromString]) parses "abc"/"Infinity"/"NaN" to NaN/±Infinity, which the
+// trailing Finite.check(isGreaterThanOrEqualTo(0)) still rejects — so a
+// stringified "5" succeeds while "-1"/"Infinity"/"NaN"/"abc" (and their native
+// equivalents) STILL fail validation and surface corrective feedback to the
+// model. This keeps the budget/timeout guards (which rely on a finite, >=0 cap)
+// honest, exactly as the bare Finite schema did.
+const LooseNonNegativeFinite = Schema.Union([Schema.Number, Schema.NumberFromString]).pipe(
+  Schema.decodeTo(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)), {
+    decode: SchemaGetter.transform((value) => value),
+    encode: SchemaGetter.transform((value) => value),
+  }),
+)
 
 const Parameters = Schema.Struct({
   action: Action.annotate({
@@ -36,11 +65,11 @@ const Parameters = Schema.Struct({
   // Non-negative finite, mirroring the engine/HTTP budget schema: a plain
   // Schema.Number would accept NaN/±Infinity, and a NaN cap makes the gate
   // (budgetRemaining <= 0) silently never trip — i.e. unlimited spend.
-  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))).annotate({
+  budget: Schema.optional(LooseNonNegativeFinite).annotate({
     description:
       "Optional cost cap in USD for the whole run. Checked before each agent step; once cumulative cost reaches the cap, the next step fails with a budget error. This is a soft cap — agent steps already running in parallel can push total spend past it. Omit for unlimited.",
   }),
-  background: Schema.optional(Schema.Boolean).annotate({
+  background: Schema.optional(LooseBoolean).annotate({
     description: "Start the workflow asynchronously and notify this session when it finishes",
   }),
   // Non-negative finite, mirroring the budget field above: a plain Schema.Number
@@ -48,7 +77,7 @@ const Parameters = Schema.Struct({
   // cap (wait hangs forever); NaN slips past the engine's `<=0` guard (NaN<=0 is
   // false) so wait times out at once yet still reports "still running". Rejecting
   // both at the argument boundary keeps the wait bound honest.
-  timeout: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))).annotate({
+  timeout: Schema.optional(LooseNonNegativeFinite).annotate({
     description: "Maximum milliseconds to wait for foreground start/wait before returning the running state",
   }),
   run_id: Schema.optional(Schema.String).annotate({
@@ -63,7 +92,7 @@ const Parameters = Schema.Struct({
   source: Schema.optional(Schema.String).annotate({
     description: "Complete TypeScript workflow source for create",
   }),
-  overwrite: Schema.optional(Schema.Boolean).annotate({ description: "Overwrite an existing workflow file" }),
+  overwrite: Schema.optional(LooseBoolean).annotate({ description: "Overwrite an existing workflow file" }),
   resume_of: Schema.optional(Schema.String).annotate({
     description:
       "Resume a previous (paused/interrupted) workflow run by its run id; the engine replays that run's completed agent journal instead of re-running them.",
