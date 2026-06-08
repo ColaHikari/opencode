@@ -1399,7 +1399,7 @@ export async function run() { return "ok" }
     ),
   )
 
-  it.live("budget=\"abc\"/\"Infinity\"/\"-1\" (strings) are still rejected by the schema guards", () =>
+  it.live("budget=\"abc\"/\"Infinity\"/\"-1\" (strings) are rejected as invalid arguments", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
@@ -1416,7 +1416,86 @@ export async function run() { return "ok" }
             tool.execute({ action: "start", name: "budgeted", budget: bad }, recorder.ctx),
           )
           expect(Exit.isFailure(exit)).toBe(true)
+          // Specifically the arg-validation error (so the model gets corrective
+          // feedback), not some downstream failure.
+          expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("invalid arguments")
         }
+      }),
+    ),
+  )
+
+  // Number("") === 0, so a blank/whitespace-only numeric string would silently
+  // coerce to a ZERO cap (budget 0 = nothing can run; timeout 0 = instant
+  // timeout) instead of being flagged. Reject it at the boundary so the model
+  // gets corrective feedback rather than a surprise zero.
+  it.live("budget supplied as a blank/whitespace-only string is rejected as invalid arguments", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "budgeted",
+            `export const meta = { name: "Budgeted" }\nexport async function run() { return "ok" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        for (const blank of ["", " ", "\t"]) {
+          const exit = yield* Effect.exit(
+            tool.execute({ action: "start", name: "budgeted", budget: blank }, recorder.ctx),
+          )
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("invalid arguments")
+        }
+      }),
+    ),
+  )
+
+  // timeout is the other LooseNonNegativeFinite consumer and the load-bearing
+  // wait-bound: a stringified "Infinity" must be rejected, exactly as the native
+  // Infinity is (so wait can never be told to hang forever via a string).
+  it.live("timeout supplied as the string \"Infinity\" is rejected as invalid arguments", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "slow",
+            `export const meta = { name: "Slow" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const started = yield* tool.execute({ action: "start", name: "slow", background: true }, recorder.ctx)
+        const exit = yield* Effect.exit(
+          tool.execute(
+            { action: "wait", run_id: started.metadata.runId as string, timeout: "Infinity" },
+            recorder.ctx,
+          ),
+        )
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("invalid arguments")
+      }),
+    ),
+  )
+
+  // background is the other LooseBoolean consumer: a stringified "true" must
+  // decode without an InvalidArgumentsError (the run starts in the background).
+  it.live("start tolerates background supplied as the string \"true\" (no InvalidArgumentsError)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "bg",
+            `export const meta = { name: "Bg" }\nexport async function run() { return "done" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const result = yield* tool.execute({ action: "start", name: "bg", background: "true" }, recorder.ctx)
+        // background "true" decoded to a real boolean: the run took the background path.
+        expect(result.metadata.background).toBe(true)
       }),
     ),
   )

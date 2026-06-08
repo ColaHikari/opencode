@@ -36,16 +36,29 @@ const LooseBoolean = Schema.Union([Schema.Boolean, Schema.Literals(["true", "fal
   }),
 )
 
+// The numeric-string branch of LooseNonNegativeFinite. NOT Schema.NumberFromString:
+// that uses Number(), and Number("")/Number(" ")/Number("\t") === 0, so a
+// blank/whitespace-only string would silently coerce to a ZERO cap (budget 0 =
+// nothing can run; timeout 0 = instant timeout) instead of being flagged. Require
+// at least one non-whitespace character first, so a blank string is rejected at
+// the boundary and the model gets corrective feedback rather than a surprise zero.
+const NonBlankNumberFromString = Schema.String.check(Schema.isPattern(/\S/)).pipe(
+  Schema.decodeTo(Schema.Number, {
+    decode: SchemaGetter.transform((value) => Number(value)),
+    encode: SchemaGetter.transform((value) => String(value)),
+  }),
+)
+
 // Same stringified-arg failure class for the numeric caps (budget/timeout):
-// accept either a native number or a numeric string, then re-apply the SAME
-// finite + non-negative refinement to the decoded value. Union([Number,
-// NumberFromString]) parses "abc"/"Infinity"/"NaN" to NaN/±Infinity, which the
-// trailing Finite.check(isGreaterThanOrEqualTo(0)) still rejects — so a
-// stringified "5" succeeds while "-1"/"Infinity"/"NaN"/"abc" (and their native
-// equivalents) STILL fail validation and surface corrective feedback to the
-// model. This keeps the budget/timeout guards (which rely on a finite, >=0 cap)
-// honest, exactly as the bare Finite schema did.
-const LooseNonNegativeFinite = Schema.Union([Schema.Number, Schema.NumberFromString]).pipe(
+// accept either a native number or a (non-blank) numeric string, then re-apply
+// the SAME finite + non-negative refinement to the decoded value. The string
+// branch parses "abc"/"Infinity"/"NaN" to NaN/±Infinity, which the trailing
+// Finite.check(isGreaterThanOrEqualTo(0)) still rejects — so a stringified "5"
+// succeeds while ""/" "/"abc"/"Infinity"/"NaN"/"-1" (and the native -1/NaN/
+// Infinity) STILL fail validation and surface corrective feedback to the model.
+// This keeps the budget/timeout guards (which rely on a finite, >=0 cap) honest,
+// exactly as the bare Finite schema did.
+const LooseNonNegativeFinite = Schema.Union([Schema.Number, NonBlankNumberFromString]).pipe(
   Schema.decodeTo(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)), {
     decode: SchemaGetter.transform((value) => value),
     encode: SchemaGetter.transform((value) => value),
