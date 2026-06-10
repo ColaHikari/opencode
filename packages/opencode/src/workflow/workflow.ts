@@ -317,13 +317,15 @@ export type StartOptions = StartInput & {
   permissionSessionID?: SessionID
   /**
    * Identity of the caller that started this run (the tool/session that asked).
-   * Used to derive the inherited `permission` ruleset for every subagent session
-   * the run spawns (parent-session deny/external_directory rules + the caller
-   * agent's edit-class denies, i.e. Plan Mode — regression of #26514). This is
-   * distinct from `permissionSessionID`, which only controls WHERE interactive
-   * permission prompts surface, not WHICH rules apply. Absent on a purely
-   * programmatic/HTTP start with no session identity — the documented fallback
-   * (no inherited ruleset) preserves the prior behavior.
+   * `sessionID` is used to derive the inherited `permission` ruleset for every
+   * subagent session the run spawns (parent-session deny/external_directory
+   * rules; since #31696 parent-AGENT restrictions are deliberately NOT
+   * inherited — plan mode is instead gated by the plan agent's `workflow`
+   * deny). This is distinct from `permissionSessionID`, which only controls
+   * WHERE interactive permission prompts surface, not WHICH rules apply.
+   * Absent on a purely programmatic/HTTP start with no session identity — the
+   * documented fallback (no inherited ruleset) preserves the prior behavior.
+   * `agent` is currently informational only.
    */
   caller?: { sessionID: SessionID; agent?: string }
   /**
@@ -3618,6 +3620,6 @@ export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),
 )
 
-export const node = LayerNode.make(defaultLayer, [])
+export const node = LayerNode.make(layer, [Database.node, Session.node, Agent.node, Provider.node, Config.node, EventV2Bridge.node])
 
 export * as Workflow from "./workflow"

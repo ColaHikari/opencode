@@ -4071,10 +4071,12 @@ export async function run() { return { ok: true } }
   )
 
   // #26514 regression / Fund N9 (security): a workflow subagent MUST inherit the
-  // caller's deny/external_directory rules (and the caller agent's edit-class
-  // denies, i.e. Plan Mode) — the same ruleset the task tool derives. Before the
-  // fix the engine spawned the child session with NO `permission`, so a parent
-  // `edit: deny` (Plan Mode) or `external_directory` confinement silently leaked.
+  // caller SESSION's deny/external_directory rules — the same ruleset the task
+  // tool derives. (Parent-AGENT denies are deliberately not inherited since
+  // #31696; plan mode is instead gated by the plan agent's `workflow` deny.)
+  // Before the fix the engine spawned the child session with NO `permission`,
+  // so a parent session `edit: deny` or `external_directory` confinement
+  // silently leaked.
   it.instance("workflow subagent inherits the caller session's deny/external_directory rules", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
