@@ -62,8 +62,7 @@ async function start(command: StartCommand) {
     const serverEntry = pathToFileURL(
       path.join(__dirname, "opencode-server.mjs").replace("app.asar", "app.asar.unpacked"),
     ).href
-    const { Log, Server } = (await import(/* @vite-ignore */ serverEntry)) as typeof import("virtual:opencode-server")
-    await Log.init({ level: "WARN" })
+    const { Server } = (await import(/* @vite-ignore */ serverEntry)) as typeof import("virtual:opencode-server")
 
     listener = await Server.listen({
       port: command.port,

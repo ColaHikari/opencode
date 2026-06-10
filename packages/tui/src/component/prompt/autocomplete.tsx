@@ -9,6 +9,7 @@ import { useEditorContext } from "../../context/editor"
 import { useProject } from "../../context/project"
 import { useSDK } from "../../context/sdk"
 import { useSync } from "../../context/sync"
+import { useSyncV2 } from "../../context/sync-v2"
 import { getScrollAcceleration } from "../../util/scroll"
 import { useTuiPaths } from "../../context/runtime"
 import { useTuiConfig } from "../../config"
@@ -19,7 +20,6 @@ import { Locale } from "../../util/locale"
 import type { PromptInfo } from "../../prompt/history"
 import { useFrecency } from "../../prompt/frecency"
 import { useBindings, useCommandSlashes, useOpencodeModeStack } from "../../keymap"
-import type { ReferenceDescriptor } from "@opencode-ai/sdk/v2"
 import { displayCharAt, mentionTriggerIndex } from "../../prompt/display"
 import {
   isWorkflowCommandInput,
@@ -96,6 +96,7 @@ export function Autocomplete(props: {
   const editor = useEditorContext()
   const sdk = useSDK()
   const sync = useSync()
+  const syncV2 = useSyncV2()
   const project = useProject()
   const slashes = useCommandSlashes()
   const modeStack = useOpencodeModeStack()
@@ -295,37 +296,12 @@ export function Autocomplete(props: {
     }
   }
 
-  function referencePromptText(reference: ReferenceDescriptor) {
-    const problem = reference.kind === "invalid" ? reference.message : undefined
-    return [
-      `Referenced configured reference @${reference.name}.`,
-      ...(reference.kind === "local" ? ["Kind: local directory"] : []),
-      ...(reference.kind === "git" ? ["Kind: git repository"] : []),
-      ...(reference.kind === "invalid" && reference.repository ? [`Repository: ${reference.repository}`] : []),
-      ...(reference.kind === "git" ? [`Repository: ${reference.repository}`] : []),
-      ...(reference.kind === "git" && reference.branch ? [`Branch/ref: ${reference.branch}`] : []),
-      ...(reference.kind === "invalid" ? [] : [`Reference root: ${reference.path}`]),
-      ...(problem
-        ? [`Problem: ${problem}`]
-        : ["Inspect the configured reference with Read, Glob, and Grep when useful."]),
-    ].join("\n")
-  }
-
-  const [references] = createResource(
-    () => project.workspace.current(),
-    async (workspace) => {
-      const result = await sdk.client.reference.list({ workspace })
-      return result.data ?? []
-    },
-    { initialValue: [] },
-  )
-
   const referenceMatch = createMemo(() => {
     if (!store.visible || store.visible === "/") return
     const { baseQuery } = extractLineRange(search())
     const slash = baseQuery.indexOf("/")
     const alias = slash === -1 ? baseQuery : baseQuery.slice(0, slash)
-    return references().find((item) => item.name === alias)
+    return syncV2.data.reference.find((item) => !item.hidden && item.name === alias)
   })
 
   function normalizeMentionPath(filePath: string) {
@@ -363,9 +339,10 @@ export function Autocomplete(props: {
       const { lineRange, baseQuery } = extractLineRange(query ?? "")
 
       // Get files from SDK
-      const result = await sdk.client.find.files({
+      const result = await sdk.client.v2.fs.find({
         query: baseQuery,
-        workspace: project.workspace.current(),
+        limit: "20",
+        location: { workspace: project.workspace.current() },
       })
 
       const options: AutocompleteOption[] = []
@@ -375,15 +352,14 @@ export function Autocomplete(props: {
       if (!result.error && result.data) {
         const width = props.anchor().width - 4
         options.push(
-          ...result.data.map((item): AutocompleteOption => {
-            const { filename, url, part } = createFilePart(item, lineRange)
+          ...result.data.data.map((item): AutocompleteOption => {
+            const { filename, url, part } = createFilePart(item.path, lineRange)
 
-            const isDir = item.endsWith("/")
             return {
               display: Locale.truncateMiddle(filename, width),
               value: filename,
-              isDirectory: isDir,
-              path: item,
+              isDirectory: item.type === "directory",
+              path: item.path,
               onSelect: () => {
                 insertPart(filename, part)
               },
@@ -458,12 +434,13 @@ export function Autocomplete(props: {
   })
 
   const referenceAliases = createMemo(() =>
-    references().map(
-      (reference): AutocompleteOption => ({
-        display: "@" + reference.name,
-        description: reference.kind === "invalid" ? reference.message : " dir",
-        onSelect: () => {
-          if (reference.kind !== "invalid") {
+    syncV2.data.reference
+      .filter((reference) => !reference.hidden)
+      .map(
+        (reference): AutocompleteOption => ({
+          display: "@" + reference.name,
+          description: ` ${reference.source.type === "git" ? reference.source.repository : reference.source.path}`,
+          onSelect: () => {
             insertPart(reference.name, {
               type: "file",
               mime: "application/x-directory",
@@ -475,16 +452,9 @@ export function Autocomplete(props: {
                 path: reference.name,
               },
             })
-            return
-          }
-          insertPart(reference.name, {
-            type: "text",
-            text: referencePromptText(reference),
-            synthetic: true,
-          })
-        },
-      }),
-    ),
+          },
+        }),
+      ),
   )
 
   const [workflowInfos] = createResource(
@@ -700,7 +670,7 @@ export function Autocomplete(props: {
     const endCursor = input.logicalCursor
 
     input.deleteRange(startCursor.row, startCursor.col, endCursor.row, endCursor.col)
-    input.insertText("@" + path)
+    input.insertText("@" + path + "/")
 
     setStore("selected", 0)
   }
