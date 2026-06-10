@@ -21,10 +21,12 @@ export const StartPayload = Schema.Struct({
   // session — pass the caller's session id to surface them interactively.
   // Validated/branded at the schema boundary like the session endpoints do.
   permissionSessionID: Schema.optional(SessionID),
-  // Resume a previous (paused/interrupted) run: its id. When set, the engine
-  // replays the source run's persisted agent journal — every completed agent it
-  // can match is re-used verbatim instead of re-prompted. Branded at the schema
-  // boundary like the run-id route params.
+  // Resume a previous (paused, interrupted, failed, or completed) run: its id.
+  // When set, the engine replays the source run's persisted agent journal — every
+  // completed agent it can match is re-used verbatim instead of re-prompted (a
+  // failed run replays its completed prefix; a completed run is a full cache
+  // hit). Running and cancelled runs are rejected with a 400. Branded at the
+  // schema boundary like the run-id route params.
   resume_of: Schema.optional(Workflow.RunID),
   // Source-journal agent indices (0-based) to force live re-execution of during a
   // resume, even if they completed. Only meaningful together with `resume_of`.

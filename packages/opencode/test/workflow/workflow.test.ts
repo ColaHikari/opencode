@@ -820,6 +820,53 @@ const PIPELINE_ERROR_WORKFLOW = `export default {
 }
 `
 
+// Item-cap fixtures (MAX_BATCH_ITEMS = 4096): trivial non-agent thunks/items so
+// the boundary tests stay fast. `count` is an argument so one fixture covers both
+// the rejection (4097) and the boundary (4096) case.
+const PARALLEL_CAP_FIXTURE = "par-cap"
+const PARALLEL_CAP_WORKFLOW = `export const meta = { name: "${PARALLEL_CAP_FIXTURE}", description: "parallel item cap", arguments: { count: { type: "number" } } }
+export async function run(args, ctx) {
+  const tasks = Array.from({ length: args.count }, (_, i) => () => Promise.resolve(i))
+  const out = await ctx.parallel(tasks)
+  return { length: out.length }
+}
+`
+const PIPELINE_CAP_FIXTURE = "pipe-cap"
+const PIPELINE_CAP_WORKFLOW = `export const meta = { name: "${PIPELINE_CAP_FIXTURE}", description: "pipeline item cap", arguments: { count: { type: "number" } } }
+export async function run(args, ctx) {
+  const items = Array.from({ length: args.count }, (_, i) => i)
+  const out = await ctx.pipeline(items, async (prev) => prev)
+  return { length: out.length }
+}
+`
+
+// Pipeline index fixtures (stage third parameter): stage 1 returns its `index`,
+// stage 2 proves it sees the SAME index for the item (prev === index from stage 1).
+const PIPELINE_INDEX_FIXTURE = "pipe-index"
+const PIPELINE_INDEX_WORKFLOW = `export const meta = { name: "${PIPELINE_INDEX_FIXTURE}", description: "pipeline stage index" }
+export async function run(_args, ctx) {
+  const out = await ctx.pipeline(
+    ["x", "y"],
+    async (_prev, _item, i) => i,
+    async (prev, _item, i) => ({ first: prev, second: i }),
+  )
+  return { out }
+}
+`
+// Duplicate items: the stage throws ONLY for the second occurrence (told apart by
+// index, the items are identical), so the drop log must name item 2 — the old
+// items.indexOf(item) logging always reported the FIRST occurrence (item 1).
+const PIPELINE_DUP_FIXTURE = "pipe-dup"
+const PIPELINE_DUP_WORKFLOW = `export const meta = { name: "${PIPELINE_DUP_FIXTURE}", description: "pipeline duplicate-item drop index" }
+export async function run(_args, ctx) {
+  const out = await ctx.pipeline(["a", "a"], async (prev, _item, i) => {
+    if (i === 1) throw new Error("dup-boom")
+    return prev
+  })
+  return { out }
+}
+`
+
 // Pipeline barrier fixture: N items, ONE stage that parks every item on the gate,
 // so the test can observe how many items run that stage concurrently (the
 // pipeline concurrency default / clamp).
@@ -1600,13 +1647,22 @@ function driftPromptOps(db: Database.Interface["db"]) {
 // aus dem Journal stammt. Der Output ist `"out:" + prompt-text` damit identische
 // Prompts dennoch denselben Output liefern (die Occurrence-Trennung wird über die
 // Zähl-Logik geprüft, nicht über unterschiedliche Outputs).
+// Entfernt die vom Engine vorangestellte Step-Framing-Direktive (Item 6: jeder
+// Nicht-Schema-Agent-Prompt wird damit geframt), sodass Prompt-matchende Ops und
+// Assertions weiterhin auf dem AUTOREN-Prompt operieren. Schema-Prompts (und der
+// rohe node.prompt) tragen das Präfix nie.
+function authorPrompt(text: string) {
+  const prefix = Workflow.STEP_FRAMING_DIRECTIVE + "\n\n"
+  return text.startsWith(prefix) ? text.slice(prefix.length) : text
+}
+
 function recordingPromptOps(db: Database.Interface["db"], cost = 0) {
   const prompted: string[] = []
   const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
     prompt: (input) =>
       Effect.gen(function* () {
         if (input.noReply) return assistantReply()
-        const text = input.parts?.[0]?.type === "text" ? input.parts[0].text : ""
+        const text = authorPrompt(input.parts?.[0]?.type === "text" ? input.parts[0].text : "")
         prompted.push(text)
         const last = yield* persistTurns(db, input.sessionID, [
           { cost, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
@@ -1832,6 +1888,92 @@ describe("Workflow", () => {
       expect(
         run.logs.some((l) => l.message.includes("pipeline item 2 dropped") && l.message.includes("stage1-boom")),
       ).toBe(true)
+    }),
+  )
+
+  // Pipeline stages receive the item's index as their third parameter — the same
+  // index in EVERY stage the item flows through (stage 2's `prev` is stage 1's
+  // returned index, and stage 2's own `i` must match it).
+  it.instance("pipeline stage receives the item index in every stage", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_INDEX_FIXTURE, PIPELINE_INDEX_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PIPELINE_INDEX_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("pipe-index did not finish")))
+      expect(run.status).toBe("completed")
+      expect((run.result as { out: unknown[] }).out).toEqual([
+        { first: 0, second: 0 },
+        { first: 1, second: 1 },
+      ])
+    }),
+  )
+
+  // Duplicate-items log bug: the drop log uses the forEach index, so the SECOND
+  // occurrence of an identical item reports "item 2" — the old items.indexOf
+  // logging always named the first occurrence ("item 1").
+  it.instance("duplicate items log the true index on drop", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_DUP_FIXTURE, PIPELINE_DUP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PIPELINE_DUP_FIXTURE, args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("pipe-dup did not finish")))
+      expect(run.status).toBe("completed")
+      // Only the second occurrence dropped, at its true position.
+      expect((run.result as { out: unknown[] }).out).toEqual(["a", null])
+      const dropLog = run.logs.find((l) => l.message.includes("dropped"))
+      expect(dropLog?.message).toContain("pipeline item 2 dropped")
+      expect(dropLog?.message).toContain("dup-boom")
+      expect(run.logs.some((l) => l.message.includes("pipeline item 1 dropped"))).toBe(false)
+    }),
+  )
+
+  // Item cap (Claude parity): a single ctx.parallel call may carry at most 4096
+  // tasks. One past the cap fails the run with an explicit InvalidError naming the
+  // limit at the call site — never a silent mass of null drops.
+  it.instance("parallel rejects more than 4096 tasks with an explicit error", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_CAP_FIXTURE, PARALLEL_CAP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PARALLEL_CAP_FIXTURE, args: { count: 4097 } })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("par-cap did not finish")))
+      expect(run.status).toBe("failed")
+      expect(run.error).toContain("at most 4096")
+      expect(run.error).toContain("4097")
+    }),
+  )
+
+  // Same cap for ctx.pipeline, with the pipeline-specific wording.
+  it.instance("pipeline rejects more than 4096 items with an explicit error", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PIPELINE_CAP_FIXTURE, PIPELINE_CAP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PIPELINE_CAP_FIXTURE, args: { count: 4097 } })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("pipe-cap did not finish")))
+      expect(run.status).toBe("failed")
+      expect(run.error).toContain("ctx.pipeline supports at most 4096")
+    }),
+  )
+
+  // Boundary: EXACTLY 4096 items pass the gate (only > caps) and the batch runs
+  // through with the default concurrency clamp.
+  it.instance("parallel allows exactly 4096 tasks", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PARALLEL_CAP_FIXTURE, PARALLEL_CAP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: PARALLEL_CAP_FIXTURE, args: { count: 4096 } })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("par-cap boundary did not finish")))
+      expect(run.status).toBe("completed")
+      expect((run.result as { length: number }).length).toBe(4096)
     }),
   )
 
@@ -2286,6 +2428,73 @@ export async function run() {}
       const exit = yield* Effect.exit(workflow.start({ source, temporary: true }))
       expect(Exit.isFailure(exit)).toBe(true)
       expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("WorkflowInvalidError")
+    }),
+  )
+
+  // Static meta gate on the NAME start path: a name start (HTTP/programmatic)
+  // previously imported the module directly — only the inline path validated
+  // statically. Now the same MetaReader gate runs BEFORE loadModule, so computed
+  // meta fails the start as an InvalidError AND the module's top-level code is
+  // never executed (no marker file — the gate fired before any import).
+  it.instance("start by NAME rejects computed meta statically, before the module is imported", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const marker = path.join(os.tmpdir(), `workflow-name-gate-${Math.random().toString(16).slice(2)}`)
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "computed-meta-name",
+          `await Bun.write(${JSON.stringify(marker)}, "executed")
+export const meta = { name: globalThis.__wfName ?? "computed" }
+export async function run(args, ctx) { return { ok: true } }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const failed = yield* workflow.start({ name: "computed-meta-name", args: {} }).pipe(Effect.flip)
+      expect(failed._tag).toBe("WorkflowInvalidError")
+      const invalid =
+        failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
+      expect(invalid.message).toContain("statically analyzable")
+      // The gate fired BEFORE the import: the top-level marker was never written.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+    }),
+  )
+
+  // Same gate on the SECOND ungated seam: a nested ctx.workflow child module is
+  // statically validated before loadModule imports it, so a computed-meta child
+  // fails the parent run without ever executing the child's top-level code.
+  it.instance("nested ctx.workflow rejects a computed-meta child before import", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const marker = path.join(os.tmpdir(), `workflow-nested-gate-${Math.random().toString(16).slice(2)}`)
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "bad-child",
+          `await Bun.write(${JSON.stringify(marker)}, "executed")
+export const meta = { name: globalThis.__wfName ?? "bad-child" }
+export async function run(args, ctx) { return { ok: true } }
+`,
+        ),
+      )
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          test.directory,
+          "gate-parent",
+          `export const meta = { name: "gate-parent" }
+export async function run(_args, ctx) { return await ctx.workflow("bad-child") }
+`,
+        ),
+      )
+      const workflow = yield* Workflow.Service
+      const started = yield* workflow.start({ name: "gate-parent", args: {} })
+      const waited = yield* workflow.wait({ id: started.id })
+      const run = waited.run ?? (yield* Effect.fail(new Error("gate-parent did not finish")))
+      expect(run.status).toBe("failed")
+      expect(run.error).toContain("statically analyzable")
+      // The child's top-level marker was never written: gate before import.
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
     }),
   )
 
@@ -4698,7 +4907,7 @@ export async function run() { return { from: "global" } }
           Effect.gen(function* () {
             if (input.noReply) return assistantReply()
             promptCount++
-            const text = input.parts?.[0]?.type === "text" ? input.parts[0].text : ""
+            const text = authorPrompt(input.parts?.[0]?.type === "text" ? input.parts[0].text : "")
             // Agent A beantwortet sofort mit Kosten 0.25; Agent B hängt.
             if (text === "agent A") {
               const last = yield* persistTurns(db, input.sessionID, [
@@ -4767,6 +4976,10 @@ export async function run() { return { from: "global" } }
       // resume_of ist auf der Row vermerkt.
       const row = yield* fetchRunRow(resumed.id)
       expect(row.resume_of).toBe(first.id)
+      // Item 6 Regressionsschutz: node.prompt bleibt der ROHE Autoren-Prompt —
+      // die Step-Framing-Direktive wird nur auf den DISPATCHTEN Text geprependet,
+      // nie auf den Node (und damit nie in den Journal-Key).
+      expect(done.agents.every((a) => !a.prompt.includes(Workflow.STEP_FRAMING_DIRECTIVE))).toBe(true)
     }),
   )
 
@@ -4803,10 +5016,11 @@ export async function run() { return { from: "global" } }
       expect(firstDone.status).toBe("completed")
       expect(firstDone.result).toEqual({ first: "out:0", second: "out:1" })
 
-      // Nur paused/interrupted Runs sind gültige Resume-Quellen (Status-Guard). Der
-      // erste Lauf completed mit beiden Journal-Einträgen; wir versetzen die Row auf
-      // `paused` (Journal/agents bleiben erhalten), um eine legitime Resume-Quelle
-      // zu erhalten — der Occurrence-Index ist das, was dieser Test prüft. Das Update
+      // Dieser Test pinnt die Occurrence-Index-Auflösung aus einer PAUSED Quelle
+      // (completed wäre seit der Guard-Erweiterung zwar auch direkt resumebar, aber
+      // paused ist der historische Kernfall). Der erste Lauf completed mit beiden
+      // Journal-Einträgen; wir versetzen die Row auf `paused` (Journal/agents
+      // bleiben erhalten), um diese Resume-Quelle zu erhalten. Das Update
       // wird im Poll wiederholt, bis es sichtbar `paused` ist (der terminale Run wird
       // ASYNCHRON aus der Registry evictet — bis dahin könnte ein letzter Snapshot die
       // DB-Mutation überschreiben; nach Eviction fällt get() auf die Row zurück).
@@ -5095,12 +5309,11 @@ export async function run() { return { from: "global" } }
     }).pipe(Effect.provide(testInstanceStoreLayer)),
   )
 
-  // Status-Guard (Fund: kein Guard auf dem Resume-Source-Status): nur paused/
-  // interrupted Runs sind gültige Resume-Quellen. Ein COMPLETED Quell-Run darf
-  // NICHT resumt werden — das würde seine Arbeit verdoppeln. Erwartung: ehrlicher
-  // WorkflowInvalidError (HTTP 400), dessen Message den Status nennt, statt stillem
-  // Degradieren zu einem Normallauf.
-  it.instance("resume from a completed source run fails with WorkflowInvalidError", () =>
+  // Status-Guard (erweitert): ein COMPLETED Quell-Run ist eine gültige Resume-
+  // Quelle — der Re-Run eines identischen Scripts ist ein 100%-Cache-Hit: KEIN
+  // Prompt wird gefeuert, beide Agent-Nodes kommen als cached:true aus dem
+  // Journal, der Run endet sofort completed mit demselben Resultat.
+  it.instance("resume of a COMPLETED run is a full cache hit", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
@@ -5114,17 +5327,115 @@ export async function run() { return { from: "global" } }
         (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
       expect(firstDone.status).toBe("completed")
 
-      // Resume von einer completed-Quelle MUSS scheitern.
+      // Resume der completed-Quelle: vollständiger Cache-Hit.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: resumeOps, resume_of: first.id })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ??
+        (yield* Effect.fail(new Error("completed-resume did not finish")))
+      expect(done.status).toBe("completed")
+      // KEIN Prompt wurde gefeuert — beide Agenten kamen aus dem Journal.
+      expect(prompted).toHaveLength(0)
+      expect(done.agents).toHaveLength(2)
+      expect(done.agents.every((a) => a.cached === true)).toBe(true)
+      // Das Resultat ist identisch zum Erstlauf; resume_of ist vermerkt.
+      expect(done.result).toEqual(firstDone.result)
+      const row = yield* fetchRunRow(resumed.id)
+      expect(row.resume_of).toBe(first.id)
+    }),
+  )
+
+  // Status-Guard (erweitert): ein FAILED Quell-Run ist eine gültige Resume-Quelle —
+  // das trägt die Kerniterationsschleife (Run failt → Script editieren → Präfix
+  // replayen). Der completed-Präfix (Agent A) kommt aus dem Journal (KEIN neuer
+  // Prompt); der gefailte Agent B steht NICHT im Journal (nur completed-Nodes
+  // landen dort) und läuft live — diesmal erfolgreich, der Run endet completed.
+  it.instance("resume of a FAILED run replays the completed prefix and reruns the failed step live", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Erster Lauf: Agent A antwortet, Agent B's Prompt schlägt fehl → Run failed.
+      // Als Workflow.PromptOps typisiert (Error-Kanal `unknown`), damit der
+      // gewollte Effect.fail(Error) den Prompt-Typ nicht verengt.
+      const failingOps: Workflow.PromptOps = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            const text = authorPrompt(input.parts?.[0]?.type === "text" ? input.parts[0].text : "")
+            if (text === "agent A") {
+              const last = yield* persistTurns(db, input.sessionID, [
+                { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+              ])
+              return { info: last.info, parts: [{ type: "text", text: "out:A" }] } as unknown as SessionV1.WithParts
+            }
+            return yield* Effect.fail(new Error("B exploded"))
+          }),
+        cancel: () => Effect.void,
+      }
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: failingOps })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("failed")
+
+      // Resume des failed-Runs: A aus dem Journal (NICHT erneut geprompt), B live
+      // (jetzt erfolgreiche Ops) → Run completed.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: resumeOps, resume_of: first.id })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ??
+        (yield* Effect.fail(new Error("failed-resume did not finish")))
+      expect(done.status).toBe("completed")
+      expect(prompted).not.toContain("agent A")
+      expect(prompted).toContain("agent B")
+      const result = done.result as { a: string; b: string }
+      expect(result.a).toBe("out:A")
+      expect(result.b).toBe("out:agent B")
+      // A ist als cached markiert (Journal-Replay), B nicht (lief live).
+      const agentA = done.agents.find((a) => a.output === "out:A")
+      expect(agentA?.cached).toBe(true)
+      const agentB = done.agents.find((a) => a.output === "out:agent B")
+      expect(agentB?.cached).not.toBe(true)
+    }),
+  )
+
+  // Status-Guard (unverändert verboten): ein noch RUNNING Quell-Run darf nicht
+  // resumt werden — die Original-Voraussetzung bleibt: erst stoppen. Erwartung:
+  // WorkflowInvalidError mit der neuen Fehlermeldung.
+  it.instance("resume from a running source run still fails with WorkflowInvalidError", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PAUSE_FIXTURE, PAUSE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Hängenden Run starten (bleibt running am Agent-Gate).
+      const { ops } = hangingPromptOps()
+      const run = yield* workflow.start({ name: PAUSE_FIXTURE, args: {}, prompt: ops })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current && current.agents.some((a) => a.status === "running" && a.session_id) ? current : undefined
+        }),
+        "agent never started",
+      )
+
       const { ops: resumeOps } = recordingPromptOps(db, 0)
       const failed = yield* workflow
-        .start({ name: RESUME_FIXTURE, args: {}, prompt: resumeOps, resume_of: first.id })
+        .start({ name: PAUSE_FIXTURE, args: {}, prompt: resumeOps, resume_of: run.id })
         .pipe(Effect.flip)
       expect(failed._tag).toBe("WorkflowInvalidError")
       const invalid =
         failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
-      // Die Message nennt den tatsächlichen Status der Quelle.
-      expect(invalid.message).toContain("completed")
-      expect(invalid.message).toContain(first.id)
+      expect(invalid.message).toContain("status is running")
+      expect(invalid.message).toContain("stopped first")
+      expect(invalid.message).toContain(run.id)
+
+      // Cleanup: die hängende Quelle canceln, damit kein Fiber den Test überlebt.
+      const cancelled = yield* workflow.cancel(run.id)
+      expect(cancelled?.status).toBe("cancelled")
     }),
   )
 
@@ -5183,7 +5494,8 @@ export async function run() { return { from: "global" } }
   )
 
   // Status-Guard / cancel-paused-Race: ein CANCELLED Quell-Run (hier: hängender Run
-  // → pause → cancel, exakt die cancel-of-a-paused-run-Semantik) darf NICHT resumt
+  // → pause → cancel, exakt die cancel-of-a-paused-run-Semantik) darf AUCH nach der
+  // Erweiterung des Guards (failed/completed sind jetzt erlaubt) NICHT resumt
   // werden. Ein direkter DB-UPDATE auf cancelled (die Race) wäre sonst re-resumebar.
   // Erwartung: WorkflowInvalidError, der den Status `cancelled` nennt.
   it.instance("resume from a cancelled source run fails with WorkflowInvalidError", () =>
@@ -5216,7 +5528,8 @@ export async function run() { return { from: "global" } }
       expect(failed._tag).toBe("WorkflowInvalidError")
       const invalid =
         failed instanceof Workflow.InvalidError ? failed : yield* Effect.fail(new Error("expected InvalidError"))
-      expect(invalid.message).toContain("cancelled")
+      expect(invalid.message).toContain("status is cancelled")
+      expect(invalid.message).toContain("cancelled runs cannot be resumed")
       expect(invalid.message).toContain(run.id)
     }),
   )
@@ -5709,6 +6022,95 @@ export async function run(args, ctx) {
       expect(text).toContain("do it")
       // Directive comes BEFORE the author's prompt.
       expect(text.indexOf("pdf")).toBeLessThan(text.indexOf("do it"))
+    }),
+  )
+
+  // Item 6 (Subagenten-Framing): a NON-schema agent step's dispatched prompt is
+  // prepended with the step-framing directive (the step's final message is a
+  // program's value, not a human reply). node.prompt keeps the RAW author prompt
+  // so the resume journal key is untouched.
+  it.instance("a non-schema agent step prepends the framing directive to the dispatched prompt", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SINGLE_AGENT_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("framing workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      expect(inputs.length).toBe(1)
+      const textPart = inputs[0]?.parts.find((p) => p.type === "text")
+      const text = textPart?.type === "text" ? textPart.text : ""
+      // Framing first, author's prompt last — nothing else in between.
+      expect(text).toBe(`${Workflow.STEP_FRAMING_DIRECTIVE}\n\ndo the thing`)
+      // The node carries the RAW prompt (journal-key stability).
+      expect(done.agents[0]?.prompt).toBe("do the thing")
+    }),
+  )
+
+  // Item 6: a SCHEMA step is NOT framed — the StructuredOutput tool call enforces
+  // the shape already, and an extra "output only data" line could compete with
+  // the structured-output system prompt. The dispatched text is the author's
+  // prompt verbatim.
+  it.instance("a schema agent step does NOT get the framing directive", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, SCHEMA_SUCCESS_FIXTURE, schemaWorkflow(SCHEMA_SUCCESS_FIXTURE)),
+      )
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      // Structured-answering ops that ALSO capture the dispatched prompt text.
+      const texts: string[] = []
+      const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            const part = input.parts?.[0]
+            texts.push(part?.type === "text" ? part.text : "")
+            const turn: AssistantTurn = {
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              structured: SCHEMA_OBJECT,
+            }
+            const last = yield* persistTurns(db, input.sessionID, [turn])
+            return { info: last.info, parts: [] } as unknown as SessionV1.WithParts
+          }),
+        cancel: () => Effect.void,
+      }
+
+      const started = yield* workflow.start({ name: SCHEMA_SUCCESS_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("schema framing workflow did not finish")))
+      expect(done.status).toBe("completed")
+      // The dispatched prompt is the author's text VERBATIM — no framing.
+      expect(texts).toEqual(["produce structured"])
+    }),
+  )
+
+  // Item 6: framing composes with the skills directive — framing first, then the
+  // skills line, then the author's prompt.
+  it.instance("the framing directive composes with the skills directive ahead of the author's prompt", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SKILLS_FIXTURE, SKILLS_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: SKILLS_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("skills framing workflow did not finish")))
+      expect(done.status).toBe("completed")
+
+      expect(inputs.length).toBe(1)
+      const textPart = inputs[0]?.parts.find((p) => p.type === "text")
+      const text = textPart?.type === "text" ? textPart.text : ""
+      expect(text).toBe(
+        `${Workflow.STEP_FRAMING_DIRECTIVE}\n\nLoad these skills before starting: pdf, xlsx.\n\ndo it`,
+      )
     }),
   )
 

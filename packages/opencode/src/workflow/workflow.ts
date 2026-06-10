@@ -329,8 +329,9 @@ export type StartOptions = StartInput & {
    */
   caller?: { sessionID: SessionID; agent?: string }
   /**
-   * Resume a previous (paused/interrupted) run by id. When set, start() loads the
-   * SOURCE run's persisted agent journal (directory-scoped, like get()) and builds
+   * Resume a previous (paused, interrupted, failed, or completed) run by id.
+   * When set, start() loads the SOURCE run's persisted agent journal
+   * (directory-scoped, like get()) and builds
    * a replay map keyed by the agent's call shape + occurrence index. As the new
    * run re-executes the SAME workflow body, each `ctx.agent` call first looks up
    * the journal: a matching COMPLETED source agent (whose index is not in
@@ -481,6 +482,33 @@ export class AgentLimitError extends Schema.TaggedErrorClass<AgentLimitError>()(
 // process by the `__testHooks.agentLimit` seam (a small value keeps the lifetime
 // test fast); inert at the default in production.
 const DEFAULT_AGENT_LIMIT = 1_000
+
+// The per-call batch cap for `ctx.parallel`/`ctx.pipeline` (Claude parity): a
+// single call may carry at most this many tasks/items. Enforced with an explicit
+// InvalidError AT THE CALL SITE so the author gets actionable feedback naming the
+// offending call, instead of the batch silently degrading into a mass of `null`
+// drops against the per-run lifetime cap above.
+const MAX_BATCH_ITEMS = 4_096
+
+// Framing directive prepended to every NON-schema agent step's prompt (Claude
+// parity): a workflow step's final message is consumed by a PROGRAM (the step's
+// resolved value), not by a human, so the subagent is told to output only the
+// requested data. Prepended onto the prompt text exactly like the skills
+// directive (PromptInput.system exists but the run loop's system-prompt assembly
+// does not read it, so a prompt prepend is the supported mechanism). Schema steps
+// are NOT framed: the StructuredOutput tool call enforces the shape already, and
+// an extra "output only data" line could compete with the structured-output
+// system prompt. Exported for tests asserting the dispatched prompt text.
+export const STEP_FRAMING_DIRECTIVE =
+  "You are one step of an automated workflow. Your final message is returned verbatim as this step's value to a program — output only the requested data, no preamble, no human-directed summary."
+
+// Legitimate resume sources for `start({ resume_of })`. Beyond paused/interrupted,
+// a FAILED source carries the core iteration loop (run fails → edit the script →
+// replay the completed prefix live-free) and a COMPLETED source is the
+// 100%-cache-hit re-run. `running` stays excluded (stop the source run first) and
+// `cancelled` stays excluded (the cancel-of-a-paused-run race protection — see the
+// status guard in start()).
+const RESUMABLE: ReadonlySet<Status> = new Set(["paused", "interrupted", "failed", "completed"])
 
 // The run-wide concurrency cap: the maximum number of `ctx.agent` dispatches that
 // may run simultaneously within a single run, regardless of any (looser) per-call
@@ -1765,6 +1793,15 @@ function createContext(input: {
     },
     parallel<T>(tasks: readonly (() => Promise<T>)[], options?: { concurrencyLimit?: number }) {
       checkpoint()
+      // Batch cap AFTER checkpoint() (abort wins, matching ctx.agent's gate
+      // order): an oversized batch is an authoring error reported at the call
+      // site. The synchronous throw propagates like any body error — run failed
+      // unless the author catches it.
+      if (tasks.length > MAX_BATCH_ITEMS)
+        throw new InvalidError({
+          path: input.active.run.workflow,
+          message: `ctx.parallel supports at most ${MAX_BATCH_ITEMS} tasks, got ${tasks.length}`,
+        })
       const concurrency = Math.max(1, options?.concurrencyLimit ?? 20)
       // Each task is gated by the run's abort signal via checkpoint() before it
       // starts: once cancel has fired, not-yet-started tasks throw CancelledError
@@ -1811,8 +1848,15 @@ function createContext(input: {
       const hasOptions = typeof last === "object" && last !== null
       const options = (hasOptions ? last : undefined) as PipelineOptions | undefined
       const stages = (hasOptions ? rest.slice(0, -1) : rest) as ReadonlyArray<
-        (prev: unknown, item: unknown) => Promise<unknown>
+        (prev: unknown, item: unknown, index: number) => Promise<unknown>
       >
+      // Same batch cap as parallel() (after checkpoint() and options parsing):
+      // an oversized item list is an authoring error reported at the call site.
+      if (items.length > MAX_BATCH_ITEMS)
+        throw new InvalidError({
+          path: input.active.run.workflow,
+          message: `ctx.pipeline supports at most ${MAX_BATCH_ITEMS} items, got ${items.length}`,
+        })
       // Same clamp as parallel(): an explicit limit ≤0 is floored to 1, matching
       // parallel's `Math.max(1, …)`. Only an UNSET limit means "unbounded".
       const concurrency = options?.concurrencyLimit === undefined ? "unbounded" : Math.max(1, options.concurrencyLimit)
@@ -1826,23 +1870,29 @@ function createContext(input: {
       return input.dispatch(
         Effect.forEach(
           items,
-          (item) =>
+          (item, index) =>
             Effect.promise(async () => {
               let current: unknown = item
               try {
                 for (const stage of stages) {
                   checkpoint()
-                  current = await stage(current, item)
+                  // Every stage receives the item's position in the ORIGINAL items
+                  // array as its third argument (Effect.forEach supplies it, same
+                  // as parallel() above) so a stage can address per-item state.
+                  current = await stage(current, item, index)
                 }
                 return current
               } catch (error) {
                 // P2: a throwing stage drops ONLY this item (null) and skips its
                 // remaining stages; other items keep running. Abort stays fatal.
+                // The drop log uses the forEach `index` (not items.indexOf), so
+                // duplicate items report their TRUE position, not the first
+                // occurrence's.
                 if (error instanceof CancelledError) throw error
                 input.active.run.logs.push({
                   time: Date.now(),
                   phase: input.active.run.current_phase,
-                  message: `pipeline item ${items.indexOf(item) + 1} dropped: ${error instanceof Error ? error.message : String(error)}`,
+                  message: `pipeline item ${index + 1} dropped: ${error instanceof Error ? error.message : String(error)}`,
                 })
                 input.persist()
                 return null
@@ -2202,6 +2252,29 @@ export const layer = Layer.effect(
         const found = discovered.find((item) => item.name === input.name)
         if (!found) return yield* new NotFoundError({ name: input.name ?? "" })
         target = { name: found.name, path: found.path, source: found.source }
+        // Static meta gate, IDENTICAL to the inline path above: validate the
+        // source AST-only (never executing the module) BEFORE loadModule imports
+        // it. The tool pre-checks via list(), but that is only ONE surface — a
+        // name start via HTTP/programmatic callers/answer()-resume reached
+        // loadModule ungated, letting computed meta (e.g. `name: process.env.X`)
+        // slip past the pure-literal requirement. Builtins pass trivially (their
+        // meta is literal by invariant). A file deleted between discovery and
+        // here fails as a clean InvalidError (ENOENT text) instead of a
+        // loadModule defect. The gate's file read is deliberately SEPARATE from
+        // loadModule's (the TOCTOU between the two reads is accepted: the gate
+        // is defense-in-depth for the permission-dialog guarantee, not a
+        // security boundary against racing writers) — passing the read text as
+        // inlineSource would move the module load to the global config dir and
+        // break relative imports.
+        const sourceText =
+          target.source !== undefined
+            ? target.source
+            : yield* Effect.tryPromise({
+                try: () => fs.readFile(target.path, "utf8"),
+                catch: (error) => new InvalidError({ path: target.path, message: errorText(error) }),
+              })
+        const gate = MetaReader.read(sourceText, target.path)
+        if (gate.valid === false) return yield* new InvalidError({ path: target.path, message: gate.error })
       }
       // tryPromise so a load failure (bad meta / missing run / syntax error)
       // surfaces as a typed InvalidError naming the file, not as an unhandled
@@ -2248,17 +2321,22 @@ export const layer = Layer.effect(
           .get()
           .pipe(Effect.orDie)
         if (sourceRow) {
-          // Status guard: only a paused or interrupted run is a legitimate resume
-          // source. A completed/cancelled/failed/running source must fail the start
-          // honestly rather than silently degrade — resuming a terminal run would
-          // duplicate its work, and the cancel-of-a-paused-run race could otherwise
-          // be re-resumed via a direct DB UPDATE to `cancelled`. HTTP maps
-          // WorkflowInvalidError to 400. An unknown id leaves `sourceRow` undefined
-          // and still degrades to a normal run (every call runs live), unchanged.
-          if (sourceRow.status !== "paused" && sourceRow.status !== "interrupted") {
+          // Status guard: paused, interrupted, FAILED, and COMPLETED runs are
+          // legitimate resume sources. failed-resume carries the original core
+          // iteration loop — the run fails, the author edits the script and
+          // replays the completed prefix from the journal (the failed node never
+          // entered the journal, so it runs live); completed-resume is the
+          // 100%-cache-hit re-run of an identical script. Still forbidden:
+          // `running` (the original precondition — stop the source run first) and
+          // `cancelled` (the cancel-of-a-paused-run race protection: a cancelled
+          // source could otherwise be re-resumed via a direct DB UPDATE to
+          // `cancelled`). HTTP maps WorkflowInvalidError to 400. An unknown id
+          // leaves `sourceRow` undefined and still degrades to a normal run
+          // (every call runs live), unchanged.
+          if (!RESUMABLE.has(sourceRow.status)) {
             return yield* new InvalidError({
               path: target.path,
-              message: `Cannot resume run ${input.resume_of}: status is ${sourceRow.status} (only paused or interrupted runs can be resumed)`,
+              message: `Cannot resume run ${input.resume_of}: status is ${sourceRow.status} (running runs must be stopped first; cancelled runs cannot be resumed)`,
             })
           }
           // Finding 11: identity guard. The HTTP start route lets the caller choose
@@ -2520,10 +2598,20 @@ export const layer = Layer.effect(
             // into the per-step tools scoping above). The directive precedes the
             // author's prompt so the model loads the skills before starting.
             const skills = agentInput.skills?.filter((s) => s.length > 0) ?? []
-            const promptText =
-              skills.length > 0
-                ? `Load these skills before starting: ${skills.join(", ")}.\n\n${agentInput.prompt}`
-                : agentInput.prompt
+            // Prompt assembly (in order): the step-framing directive (NON-schema
+            // steps only — see STEP_FRAMING_DIRECTIVE), the skills directive, then
+            // the author's prompt. Only the DISPATCHED text is framed: `node.prompt`
+            // keeps the raw `agentInput.prompt` (set at node creation above), and
+            // the resume journalKey builds on agentInput.prompt too — so framing
+            // never breaks existing resume journals or the journal shape match
+            // (the skills directive has relied on the same split all along).
+            const promptText = [
+              agentInput.schema ? undefined : STEP_FRAMING_DIRECTIVE,
+              skills.length > 0 ? `Load these skills before starting: ${skills.join(", ")}.` : undefined,
+              agentInput.prompt,
+            ]
+              .filter(Boolean)
+              .join("\n\n")
             const tools = skills.length > 0 ? { ...(agentInput.tools ?? {}), skill: true } : agentInput.tools
             // Declarative file attachments (Task 10). Each path is resolved
             // RELATIVE TO the run's workspace directory (`active.directory`, the
@@ -3186,6 +3274,24 @@ export const layer = Layer.effect(
         if (!target) {
           throw new InvalidError({ path: active.run.workflow, message: `Workflow not found: ${name}` })
         }
+        // Static meta gate, same as start()'s name branch: a nested child module
+        // is validated AST-only BEFORE loadModule imports (and thereby executes)
+        // it, so computed meta cannot slip in through the ctx.workflow seam
+        // either. A read failure or non-literal meta throws a clean InvalidError
+        // naming the child's file. (Same accepted TOCTOU between the gate read
+        // and loadModule's own read as in start() — defense-in-depth, not a
+        // security boundary.)
+        const childSource =
+          target.source !== undefined
+            ? target.source
+            : await fs.readFile(target.path, "utf8").then(
+                (text) => text,
+                (error) => {
+                  throw new InvalidError({ path: target.path, message: errorText(error) })
+                },
+              )
+        const childGate = MetaReader.read(childSource, target.path)
+        if (childGate.valid === false) throw new InvalidError({ path: target.path, message: childGate.error })
         const childModule = await loadModule(target.path, target.source)
         const coerced = coerceArgs(childArgs, childModule.meta.arguments, target.path)
         if (coerced instanceof InvalidError) throw coerced

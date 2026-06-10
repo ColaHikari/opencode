@@ -186,6 +186,33 @@ describe("workflow HTTP lifecycle e2e", () => {
     }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
   )
 
+  it.live("start by name on a computed-meta file is a 400 through the httpapi", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      // Computed meta (globalThis lookup) is not statically analyzable: the
+      // engine's meta gate must reject the NAME start before importing the
+      // module, surfacing as a 400 WorkflowApiError on the HTTP start route.
+      yield* Effect.promise(() =>
+        writeWorkflow(
+          directory,
+          "http-computed-meta",
+          `export const meta = { name: globalThis.__wfName ?? "computed" }
+export async function run(args, ctx) { return { ok: true } }
+`,
+        ),
+      )
+
+      const startRes = yield* requestInDirectory("/workflow/http-computed-meta/start", directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      expect(startRes.status).toBe(400)
+      const body = yield* bodyJson(startRes)
+      expect(JSON.stringify(body)).toContain("statically analyzable")
+    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+  )
+
   it.live("save -> file written + discoverable; duplicate is 409; bad name is 400", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true })

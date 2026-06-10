@@ -68,8 +68,10 @@ export type WorkflowPipelineOptions = { concurrencyLimit?: number }
 
 /** A pipeline stage: receives the previous stage's output for this item plus the
  * original item, and returns the next value. The first stage's `prev` is the
- * item itself. Stages may change the type (`I → S1 → S2 …`). */
-export type WorkflowPipelineStage<Prev, Item, Next> = (prev: Prev, item: Item) => Promise<Next>
+ * item itself. Stages may change the type (`I → S1 → S2 …`). `index` is the
+ * item's position in the original items array — the same value for every stage
+ * an item flows through (a two-parameter stage simply ignores it). */
+export type WorkflowPipelineStage<Prev, Item, Next> = (prev: Prev, item: Item, index: number) => Promise<Next>
 
 /** Per-item pipeline. Each item flows through every stage SEQUENTIALLY (stage N+1
  * receives stage N's result for that item), while items run concurrently against
