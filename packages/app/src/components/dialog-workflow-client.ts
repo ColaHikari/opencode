@@ -58,9 +58,36 @@ export type WorkflowAnswerClient = {
   directory?: string
 }
 
-// Calls the generated `sdk.client.workflow.answer` with only the set fields.
-// Maps 200 → {run}, 404 → not_found, 409 → no_question, anything else (incl. a
-// transport failure) → error.
+// What a throwing hey-api client gives us on non-2xx: with `throwOnError: true`
+// (how every app client is created, see context/server-sdk.tsx) the generated
+// transport throws the PARSED JSON error body as a plain object — no Error
+// instance, no status code. This decoder recovers both from the known wire
+// shapes of the workflow routes (httpapi/errors.ts + groups/workflow.ts):
+//   - 404 ApiNotFoundError → { name: "NotFoundError", data: { message } }
+//   - 409 ConflictError    → { _tag: "ConflictError", message, resource? }
+//   - 400 WorkflowApiError → { _tag: "WorkflowApiError", message, workflow?, path? }
+// Error instances and strings keep their message; anything else decodes to {}
+// (NEVER String(thrown) on an object — that is the '[object Object]' toast bug).
+export type DecodedApiThrow = { status?: 400 | 404 | 409; message?: string }
+
+export function decodeWorkflowApiThrow(thrown: unknown): DecodedApiThrow {
+  if (typeof thrown === "string") return { message: thrown }
+  if (typeof thrown !== "object" || thrown === null) return {}
+  const body = thrown as { name?: unknown; _tag?: unknown; message?: unknown; data?: { message?: unknown } }
+  if (body.name === "NotFoundError" && typeof body.data?.message === "string")
+    return { status: 404, message: body.data.message }
+  const message = typeof body.message === "string" ? body.message : undefined
+  if (body._tag === "ConflictError") return { status: 409, message }
+  if (body._tag === "WorkflowApiError") return { status: 400, message }
+  if (thrown instanceof Error) return { message: thrown.message }
+  return {}
+}
+
+// Calls the generated `sdk.client.workflow.answer` with only the set fields and
+// maps both client flavours to the same union: a non-throwing client surfaces
+// the status on `result.response` (200 → ok, 404 → not_found, 409 →
+// no_question), a throwing one (the app default) lands in the catch where the
+// decoder recovers the status from the thrown error body.
 export async function answerWorkflowRun(sdk: WorkflowAnswerClient, input: AnswerInput): Promise<AnswerResult> {
   const payload: { answer: string; permissionSessionID?: string } = { answer: input.answer }
   if (input.permissionSessionID !== undefined) payload.permissionSessionID = input.permissionSessionID
@@ -76,7 +103,10 @@ export async function answerWorkflowRun(sdk: WorkflowAnswerClient, input: Answer
     if (status === 409) return { type: "no_question" }
     return { type: "error", message: `unexpected status ${status}` }
   } catch (error) {
-    return { type: "error", message: error instanceof Error ? error.message : String(error) }
+    const decoded = decodeWorkflowApiThrow(error)
+    if (decoded.status === 404) return { type: "not_found" }
+    if (decoded.status === 409) return { type: "no_question" }
+    return { type: "error", message: decoded.message ?? "request failed" }
   }
 }
 
@@ -106,48 +136,31 @@ export function saveWorkflowPayload(input: SaveInput): { name: string; source: s
   return payload
 }
 
-// The raw hey-api transport carried by every generated sub-client (they share one
-// `client` instance). Used as the typed-fetch fallback below until the SDK is
-// regenerated with the `workflow.save` method.
-type RawPost = {
-  post: (options: {
-    url: string
-    body: unknown
-    query?: Record<string, unknown>
-  }) => Promise<{ data?: unknown; response: { status: number } }>
-}
-
-// Calls POST /workflow/save and maps the HTTP contract to a small union:
+// Calls the generated `sdk.client.workflow.save` and maps the HTTP contract to
+// a small union:
 //   - 200 → ok with the written path;
-//   - 400 (WorkflowApiError: bad name / invalid meta) → invalid;
+//   - 400 (WorkflowApiError: bad name / invalid meta) → invalid with the real
+//     server message (e.g. a MetaReader validation error);
 //   - 409 (ConflictError: file exists) → conflict;
 //   - anything else / transport failure → error.
-//
-// NOTE (SDK regen): the generated client does not yet expose `workflow.save`, so
-// this reaches the shared raw transport off `sdk.client.workflow` and posts the
-// route directly (the directory is forwarded as a query param exactly like the
-// other workflow calls). Once the controller regenerates the SDK, swap the
-// `rawPost(...)` call for `sdk.client.workflow.save({ directory, workflowSavePayload })`.
+// Like answerWorkflowRun this covers both client flavours: a non-throwing
+// client surfaces the status on `result.response`, a throwing one (the app
+// default) lands in the catch where decodeWorkflowApiThrow recovers the status
+// and message from the thrown error body.
 export async function saveWorkflowRun(sdk: WorkflowAnswerClient, input: SaveInput): Promise<SaveResult> {
   const payload = saveWorkflowPayload(input)
   try {
-    const workflow = sdk.client.workflow as unknown as {
-      save?: (args: {
-        directory?: string
-        workflowSavePayload: typeof payload
-      }) => Promise<{ data?: { path: string }; response: { status: number } }>
-    } & RawPost
-    const result = workflow.save
-      ? await workflow.save({ directory: sdk.directory, workflowSavePayload: payload })
-      : await workflow.post({ url: "/workflow/save", body: payload, query: { directory: sdk.directory } })
-    const data = result.data as { path?: string } | undefined
-    if (data?.path) return { type: "ok", path: data.path }
+    const result = await sdk.client.workflow.save({ directory: sdk.directory, workflowSavePayload: payload })
+    if (result.data?.path) return { type: "ok", path: result.data.path }
     const status = result.response.status
     if (status === 409) return { type: "conflict" }
     if (status === 400) return { type: "invalid", message: `invalid workflow (status ${status})` }
     return { type: "error", message: `unexpected status ${status}` }
   } catch (error) {
-    return { type: "error", message: error instanceof Error ? error.message : String(error) }
+    const decoded = decodeWorkflowApiThrow(error)
+    if (decoded.status === 409) return { type: "conflict" }
+    if (decoded.status === 400) return { type: "invalid", message: decoded.message ?? "invalid workflow" }
+    return { type: "error", message: decoded.message ?? "request failed" }
   }
 }
 
