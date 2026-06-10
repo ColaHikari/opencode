@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test"
 import {
   detectUltracodeKeyword,
   stripUltracodeKeyword,
+  ultracodeReminder,
   ULTRACODE_PROMPT_DIRECTIVE,
   ULTRACODE_SESSION_DIRECTIVE,
 } from "../../../../src/component/prompt/ultracode"
@@ -79,5 +80,18 @@ describe("ultracode keyword", () => {
     expect(ULTRACODE_SESSION_DIRECTIVE).toContain("workflow")
     expect(ULTRACODE_SESSION_DIRECTIVE).toContain("create")
     expect(ULTRACODE_SESSION_DIRECTIVE).toContain("ON")
+  })
+
+  it("ultracodeReminder wrappt in <system-reminder>", () => {
+    expect(ultracodeReminder("X")).toBe("<system-reminder>X</system-reminder>")
+  })
+
+  it("gewrappte Direktiven enthalten den Originalwortlaut", () => {
+    for (const directive of [ULTRACODE_SESSION_DIRECTIVE, ULTRACODE_PROMPT_DIRECTIVE]) {
+      const wrapped = ultracodeReminder(directive)
+      expect(wrapped).toContain(directive)
+      expect(wrapped.startsWith("<system-reminder>")).toBeTrue()
+      expect(wrapped.endsWith("</system-reminder>")).toBeTrue()
+    }
   })
 })

@@ -69,6 +69,7 @@ import { usePromptMove } from "./move"
 import {
   detectUltracodeKeyword,
   stripUltracodeKeyword,
+  ultracodeReminder,
   ULTRACODE_PROMPT_DIRECTIVE,
   ULTRACODE_SESSION_DIRECTIVE,
 } from "./ultracode"
@@ -1140,7 +1141,14 @@ export function Prompt(props: PromptProps) {
     // substantial submit while the toggle is on; the keyword directive fires for the
     // single turn that contains a standalone `ultracode` token, which is stripped from
     // the visible text. Both are prepended as synthetic text parts so the agent sees
-    // the orchestration instruction before the user's words.
+    // the orchestration instruction before the user's words. Both ride inside the
+    // <system-reminder> wrapper (state confirmation convention), so the model reads
+    // them as harness state, not user prose.
+    //
+    // Deliberate deviation from the original, which leaves the keyword in the visible
+    // text: we keep stripping it because the reminder restates the opt-in in full, the
+    // strip behaviour is documented and tested, and a visible keyword without a
+    // persisted highlight would be inconsistent.
     //
     // Detection AND stripping run on the RAW input (store.prompt.input), exactly what
     // the live highlight sees — never on the paste-expanded text. Otherwise an
@@ -1167,8 +1175,12 @@ export function Prompt(props: PromptProps) {
         })()
       : inputText
     const ultracodeParts = [
-      ...(ultracodeSession() ? [{ type: "text" as const, text: ULTRACODE_SESSION_DIRECTIVE, synthetic: true }] : []),
-      ...(keywordActive ? [{ type: "text" as const, text: ULTRACODE_PROMPT_DIRECTIVE, synthetic: true }] : []),
+      ...(ultracodeSession()
+        ? [{ type: "text" as const, text: ultracodeReminder(ULTRACODE_SESSION_DIRECTIVE), synthetic: true }]
+        : []),
+      ...(keywordActive
+        ? [{ type: "text" as const, text: ultracodeReminder(ULTRACODE_PROMPT_DIRECTIVE), synthetic: true }]
+        : []),
     ]
 
     if (store.mode === "shell") {

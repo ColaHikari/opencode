@@ -27,6 +27,17 @@ export const ULTRACODE_SESSION_DIRECTIVE =
   "runs when the task has phases. Skip only trivial or conversational turns. Treat " +
   "explicit requests like 'use a workflow' as the same opt-in."
 
+// Wraps an injected directive in the <system-reminder> convention the TUI already
+// uses for state/context confirmations — same wrapper as formatEditorContext
+// (prompt/index.tsx) and dialog-workspace-create.tsx — so the model reads it as
+// harness state rather than user prose. The directive CONSTANTS above stay exported
+// unwrapped because the app copy (packages/app/src/components/prompt-input/ultracode.ts)
+// and the headless copy (packages/opencode/src/cli/cmd/run/workflow.shared.ts) are
+// kept word-identical and existing tests assert the bare wording.
+export function ultracodeReminder(directive: string): string {
+  return `<system-reminder>${directive}</system-reminder>`
+}
+
 // Returns the first standalone-keyword hit (index + length) for live highlighting,
 // or undefined when the keyword is absent. Length tracks the matched text so the
 // caller can style exactly the keyword span.
