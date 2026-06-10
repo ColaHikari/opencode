@@ -444,6 +444,7 @@ export const node = LayerNode.make(layer.pipe(Layer.provide(Ripgrep.defaultLayer
   Truncate.node,
   RuntimeFlags.node,
   Database.node,
+  Workflow.node,
 ])
 
 export * as ToolRegistry from "./registry"

@@ -1,3 +1,4 @@
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
@@ -2619,29 +2620,23 @@ export const layer = Layer.effect(
               }
             }
             // Security (#26514 regression, Fund N9): a workflow subagent MUST
-            // inherit the caller's deny/external_directory rules and the caller
-            // agent's edit-class denies (Plan Mode lives on the agent ruleset,
-            // not the session) — exactly like the task tool derives a subagent's
-            // ruleset. Without the caller's identity (a purely programmatic/HTTP
-            // start with no session) we fall back to the prior behavior: no
-            // inherited ruleset (the engine still defaults task/todowrite denies
-            // for any non-permitting subagent via the normal session permission
-            // path). `agents.get` on the caller agent uses the same catchCause
-            // fallback as task.ts so an unknown caller agent never fails the run.
+            // inherit the caller's deny/external_directory rules — exactly like
+            // the task tool derives a subagent's ruleset (since #31696 parent
+            // AGENT restrictions are deliberately NOT inherited; the subagent's
+            // own permissions determine its capabilities). Without the caller's
+            // identity (a purely programmatic/HTTP start with no session) we fall
+            // back to the prior behavior: no inherited ruleset (the engine still
+            // defaults task/todowrite denies for any non-permitting subagent via
+            // the normal session permission path).
             const callerSession = input.caller
               ? yield* sessions.get(input.caller.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               : undefined
-            const callerAgent =
-              input.caller?.agent !== undefined
-                ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-                : undefined
-            // The inherited subagent ruleset (#26514): parent Plan-Mode edit denies,
-            // parent session denies/external_directory, default task/todowrite denies.
-            // Absent a caller identity there is nothing to inherit (prior fallback).
+            // The inherited subagent ruleset: parent session denies/external_directory,
+            // default task/todowrite denies. Absent a caller identity there is
+            // nothing to inherit (prior fallback).
             const derivedPermission = callerSession
               ? deriveSubagentSessionPermission({
                   parentSessionPermission: callerSession.permission ?? [],
-                  parentAgent: callerAgent,
                   subagent: selected,
                 })
               : undefined
@@ -3622,5 +3617,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Config.defaultLayer),
   Layer.provide(EventV2Bridge.defaultLayer),
 )
+
+export const node = LayerNode.make(defaultLayer, [])
 
 export * as Workflow from "./workflow"

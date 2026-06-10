@@ -134,8 +134,6 @@ export const defaultLayer = layer.pipe(
 
 const locationServiceMapNode = LayerNode.make(LocationServiceMap.layer, [])
 
-const workflowNode = LayerNode.make(Workflow.defaultLayer, [])
-
-export const node = LayerNode.make(layer, [Skill.node, workflowNode, locationServiceMapNode])
+export const node = LayerNode.make(layer, [Skill.node, Workflow.node, locationServiceMapNode])
 
 export * as SystemPrompt from "./system"

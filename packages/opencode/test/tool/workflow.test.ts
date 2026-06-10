@@ -1,4 +1,5 @@
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { afterEach, describe, expect } from "bun:test"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import fs from "fs/promises"
@@ -34,7 +35,7 @@ const it = testEffect(
     Session.defaultLayer,
     Workflow.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
-  ),
+  ).pipe(Layer.provide(Ripgrep.defaultLayer)),
 )
 
 const baseCtx: Omit<Tool.Context, "ask"> = {
