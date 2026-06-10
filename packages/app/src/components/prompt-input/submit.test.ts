@@ -1,5 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import type { Prompt } from "@/context/prompt"
+import type { FollowupDraft } from "./submit"
+import { ULTRACODE_PROMPT_DIRECTIVE, ULTRACODE_SESSION_DIRECTIVE } from "./ultracode"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
 
@@ -22,7 +24,7 @@ const sentShell: string[] = []
 const syncedDirectories: string[] = []
 const workflowStarts: Array<{ name: string; directory?: string; args?: Record<string, unknown>; permission?: string }> =
   []
-const promptParts: Array<Array<{ type: string; text?: string }>> = []
+const promptParts: Array<Array<{ type: string; text?: string; synthetic?: boolean }>> = []
 let dashboardOpened = 0
 let workflowListData: Array<{ name: string; valid?: boolean; meta: { name: string; arguments?: any } }> = []
 let workflowStartSessionId: string | undefined
@@ -62,7 +64,7 @@ const clientFor = (directory: string) => {
         return { data: undefined }
       },
       prompt: async () => ({ data: undefined }),
-      promptAsync: async (input: { parts: Array<{ type: string; text?: string }> }) => {
+      promptAsync: async (input: { parts: Array<{ type: string; text?: string; synthetic?: boolean }> }) => {
         promptParts.push(input.parts)
         return { data: undefined }
       },
@@ -614,7 +616,7 @@ describe("workflow command routing on submit", () => {
 })
 
 describe("ultracode injection on submit", () => {
-  test("prepends the session directive when session mode is on", async () => {
+  test("sends the session directive as a leading synthetic system-reminder part", async () => {
     params = { id: "session-1" }
     ultracodeSession = true
     promptValue = [{ type: "text", content: "fix the bug", start: 0, end: 11 }]
@@ -625,15 +627,17 @@ describe("ultracode injection on submit", () => {
     await flush()
 
     expect(promptParts).toHaveLength(1)
-    const text = promptParts[0]
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("")
-    expect(text).toContain("Ultracode session mode is ON")
-    expect(text).toContain("fix the bug")
+    const [first, second] = promptParts[0]
+    expect(first).toMatchObject({ type: "text", synthetic: true })
+    expect(first?.text).toStartWith("<system-reminder>")
+    expect(first?.text).toEndWith("</system-reminder>")
+    expect(first?.text).toContain("Ultracode session mode is ON")
+    // The visible user part is the pure user text — no directive wording.
+    expect(second).toMatchObject({ type: "text", text: "fix the bug" })
+    expect(second?.synthetic).toBeUndefined()
   })
 
-  test("strips the keyword and injects the prompt directive when keyword detected", async () => {
+  test("strips the keyword from the visible part and sends the prompt directive as reminder part", async () => {
     params = { id: "session-1" }
     promptValue = [{ type: "text", content: "ultracode fix the bug", start: 0, end: 21 }]
     const submit = createPromptSubmit(workflowInput())
@@ -642,17 +646,15 @@ describe("ultracode injection on submit", () => {
 
     await flush()
 
-    const text = promptParts[0]
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("")
-    expect(text).toContain("opted into workflow orchestration")
-    expect(text).toContain("fix the bug")
-    // The directive legitimately mentions "(ultracode)"; the USER's text (the
-    // trailing segment after the directive's blank-line separator) is stripped.
-    const userText = text.split("\n\n").at(-1) ?? ""
-    expect(userText).toBe("fix the bug")
-    expect(userText).not.toMatch(/\bultracode\b/i)
+    const [first, second] = promptParts[0]
+    expect(first).toMatchObject({ type: "text", synthetic: true })
+    expect(first?.text).toStartWith("<system-reminder>")
+    expect(first?.text).toContain("opted into workflow orchestration")
+    // The directive legitimately mentions "(ultracode)"; the USER's visible
+    // part carries the stripped text without the trigger word.
+    expect(second?.synthetic).toBeUndefined()
+    expect(second?.text).toBe("fix the bug")
+    expect(second?.text).not.toMatch(/\bultracode\b/i)
   })
 
   test("does not inject when the config keyword flag is off and session mode is off", async () => {
@@ -665,11 +667,35 @@ describe("ultracode injection on submit", () => {
 
     await flush()
 
+    expect(promptParts[0].some((p) => p.synthetic)).toBe(false)
     const text = promptParts[0]
       .filter((p) => p.type === "text")
       .map((p) => p.text)
       .join("")
     expect(text).toContain("ultracode fix the bug")
     expect(text).not.toContain("opted into workflow orchestration")
+  })
+
+  test("queued drafts carry directives and the stripped prompt", async () => {
+    params = { id: "session-1" }
+    ultracodeSession = true
+    promptValue = [{ type: "text", content: "ultracode fix the bug", start: 0, end: 21 }]
+    const queued: FollowupDraft[] = []
+    const submit = createPromptSubmit({
+      ...workflowInput(),
+      shouldQueue: () => true,
+      onQueue: (draft) => queued.push(draft),
+    })
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    // The turn is queued, not sent; the draft transports the directives so
+    // sendFollowupDraft emits them later (pages/session.tsx followup path).
+    expect(promptParts).toEqual([])
+    expect(queued).toHaveLength(1)
+    expect(queued[0]?.directives).toEqual([ULTRACODE_SESSION_DIRECTIVE, ULTRACODE_PROMPT_DIRECTIVE])
+    expect(queued[0]?.prompt).toEqual([{ type: "text", content: "fix the bug", start: 0, end: 0 }])
   })
 })

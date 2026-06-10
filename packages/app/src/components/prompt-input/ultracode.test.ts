@@ -3,6 +3,7 @@ import {
   buildUltracodeParts,
   detectUltracodeKeyword,
   stripUltracodeKeyword,
+  systemReminder,
   ultracodeToggle,
   ULTRACODE_PROMPT_DIRECTIVE,
   ULTRACODE_SESSION_DIRECTIVE,
@@ -26,6 +27,18 @@ describe("ultracode keyword", () => {
   test("directives are distinct non-empty constants", () => {
     expect(ULTRACODE_PROMPT_DIRECTIVE).not.toBe(ULTRACODE_SESSION_DIRECTIVE)
     expect(ULTRACODE_PROMPT_DIRECTIVE.length).toBeGreaterThan(0)
+  })
+})
+
+describe("systemReminder", () => {
+  test("wraps text in the <system-reminder> tag", () => {
+    expect(systemReminder("X")).toBe("<system-reminder>X</system-reminder>")
+  })
+  test("wrapped directives keep the original wording", () => {
+    const wrapped = systemReminder(ULTRACODE_SESSION_DIRECTIVE)
+    expect(wrapped).toContain(ULTRACODE_SESSION_DIRECTIVE)
+    expect(wrapped.startsWith("<system-reminder>")).toBe(true)
+    expect(wrapped.endsWith("</system-reminder>")).toBe(true)
   })
 })
 

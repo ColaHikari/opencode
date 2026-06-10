@@ -48,6 +48,10 @@ export type FollowupDraft = {
   agent: string
   model: { providerID: string; modelID: string }
   variant?: string
+  // Ultracode directives for this turn. Transported separately from the prompt
+  // so buildRequestParts can emit them as leading synthetic <system-reminder>
+  // parts instead of fusing them into the visible user text (TUI parity).
+  directives?: string[]
 }
 
 type FollowupSendInput = {
@@ -123,6 +127,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     context: input.draft.context,
     images,
     text,
+    directives: input.draft.directives,
     sessionID: input.draft.sessionID,
     messageID,
     sessionDirectory: input.draft.sessionDirectory,
@@ -542,6 +547,30 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
+    // Ultracode directive injection on a normal prompt (parity with the TUI's
+    // ultracodeParts). The directives travel on draft.directives and become
+    // leading synthetic <system-reminder> parts in buildRequestParts — never
+    // fused into the visible user text. The keyword is still STRIPPED from the
+    // visible text (TUI consistency; the original leaves it standing — that
+    // call is owned by the TUI part of this parity item and must stay uniform
+    // across UIs). Runs before the queue branch so queued followups carry
+    // their directives too.
+    if (mode === "normal" && !text.trimStart().startsWith("/")) {
+      const keywordEnabled = sync.data.config?.workflows?.ultracode_keyword ?? true
+      const ultracode = buildUltracodeParts({ text, session: input.ultracodeSession(), keywordEnabled })
+      if (ultracode.directives.length > 0) {
+        draft.directives = ultracode.directives
+        // Strip the keyword from the visible text parts so the user prompt the
+        // model sees no longer contains the trigger word. Collapse the body to
+        // a single text part when stripping (the keyword span was computed over
+        // the joined text) while preserving non-text parts.
+        if (ultracode.text !== text) {
+          const nonText = currentPrompt.filter((part) => part.type !== "text")
+          draft.prompt = [{ type: "text", content: ultracode.text, start: 0, end: 0 }, ...nonText]
+        }
+      }
+    }
+
     if (!isNewSession && mode === "normal" && input.shouldQueue?.()) {
       input.onQueue?.(draft)
       clearContext()
@@ -568,38 +597,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           restoreInput()
         })
       return
-    }
-
-    // Ultracode directive injection on a normal prompt (parity with the TUI's
-    // ultracodeParts). Prepend the session/keyword directives as leading synthetic
-    // text and strip the keyword from the user's visible text. Reuses the tested
-    // buildUltracodeParts; the directives flow through sendFollowupDraft's
-    // draftText join into the request's first text part.
-    if (mode === "normal" && !text.trimStart().startsWith("/")) {
-      const keywordEnabled = sync.data.config?.workflows?.ultracode_keyword ?? true
-      const ultracode = buildUltracodeParts({ text, session: input.ultracodeSession(), keywordEnabled })
-      if (ultracode.directives.length > 0) {
-        const directiveParts: Prompt = ultracode.directives.map((content) => ({
-          type: "text",
-          content: `${content}\n\n`,
-          start: 0,
-          end: 0,
-        }))
-        // Strip the keyword from the visible text parts so the user prompt the
-        // model sees no longer contains the trigger word.
-        const stripped = ultracode.text !== text
-        const bodyParts: Prompt = stripped
-          ? currentPrompt.map((part) =>
-              part.type === "text" && part.content.length > 0 ? { ...part, content: ultracode.text } : part,
-            )
-          : currentPrompt
-        // Collapse the body to a single text part when stripping (the keyword span
-        // was computed over the joined text) while preserving non-text parts.
-        const nonText = stripped ? currentPrompt.filter((part) => part.type !== "text") : []
-        draft.prompt = stripped
-          ? [...directiveParts, { type: "text", content: ultracode.text, start: 0, end: 0 }, ...nonText]
-          : [...directiveParts, ...bodyParts]
-      }
     }
 
     if (text.startsWith("/")) {
