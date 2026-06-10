@@ -42,20 +42,30 @@ export type WorkflowLogRow = {
 
 export type WorkflowAgentRow = {
   id: string
-  // Agent NODES only ever carry these three. The run-level `status` column below
-  // is widened to also include "cancelled"/"interrupted", but those are RUN
-  // lifecycle states only: on cancel/interrupt the engine rewrites a still-running
-  // agent node to "failed" (with an explanatory error), and the orphan sweep
-  // touches only the run row, never the agents JSON. Keep this union in lockstep
-  // with the engine's `AgentRun` schema (asserted at compile time over there).
-  status: "running" | "completed" | "failed"
+  // Agent NODES only ever carry these four ("skipped" = a human skipped the step
+  // via skipAgent, Item 15). The run-level `status` column below is widened to
+  // also include "cancelled"/"interrupted", but those are RUN lifecycle states
+  // only: on cancel/interrupt the engine rewrites a still-running agent node to
+  // "failed" (with an explanatory error), and the orphan sweep touches only the
+  // run row, never the agents JSON. Keep this union in lockstep with the
+  // engine's `AgentRun` schema (asserted at compile time over there).
+  status: "running" | "completed" | "failed" | "skipped"
   started_at: number
   completed_at?: number
   phase?: string
   agent?: string
+  // Per-call display name (Item 16), set from `ctx.agent({ label })`. Display-only
+  // (never part of the resume journal key). Keep in lockstep with the engine's
+  // `AgentRun` schema (asserted at compile time over there).
+  label?: string
   model?: string
   session_id?: string
   message_id?: string
+  // Item 7: the isolated `git worktree` base directory this step ran in (only
+  // for isolation:"worktree" steps; preserved worktrees stay inspectable here).
+  // Keep in lockstep with the engine's `AgentRun` schema (asserted at compile
+  // time over there).
+  worktree?: string
   prompt: string
   output?: string
   cost?: number

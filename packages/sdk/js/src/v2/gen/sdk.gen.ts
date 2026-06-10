@@ -340,6 +340,8 @@ import type {
   WorkflowSaveErrors,
   WorkflowSavePayload,
   WorkflowSaveResponses,
+  WorkflowSkipErrors,
+  WorkflowSkipResponses,
   WorkflowSourceErrors,
   WorkflowSourceResponses,
   WorkflowStartErrors,
@@ -5318,6 +5320,40 @@ export class Workflow extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<WorkflowPauseResponses, WorkflowPauseErrors, ThrowOnError>({
       url: "/workflow/run/{id}/pause",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Skip workflow agent step
+   *
+   * Skip one in-flight agent step of a live workflow run; the step's ctx.agent call resolves null and the run continues.
+   */
+  public skip<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      agentId: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "path", key: "agentId" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowSkipResponses, WorkflowSkipErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/agent/{agentId}/skip",
       ...options,
       ...params,
     })

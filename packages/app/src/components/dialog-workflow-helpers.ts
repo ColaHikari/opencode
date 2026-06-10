@@ -15,13 +15,18 @@ export function timestamp(value: unknown) {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-export function statusIcon(status: WorkflowRun["status"]) {
+// Accepts BOTH the run-level and the agent-node status unions (the dialog feeds
+// agent.status through here too). `skipped` (Item 15: a human skipped the step)
+// gets a minimal distinct glyph; the full skipped/label rendering is the
+// detail-view item of the next wave.
+export function statusIcon(status: WorkflowRun["status"] | WorkflowRun["agents"][number]["status"]) {
   if (status === "running") return "●"
   if (status === "completed") return "✔"
   if (status === "failed") return "✖"
   if (status === "cancelled") return "⊗"
   if (status === "interrupted") return "⊘"
   if (status === "paused") return "⏸"
+  if (status === "skipped") return "↷"
   return "◌"
 }
 

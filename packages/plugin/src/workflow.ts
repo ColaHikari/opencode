@@ -49,6 +49,17 @@ export type WorkflowAgentInput = {
   schema?: unknown
   permissionSessionID?: string
   /**
+   * Explicit progress group for THIS call. Pins the step to the named phase
+   * regardless of where `ctx.setPhase` currently points — closing the race
+   * window when setPhase and agent() run under parallel/pipeline concurrency.
+   * A phase declared in `meta.phases` with a `model` activates that model as
+   * this call's default (an explicit `model` still wins). The run's current
+   * phase is NOT changed (no setPhase side effect).
+   */
+  phase?: string
+  /** Display name for this step in run views (defaults to the agent name). */
+  label?: string
+  /**
    * Run this step's subagent in a FRESH `git worktree` instead of the run's
    * workspace, so parallel agents that mutate files do not conflict. The
    * worktree is created when the step dispatches and auto-removed when the run
@@ -56,6 +67,14 @@ export type WorkflowAgentInput = {
    * otherwise the step fails with a clear error.
    */
   isolation?: "worktree"
+  /**
+   * What a FAILING step resolves to. Default `"fail"`: the error propagates
+   * (the run fails unless you catch it). `"null"`: the step resolves `null`
+   * (its node stays `failed` with the error recorded) so the workflow body can
+   * branch on the outcome. Budget/lifetime limits and aborts are NEVER
+   * swallowed — those always throw regardless of this option.
+   */
+  onError?: "fail" | "null"
 }
 
 export type WorkflowAgentResult = {
@@ -117,10 +136,25 @@ export type WorkflowContext = {
    * was started without a budget (unlimited — the default). Read it to make a
    * workflow budget-aware; the engine additionally fails the next `agent()` call
    * with a budget error once this reaches zero.
+   *
+   * @deprecated USD-only view; prefer `ctx.budget.remaining()` (and
+   * `tokensRemaining()` for the token cap).
    */
   readonly budgetRemaining: number
-  /** Cost budget (USD) in Claude-Code API shape: `total` (null when unlimited), `spent()` so far, `remaining()` (Infinity when unlimited). */
-  readonly budget: { readonly total: number | null; spent(): number; remaining(): number }
+  /**
+   * Budget in Claude-Code API shape. USD: `total` (null when unlimited),
+   * `spent()` so far, `remaining()` (Infinity when unlimited). Tokens:
+   * `tokensTotal`/`tokensSpent()`/`tokensRemaining()` — the same trio for the
+   * independent output-token cap (`budget: { tokens }` at start).
+   */
+  readonly budget: {
+    readonly total: number | null
+    spent(): number
+    remaining(): number
+    readonly tokensTotal: number | null
+    tokensSpent(): number
+    tokensRemaining(): number
+  }
   /**
    * Switch the run's current phase. When the named phase is declared in
    * `meta.phases` as a structured object with a `model`, that model becomes the
@@ -138,7 +172,11 @@ export type WorkflowContext = {
    */
   parallel<T>(tasks: readonly (() => Promise<T>)[], options?: WorkflowParallelOptions): Promise<(T | null)[]>
   pipeline: WorkflowPipelineFn
-  agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult>
+  /**
+   * Resolves `null` when a human skips the step, or with `onError: "null"` when
+   * the step fails. Guard the result before dereferencing (`if (!r) …`).
+   */
+  agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult | null>
   /**
    * Deterministic non-LLM step: run a shell command in the run's workspace (or an
    * explicit `cwd`) and resolve to `{ output, exitCode }`. Unlike `agent()`, this

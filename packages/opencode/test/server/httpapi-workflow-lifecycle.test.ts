@@ -287,6 +287,52 @@ export async function run(args, ctx) { return { ok: true } }
     }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
   )
 
+  // Item 15: the skip route's status contract. 404 for an unknown run id; 409
+  // for a known live run whose addressed node is not skippable (a question node
+  // is answered, never skipped; an unknown agent id has nothing to skip).
+  it.live("skip route returns 404 for unknown runs and 409 for unskippable nodes", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      yield* Effect.promise(() => writeWorkflow(directory, "http-live-q", LIVE_Q))
+
+      // Unknown run id → 404.
+      const missing = yield* requestInDirectory("/workflow/run/job_does_not_exist/agent/1/skip", directory, {
+        method: "POST",
+      })
+      expect(missing.status).toBe(404)
+
+      // Live run parked on a QUESTION node: skipping it is a 409 (answer it
+      // instead) — and an unknown agent id is a 409 too.
+      const startRes = yield* requestInDirectory("/workflow/http-live-q/start", directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      const started = yield* bodyJson(startRes)
+      const id = started["id"] as string
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const res = yield* requestInDirectory(`/workflow/run/${id}`, directory)
+          const run = yield* bodyJson(res)
+          return run?.["pending_question"]?.question === "deploy?" ? run : undefined
+        }),
+        "pending question via GET",
+      )
+      const questionSkip = yield* requestInDirectory(`/workflow/run/${id}/agent/1/skip`, directory, {
+        method: "POST",
+      })
+      expect(questionSkip.status).toBe(409)
+      const unknownAgent = yield* requestInDirectory(`/workflow/run/${id}/agent/99/skip`, directory, {
+        method: "POST",
+      })
+      expect(unknownAgent.status).toBe(409)
+
+      // Cleanup: stop the live run.
+      const cancelRes = yield* requestInDirectory(`/workflow/run/${id}/cancel`, directory, { method: "POST" })
+      expect(cancelRes.status).toBe(200)
+    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+  )
+
   it.live("start -> cancel (live-waiting question) transitions to cancelled through the httpapi", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true })

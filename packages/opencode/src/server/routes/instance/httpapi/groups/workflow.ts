@@ -15,6 +15,9 @@ export const StartPayload = Schema.Struct({
   // Optional cost cap (USD) for the run; mirrors the engine StartInput.budget.
   // Non-negative finite: a negative/NaN/Infinity cap is rejected at validation.
   budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  // Optional output-token cap for the run (Item 17); soft cap like budget,
+  // counting each step's output+reasoning tokens. Combinable with budget.
+  budget_tokens: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
   // Session that should receive permission prompts raised by the run's
   // subagents (mirrors the workflow tool path). Headless default: when omitted,
   // permission requests follow the engine's default policy on an unobserved
@@ -98,6 +101,8 @@ export const WorkflowPaths = {
   start: `${root}/:name/start`,
   cancel: `${root}/run/:id/cancel`,
   pause: `${root}/run/:id/pause`,
+  // Skip one in-flight agent step of a live run (Item 15).
+  skip: `${root}/run/:id/agent/:agentId/skip`,
   answer: `${root}/run/:id/answer`,
   remove: `${root}/run/:id`,
 } as const
@@ -235,6 +240,25 @@ export const WorkflowApi = HttpApi.make("workflow")
             identifier: "workflow.pause",
             summary: "Pause workflow run",
             description: "Pause a running workflow execution run, keeping its journal so it can be resumed.",
+          }),
+        ),
+        HttpApiEndpoint.post("skip", WorkflowPaths.skip, {
+          // Branded run id at the schema boundary like cancel/pause; the agent id
+          // is the engine's per-run node counter (a plain string).
+          params: { id: Workflow.RunID, agentId: Schema.String },
+          query: WorkspaceRoutingQuery,
+          // 200 + the run snapshot once the skip request is recorded. A run not
+          // known to this workspace is a 404; a run that is not live, an unknown
+          // agent id, a question node, or a non-running node is a 409 (there is
+          // nothing skippable).
+          success: described(Workflow.Run, "Workflow run after requesting the skip"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.skip",
+            summary: "Skip workflow agent step",
+            description:
+              "Skip one in-flight agent step of a live workflow run; the step's ctx.agent call resolves null and the run continues.",
           }),
         ),
         HttpApiEndpoint.post("answer", WorkflowPaths.answer, {

@@ -19,6 +19,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { Global } from "@opencode-ai/core/global"
+import { spawnSync } from "child_process"
 import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -175,6 +176,12 @@ function seedCompletedRow(id: string, directory: string) {
             started_at: now,
             completed_at: now,
             phase: "run",
+            // Item 16: the per-call display label must survive the DB→fromRow
+            // roundtrip like the rest of the node's telemetry.
+            label: "seeded label",
+            // Item 7: the isolated-worktree location must survive the roundtrip
+            // so a preserved worktree stays inspectable.
+            worktree: "/tmp/oc-wf-seeded",
             prompt: "do the thing",
             output: "did the thing",
             // Fund 51: per-agent telemetry (cost USD + tokens incl. `total`) must
@@ -278,6 +285,134 @@ export async function run(args, ctx) {
   ctx.setPhase("verify")
   await ctx.agent({ prompt: "hi" })
   await ctx.agent({ prompt: "hi", model: "other/explicit" })
+  return { ok: true }
+}
+`
+
+// Item 16 (a): a per-call `phase` pins the step's node to that phase regardless
+// of where setPhase has moved the run's current phase in the meantime — the
+// deterministic core of the parallel/pipeline race the option closes.
+const PERCALL_PHASE_FIXTURE = "percall-phase"
+const PERCALL_PHASE_WORKFLOW = `export const meta = { name: "${PERCALL_PHASE_FIXTURE}", phases: ["a", "b"] }
+export async function run(args, ctx) {
+  ctx.setPhase("a")
+  ctx.setPhase("b")
+  await ctx.agent({ prompt: "pinned", phase: "a" })
+  await ctx.agent({ prompt: "unpinned" })
+  return { ok: true }
+}
+`
+
+// Item 16 (b): a per-call phase that is DECLARED with a model resolves that model
+// as the call's default; an explicit model still wins; and a per-call phase
+// WITHOUT a declared model never inherits the global current phase's model.
+const PERCALL_PHASE_MODEL_FIXTURE = "percall-phase-model"
+const PERCALL_PHASE_MODEL_WORKFLOW = `export const meta = {
+  name: "${PERCALL_PHASE_MODEL_FIXTURE}",
+  phases: ["x", { title: "y", model: "stub/mini" }]
+}
+export async function run(args, ctx) {
+  await ctx.agent({ prompt: "a", phase: "y" })
+  await ctx.agent({ prompt: "b", phase: "y", model: "other/explicit" })
+  ctx.setPhase("y")
+  await ctx.agent({ prompt: "c", phase: "x" })
+  return { ok: true }
+}
+`
+
+// Item 16 (c): `label` is a per-call display name persisted on the agent node.
+const LABEL_FIXTURE = "label-step"
+const LABEL_WORKFLOW = `export const meta = { name: "${LABEL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "hi", label: "Find the bug" })
+  return { ok: true }
+}
+`
+
+// Item 16 (d): a nested ctx.workflow child's per-call phase is logPrefix-ed
+// exactly like its setPhase would be.
+const PERCALL_CHILD_FIXTURE = "percall-child"
+const PERCALL_CHILD_WORKFLOW = `export const meta = { name: "${PERCALL_CHILD_FIXTURE}", phases: ["p"] }
+export async function run(args, ctx) {
+  await ctx.agent({ prompt: "child step", phase: "p" })
+  return { ok: true }
+}
+`
+const PERCALL_PARENT_FIXTURE = "percall-parent"
+const PERCALL_PARENT_WORKFLOW = `export const meta = { name: "${PERCALL_PARENT_FIXTURE}", description: "pp" }
+export async function run(_a, ctx) {
+  return await ctx.workflow("${PERCALL_CHILD_FIXTURE}", {})
+}
+`
+
+// Item 12 fixtures: model inheritance from the caller session. A DEFAULT-agent
+// step (no `agent:` override) with no explicit/phase model resolves to the
+// run's caller_model; an explicitly chosen agent does NOT inherit it.
+const CALLER_MODEL_FIXTURE = "caller-model"
+const CALLER_MODEL_WORKFLOW = `export const meta = { name: "${CALLER_MODEL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "default-step" })
+  await ctx.agent({ prompt: "explicit-agent-step", agent: "general" })
+  return { ok: true }
+}
+`
+// A declared phase model must still WIN over the caller model (the new tier
+// sits between phase model and the agent's own model).
+const CALLER_PHASE_FIXTURE = "caller-phase-model"
+const CALLER_PHASE_WORKFLOW = `export const meta = {
+  name: "${CALLER_PHASE_FIXTURE}",
+  phases: [{ title: "verify", model: "stub/mini" }]
+}
+export async function run(args, ctx) {
+  ctx.setPhase("verify")
+  await ctx.agent({ prompt: "hi" })
+  return { ok: true }
+}
+`
+
+// Item 15 fixtures: a human skip resolves the in-flight ctx.agent call to null.
+const SKIP_FIXTURE = "skip-step"
+const SKIP_WORKFLOW = `export const meta = { name: "${SKIP_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.agent({ prompt: "hang" })
+  return { skipped: r === null }
+}
+`
+
+// Item 15 (pre-dispatch skip): args.count parallel agent steps. With count =
+// run-concurrency-cap + 1 the LAST step's node exists while its dispatch still
+// waits for a semaphore permit — the deterministic window for a skip that lands
+// BEFORE the step's prompt dispatches.
+const SKIP_PARALLEL_FIXTURE = "skip-parallel"
+const SKIP_PARALLEL_WORKFLOW = `export const meta = { name: "${SKIP_PARALLEL_FIXTURE}", phases: ["run"], arguments: { count: { type: "number" } } }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const tasks = []
+  for (let i = 0; i < args.count; i++) tasks.push(() => ctx.agent({ prompt: "hang " + i }))
+  const results = await ctx.parallel(tasks)
+  return { allNull: results.every((r) => r === null) }
+}
+`
+
+// Item 15 (onError:"null"): a failing step resolves null; the body branches.
+const ONERROR_NULL_FIXTURE = "onerror-null"
+const ONERROR_NULL_WORKFLOW = `export const meta = { name: "${ONERROR_NULL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.agent({ prompt: "boom", onError: "null" })
+  return { isNull: r === null }
+}
+`
+
+// Item 15 (budget carve-out): onError:"null" must NOT swallow budget exhaustion.
+const ONERROR_BUDGET_FIXTURE = "onerror-budget"
+const ONERROR_BUDGET_WORKFLOW = `export const meta = { name: "${ONERROR_BUDGET_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.agent({ prompt: "gated", onError: "null" })
   return { ok: true }
 }
 `
@@ -581,6 +716,36 @@ function directoryCapturingPromptOps() {
     cancel: () => Effect.void,
   }
   return { ops, inputs, directories, wasGitWorktree, modes }
+}
+
+// Item 15: prompt-ops whose agent prompts FAIL (the noReply start banner still
+// succeeds so the run gets going). Drives the onError:"null" settlement.
+function failingPromptOps() {
+  const ops: Workflow.PromptOps = {
+    prompt: (input) => (input.noReply ? Effect.succeed(assistantReply()) : Effect.fail(new Error("boom"))),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
+// Item 7: like directoryCapturingPromptOps, but each real dispatch ALSO writes
+// an (uncommitted) file into the effective directory — making an isolated
+// worktree DIRTY so the run finalizer must preserve it instead of removing it.
+function dirtyingPromptOps() {
+  const directories: string[] = []
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (!input.noReply) {
+          const dir = yield* InstanceState.directory
+          directories.push(dir)
+          yield* Effect.promise(() => fs.writeFile(path.join(dir, "UNCOMMITTED.txt"), "dirty"))
+        }
+        return assistantReply()
+      }),
+    cancel: () => Effect.void,
+  }
+  return { ops, directories }
 }
 
 // N11-Fixture: Der Body startet einen Agenten OHNE ihn zu awaiten (fire-and-
@@ -1194,6 +1359,25 @@ function costPromptOps(db: Database.Interface["db"], cost: number) {
   return ops
 }
 
+// Item 17: prompt-ops whose telemetry carries TOKENS (with deliberately non-zero
+// input/cache numbers, which must NOT count toward the token budget — only
+// output + reasoning do). Cost stays 0 so the USD path is provably untouched.
+// (Distinct from the aliasing-test `tokensPromptOps` above, which pins a fixed
+// token shape — this one parameterizes the budget-relevant output/reasoning.)
+function tokenBudgetPromptOps(db: Database.Interface["db"], output: number, reasoning = 0) {
+  const ops: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+    prompt: (input) =>
+      Effect.gen(function* () {
+        if (input.noReply) return assistantReply()
+        return yield* persistTurns(db, input.sessionID, [
+          { cost: 0, tokens: { input: 11, output, reasoning, cache: { read: 7, write: 3 } } },
+        ])
+      }),
+    cancel: () => Effect.void,
+  }
+  return ops
+}
+
 // Finding 2 fake: an externally-aborted subagent. The prompt RESOLVES (does not
 // reject) with an abort-marked assistant message that ALSO carries a real cost —
 // exactly what the production runner returns when a child session is aborted out
@@ -1368,6 +1552,36 @@ const BUDGET_API_UNLIMITED_WORKFLOW = `export const meta = { name: "${BUDGET_API
 export async function run(args, ctx) {
   ctx.setPhase("run")
   return { total: ctx.budget.total, remainingFinite: Number.isFinite(ctx.budget.remaining()) }
+}
+`
+
+// Item 17: ctx.budget token trio MIT Token-Budget — liest tokensTotal/
+// tokensSpent()/tokensRemaining() vor und nach einem Agent-Step, damit der Test
+// die Live-Verbuchung (output+reasoning, NICHT input/cache) beobachten kann.
+const TOKEN_API_FIXTURE = "token-budget-api"
+const TOKEN_API_WORKFLOW = `export const meta = { name: "${TOKEN_API_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const beforeSpent = ctx.budget.tokensSpent()
+  const beforeRemaining = ctx.budget.tokensRemaining()
+  await ctx.agent({ prompt: "spend tokens" })
+  return {
+    total: ctx.budget.tokensTotal,
+    beforeSpent,
+    beforeRemaining,
+    afterSpent: ctx.budget.tokensSpent(),
+    afterRemaining: ctx.budget.tokensRemaining(),
+  }
+}
+`
+
+// Item 17: ohne Token-Budget ist tokensTotal null und tokensRemaining()
+// Infinity (nicht endlich; Boolean wegen JSON).
+const TOKEN_API_UNLIMITED_FIXTURE = "token-budget-unlimited"
+const TOKEN_API_UNLIMITED_WORKFLOW = `export const meta = { name: "${TOKEN_API_UNLIMITED_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  return { tokensTotal: ctx.budget.tokensTotal, remainingFinite: Number.isFinite(ctx.budget.tokensRemaining()) }
 }
 `
 
@@ -3699,6 +3913,155 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       const result = done.run?.result as { total: number | null; remainingFinite: boolean }
       expect(result.total).toBe(null)
       expect(result.remainingFinite).toBe(false)
+    }),
+  )
+
+  // Item 17: budget {tokens} gates the next step once the accumulated
+  // output+reasoning tokens reach the cap — same two-step shape as the USD gate.
+  it.instance("a token budget gates the next step once exhausted", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_FIXTURE, BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      // Step 1 spends exactly the cap (40 output + 10 reasoning = 50) ⇒ step 2
+      // must be refused at the token gate.
+      const run = yield* workflow.start({
+        name: BUDGET_FIXTURE,
+        args: {},
+        prompt: tokenBudgetPromptOps(db, 40, 10),
+        budget: { tokens: 50 },
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("failed")
+      expect(done.run?.error ?? "").toMatch(/token budget exhausted/i)
+      // Step one really completed; step two was REFUSED at the gate (the throw
+      // happens before node creation, exactly like the USD gate).
+      const one = done.run?.agents.find((a) => a.prompt === "step one")
+      expect(one?.status).toBe("completed")
+      expect(done.run?.agents.length).toBe(1)
+    }),
+  )
+
+  // Item 17: ctx.budget's token trio reads live across steps; only
+  // output+reasoning count (the fake carries non-zero input/cache tokens).
+  it.instance("ctx.budget exposes tokensTotal/tokensSpent()/tokensRemaining() live across steps", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, TOKEN_API_FIXTURE, TOKEN_API_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const run = yield* workflow.start({
+        name: TOKEN_API_FIXTURE,
+        args: {},
+        prompt: tokenBudgetPromptOps(db, 30, 20),
+        budget: { tokens: 100 },
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as {
+        total: number
+        beforeSpent: number
+        beforeRemaining: number
+        afterSpent: number
+        afterRemaining: number
+      }
+      expect(result.total).toBe(100)
+      expect(result.beforeSpent).toBe(0)
+      expect(result.beforeRemaining).toBe(100)
+      // 30 output + 20 reasoning = 50; input (11) and cache (7/3) do NOT count.
+      expect(result.afterSpent).toBe(50)
+      expect(result.afterRemaining).toBe(50)
+    }),
+  )
+
+  // Item 17: without a token budget, tokensTotal is null and tokensRemaining()
+  // is Infinity — mirroring the USD trio's unlimited shape.
+  it.instance("ctx.budget.tokensTotal is null and tokensRemaining() is Infinity without a token budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, TOKEN_API_UNLIMITED_FIXTURE, TOKEN_API_UNLIMITED_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const run = yield* workflow.start({ name: TOKEN_API_UNLIMITED_FIXTURE, args: {} })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      const result = done.run?.result as { tokensTotal: number | null; remainingFinite: boolean }
+      expect(result.tokensTotal).toBe(null)
+      expect(result.remainingFinite).toBe(false)
+    }),
+  )
+
+  // Item 17 (back-compat pin): the struct form {usd} behaves exactly like the
+  // naked-number budget (which the existing USD tests keep pinning).
+  it.instance("budget {usd} behaves like the naked-number USD budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_FIXTURE, BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const run = yield* workflow.start({
+        name: BUDGET_FIXTURE,
+        args: {},
+        prompt: costPromptOps(db, 2),
+        budget: { usd: 1 },
+      })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("failed")
+      expect(done.run?.error ?? "").toMatch(/budget exhausted.*USD/i)
+    }),
+  )
+
+  // Item 17: a resume's journal REPLAYS charge their token cost too (node.tokens
+  // is copied on the cache hit and settled like a live step), so a tight token
+  // budget gates a later step even when the earlier one never re-prompted.
+  it.instance("a resume charges replayed token cost against the token budget", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_FIXTURE, BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // First run: both steps complete, 30 output tokens each.
+      const first = yield* workflow.start({ name: BUDGET_FIXTURE, args: {}, prompt: tokenBudgetPromptOps(db, 30) })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      // completed → paused so it is a legitimate resume source (journal kept).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
+      // Resume with tokens:30 — step one REPLAYS (no prompt) but charges its 30
+      // journal tokens, so step two trips the token gate.
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: BUDGET_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        budget: { tokens: 30 },
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/token budget exhausted/i)
+      // Step one was never re-prompted — it came from the journal.
+      expect(prompted).not.toContain("step one")
+      const one = done.agents.find((a) => a.prompt === "step one")
+      expect(one?.cached).toBe(true)
     }),
   )
 
@@ -6108,9 +6471,7 @@ export async function run(args, ctx) {
       expect(inputs.length).toBe(1)
       const textPart = inputs[0]?.parts.find((p) => p.type === "text")
       const text = textPart?.type === "text" ? textPart.text : ""
-      expect(text).toBe(
-        `${Workflow.STEP_FRAMING_DIRECTIVE}\n\nLoad these skills before starting: pdf, xlsx.\n\ndo it`,
-      )
+      expect(text).toBe(`${Workflow.STEP_FRAMING_DIRECTIVE}\n\nLoad these skills before starting: pdf, xlsx.\n\ndo it`)
     }),
   )
 
@@ -6347,6 +6708,112 @@ export async function run(args, ctx) {
       } finally {
         yield* Effect.promise(() => fs.rm(stale, { recursive: true, force: true }).catch(() => {}))
         yield* Effect.promise(() => fs.rm(fresh, { recursive: true, force: true }).catch(() => {}))
+      }
+    }).pipe(Effect.provide(testInstanceStoreLayer)),
+  )
+
+  // Item 7: an isolated worktree with UNCOMMITTED changes is PRESERVED at run
+  // end (git registration intact), the preserve is logged with the path, and
+  // the node records its work location (`worktree`).
+  it.instance(
+    "a dirty isolated worktree survives the run",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, ISOLATION_FIXTURE, ISOLATION_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, directories } = dirtyingPromptOps()
+
+        const started = yield* workflow.start({ name: ISOLATION_FIXTURE, args: {}, prompt: ops })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("isolation workflow did not finish")))
+        expect(done.status).toBe("completed")
+        const worktree = directories[0]!
+        expect(worktree).toBeDefined()
+        // The node records where the step worked (Item 7).
+        expect(done.agents[0]?.worktree).toBe(worktree)
+
+        try {
+          // The preserve runs in the run-scope finalizer (async relative to
+          // wait()); poll the persisted run for the preserve log.
+          const preserved = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const current = yield* workflow.get(started.id)
+              return current?.logs.some((l) => l.message.includes("worktree preserved at")) ? current : undefined
+            }),
+            "preserve log never appeared on the run",
+          )
+          const log = preserved.logs.find((l) => l.message.includes("worktree preserved at"))
+          expect(log?.message).toContain(worktree)
+          expect(log?.message).toContain("uncommitted changes")
+          // The worktree (with the uncommitted file) is still on disk…
+          const file = yield* Effect.promise(() =>
+            fs.readFile(path.join(worktree, "UNCOMMITTED.txt"), "utf8").catch(() => undefined),
+          )
+          expect(file).toBe("dirty")
+          // …and carries the sweep-skip marker.
+          const marker = yield* Effect.promise(() =>
+            fs
+              .stat(path.join(worktree, ".oc-wf-preserved"))
+              .then(() => true)
+              .catch(() => false),
+          )
+          expect(marker).toBe(true)
+        } finally {
+          // Cleanup: detach + remove the deliberately preserved worktree.
+          yield* Effect.promise(async () => {
+            spawnSync("git", ["worktree", "remove", "--force", worktree], { cwd: test.directory })
+            await fs.rm(worktree, { recursive: true, force: true }).catch(() => {})
+            spawnSync("git", ["worktree", "prune"], { cwd: test.directory })
+          })
+        }
+      }),
+    { git: true },
+  )
+
+  // Item 7 (sweep protection): the startup worktree sweep must skip BOTH a
+  // marker-carrying preserved worktree and (fallback) a marker-less but DIRTY
+  // git worktree, while still reclaiming a plain aged leak.
+  it.live("sweepWorktrees skips preserved and dirty worktrees but reclaims plain leaks", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      const tmp = os.tmpdir()
+      const old = Date.now() - 3 * 60 * 60 * 1000
+      const age = (dir: string) => Effect.promise(() => fs.utimes(dir, old / 1000, old / 1000))
+
+      // (a) An aged dir WITH the preserve marker — must survive.
+      const preserved = yield* Effect.promise(() => fs.mkdtemp(path.join(tmp, "oc-wf-")))
+      yield* Effect.promise(() => fs.writeFile(path.join(preserved, ".oc-wf-preserved"), ""))
+      // (b) An aged REAL worktree, marker-less but dirty — fallback skip.
+      const dirty = yield* Effect.promise(() => fs.mkdtemp(path.join(tmp, "oc-wf-")))
+      spawnSync("git", ["worktree", "add", "--detach", dirty], { cwd: directory })
+      yield* Effect.promise(() => fs.writeFile(path.join(dirty, "WORK.txt"), "in flight"))
+      // (c) An aged plain (non-git) leak — must be reclaimed as before.
+      const leak = yield* Effect.promise(() => fs.mkdtemp(path.join(tmp, "oc-wf-")))
+      yield* age(preserved)
+      yield* age(dirty)
+      yield* age(leak)
+
+      try {
+        yield* Effect.promise(() => Workflow.__testHooks.sweepWorktrees(directory))
+        const exists = (dir: string) =>
+          Effect.promise(() =>
+            fs
+              .stat(dir)
+              .then(() => true)
+              .catch(() => false),
+          )
+        expect(yield* exists(preserved)).toBe(true)
+        expect(yield* exists(dirty)).toBe(true)
+        expect(yield* exists(leak)).toBe(false)
+      } finally {
+        yield* Effect.promise(async () => {
+          spawnSync("git", ["worktree", "remove", "--force", dirty], { cwd: directory })
+          for (const dir of [preserved, dirty, leak]) {
+            await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
+          }
+          spawnSync("git", ["worktree", "prune"], { cwd: directory })
+        })
       }
     }).pipe(Effect.provide(testInstanceStoreLayer)),
   )
@@ -6635,6 +7102,410 @@ export async function run(args, ctx) {
       expect(String(inputs[0]?.model?.modelID)).toBe("mini")
       expect(String(inputs[1]?.model?.providerID)).toBe("other")
       expect(String(inputs[1]?.model?.modelID)).toBe("explicit")
+    }),
+  )
+
+  // Item 16 (a): a per-call `phase` pins the node to that phase even after
+  // setPhase has moved the run's current phase — closing the parallel/pipeline
+  // race window deterministically (the sequential setPhase("b") stands in for
+  // the concurrent phase move).
+  it.instance("a per-call phase pins the agent node to that phase", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PERCALL_PHASE_FIXTURE, PERCALL_PHASE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: PERCALL_PHASE_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("percall-phase workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(done.agents.length).toBe(2)
+      // The pinned step carries its per-call phase, not the moved current phase…
+      expect(done.agents[0]?.phase).toBe("a")
+      // …while an unpinned step still snapshots current_phase as before.
+      expect(done.agents[1]?.phase).toBe("b")
+    }),
+  )
+
+  // Item 16 (b): a per-call phase resolves ITS declared default model (explicit
+  // model still wins), never the global current phase's model — and it has no
+  // setPhase side effect on the run.
+  it.instance("a per-call phase resolves the declared phase default model without moving the run phase", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        writeWorkflow(test.directory, PERCALL_PHASE_MODEL_FIXTURE, PERCALL_PHASE_MODEL_WORKFLOW),
+      )
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({ name: PERCALL_PHASE_MODEL_FIXTURE, args: {}, prompt: ops })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("percall-phase-model workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(inputs.length).toBe(3)
+      // Call 1: phase "y" is declared with stub/mini → that model is the default.
+      expect(String(inputs[0]?.model?.providerID)).toBe("stub")
+      expect(String(inputs[0]?.model?.modelID)).toBe("mini")
+      // Call 2: an explicit model wins over the per-call phase default.
+      expect(String(inputs[1]?.model?.providerID)).toBe("other")
+      expect(String(inputs[1]?.model?.modelID)).toBe("explicit")
+      // Call 3: pinned to "x" (no declared model) while the GLOBAL phase is "y"
+      // (model stub/mini) — the per-call phase must NOT inherit the global
+      // phase's model.
+      expect(inputs[2]?.model).toBeUndefined()
+      // The first two calls never moved the run's phase (no setPhase side
+      // effect); only the explicit setPhase("y") did.
+      expect(done.current_phase).toBe("y")
+      expect(done.agents[0]?.phase).toBe("y")
+      expect(done.agents[2]?.phase).toBe("x")
+    }),
+  )
+
+  // Item 16 (c): `label` is persisted on the agent node and survives the
+  // DB→fromRow roundtrip.
+  it.instance("a per-call label is persisted on the agent node and round-trips through fromRow", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, LABEL_FIXTURE, LABEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: LABEL_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("label workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(done.agents[0]?.label).toBe("Find the bug")
+
+      // DB roundtrip (seedCompletedRow-style): a seeded row's agent label comes
+      // back through DB→fromRow.
+      const persistedId = Workflow.RunID.make("job_label_roundtrip")
+      yield* seedCompletedRow(persistedId, test.directory)
+      const persisted = (yield* workflow.get(persistedId)) ?? (yield* Effect.fail(new Error("seeded run not readable")))
+      expect(persisted.agents[0]?.label).toBe("seeded label")
+      // Item 7: the isolated-worktree location survives the roundtrip too.
+      expect(persisted.agents[0]?.worktree).toBe("/tmp/oc-wf-seeded")
+    }),
+  )
+
+  // Item 16 (d): a nested ctx.workflow child's per-call phase is prefixed with
+  // the child's logPrefix, consistent with its setPhase.
+  it.instance("a nested child's per-call phase is prefixed with the child name", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PERCALL_CHILD_FIXTURE, PERCALL_CHILD_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, PERCALL_PARENT_FIXTURE, PERCALL_PARENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const started = yield* workflow.start({ name: PERCALL_PARENT_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("percall-parent workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(done.agents.length).toBe(1)
+      expect(done.agents[0]?.phase).toBe(`${PERCALL_CHILD_FIXTURE}: p`)
+    }),
+  )
+
+  // Item 16 (e): a per-call phase is resume-stable — the journal keys on
+  // node.phase, which carries the per-call phase on both the seed and the live
+  // lookup side, so a resumed run replays the pinned step instead of re-prompting.
+  it.instance("a per-call phase step replays from the journal on resume", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PERCALL_PHASE_FIXTURE, PERCALL_PHASE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: PERCALL_PHASE_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      expect(firstOps.prompted.length).toBe(2)
+
+      // completed → paused so it is a legitimate resume source (journal kept).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          yield* db
+            .update(WorkflowRunTable)
+            .set({ status: "paused" })
+            .where(eq(WorkflowRunTable.id, first.id))
+            .run()
+            .pipe(Effect.orDie)
+          const current = yield* workflow.get(first.id)
+          return current?.status === "paused" ? current : undefined
+        }),
+        "source run never became paused",
+      )
+
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: PERCALL_PHASE_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ??
+        (yield* Effect.fail(new Error("percall-phase resume did not finish")))
+      expect(done.status).toBe("completed")
+      // Both steps — the pinned and the unpinned one — replayed from the journal.
+      expect(prompted).toHaveLength(0)
+      expect(done.agents.every((agent) => agent.cached === true)).toBe(true)
+    }),
+  )
+
+  // Item 12: a run started with caller_model resolves a DEFAULT-agent step (no
+  // explicit/phase model) to the caller session's model; an explicitly chosen
+  // agent keeps its own model resolution (no inheritance).
+  it.instance("caller_model resolves a default-agent step; an explicit agent does not inherit it", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, CALLER_MODEL_FIXTURE, CALLER_MODEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({
+        name: CALLER_MODEL_FIXTURE,
+        args: {},
+        prompt: ops,
+        caller_model: { providerID: "stub", modelID: "caller" },
+      })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("caller-model workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(inputs.length).toBe(2)
+      // The default-agent step inherited the caller session's model…
+      expect(String(inputs[0]?.model?.providerID)).toBe("stub")
+      expect(String(inputs[0]?.model?.modelID)).toBe("caller")
+      // …while the explicitly-chosen agent kept its own model resolution (the
+      // "general" agent declares no model, so nothing is dispatched).
+      expect(inputs[1]?.model).toBeUndefined()
+    }),
+  )
+
+  // Item 12: precedence — a declared phase default model still wins over the
+  // caller model (the inheritance tier sits BELOW phase model).
+  it.instance("a phase default model wins over caller_model", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, CALLER_PHASE_FIXTURE, CALLER_PHASE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+
+      const started = yield* workflow.start({
+        name: CALLER_PHASE_FIXTURE,
+        args: {},
+        prompt: ops,
+        caller_model: { providerID: "stub", modelID: "caller" },
+      })
+      const waited = yield* workflow.wait({ id: started.id })
+      const done = waited.run ?? (yield* Effect.fail(new Error("caller-phase workflow did not finish")))
+      expect(done.status).toBe("completed")
+      expect(inputs.length).toBe(1)
+      expect(String(inputs[0]?.model?.providerID)).toBe("stub")
+      expect(String(inputs[0]?.model?.modelID)).toBe("mini")
+    }),
+  )
+
+  // Item 15: skipping an IN-FLIGHT agent step resolves its ctx.agent call to
+  // null, marks the node `skipped` (no budget charge), and the run continues.
+  it.instance("skipAgent resolves the in-flight agent call to null and the run continues", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SKIP_FIXTURE, SKIP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops } = resolveOnAbortPromptOps()
+
+      const run = yield* workflow.start({ name: SKIP_FIXTURE, args: {}, prompt: ops })
+      // Wait until the step is genuinely in flight (session registered).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          const node = current?.agents[0]
+          return node?.status === "running" && node.session_id ? current : undefined
+        }),
+        "agent node never started",
+      )
+      const snap = yield* workflow.skipAgent({ id: run.id, agentId: "1" })
+      expect(snap?.id).toBe(run.id)
+
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("run did not finish")))
+      expect(done.status).toBe("completed")
+      // The body observed null for the skipped step…
+      expect(done.result).toEqual({ skipped: true })
+      // …and the node settled as `skipped` with no charge (the abort artifact
+      // carries no real spend; the ensuring skips the charge for aborted steps).
+      expect(done.agents[0]?.status).toBe("skipped")
+      expect(done.agents[0]?.cost ?? 0).toBe(0)
+    }),
+  )
+
+  // Item 15: a skip that lands BEFORE the step's prompt dispatches (its node
+  // exists, its dispatch still waits for a run-semaphore permit) resolves the
+  // step without ever prompting. Deterministic via semaphore saturation: cap+1
+  // parallel steps, the (cap+1)-th waits while the first cap hang in prompts.
+  it.instance(
+    "a skip that lands before the step dispatches resolves it without ever prompting",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        // The lifetime-cap tests above leak their tiny agentLimit override (the
+        // seam is module-global, captured per run at start). This test dispatches
+        // cap+1 agents, so restore the production default for OUR run first.
+        Workflow.__testHooks.agentLimit(1_000)
+        // The engine's run-wide concurrency cap (agentConcurrencyCap) — kept in
+        // sync by the poll below, which REQUIRES exactly `cap` dispatched
+        // sessions and one undisptached node before proceeding.
+        const cap = Math.min(16, Math.max(2, os.cpus().length - 2))
+        yield* Effect.promise(() => writeWorkflow(test.directory, SKIP_PARALLEL_FIXTURE, SKIP_PARALLEL_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, started } = resolveOnAbortPromptOps()
+
+        const run = yield* workflow.start({
+          name: SKIP_PARALLEL_FIXTURE,
+          args: { count: cap + 1 },
+          prompt: ops,
+        })
+        // All cap+1 nodes exist; exactly cap are dispatched (session registered);
+        // one still waits for a permit. Generous bound: under full-suite load,
+        // creating `cap` child sessions (up to 16) can take a while — the
+        // saturation itself is deterministic.
+        const saturated = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const current = yield* workflow.get(run.id)
+            if (!current || current.agents.length !== cap + 1) return undefined
+            const dispatched = current.agents.filter((a) => a.session_id).length
+            const pending = current.agents.find((a) => a.status === "running" && !a.session_id)
+            return dispatched === cap && pending ? { pendingId: pending.id } : undefined
+          }),
+          "saturated batch never materialized",
+          "45 seconds",
+        )
+        // Skip the not-yet-dispatched node FIRST (nothing to abort yet)…
+        yield* workflow.skipAgent({ id: run.id, agentId: saturated.pendingId })
+        // …then skip the in-flight steps so permits free up and the run settles.
+        const live = yield* workflow.get(run.id)
+        for (const node of live?.agents ?? []) {
+          if (node.id === saturated.pendingId) continue
+          yield* workflow.skipAgent({ id: run.id, agentId: node.id }).pipe(Effect.ignore)
+        }
+
+        const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("run did not finish")))
+        expect(done.status).toBe("completed")
+        expect(done.result).toEqual({ allNull: true })
+        const skippedEarly = done.agents.find((a) => a.id === saturated.pendingId)
+        expect(skippedEarly?.status).toBe("skipped")
+        // The pre-dispatch skip never prompted: only the cap in-flight steps did.
+        expect(started.size).toBe(cap)
+      }),
+    90_000,
+  )
+
+  // Item 15: skipAgent's rejection matrix — completed node, unknown agent id,
+  // unknown run id, and a persisted (non-live) run.
+  it.instance("skipAgent rejects completed nodes, unknown agents, and non-live runs", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, AGENT_THEN_HANG_FIXTURE, AGENT_THEN_HANG_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      // Live run whose single agent node already COMPLETED (body still hanging).
+      const run = yield* workflow.start({ name: AGENT_THEN_HANG_FIXTURE, args: {}, prompt: immediatePromptOps() })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* workflow.get(run.id)
+          return current?.agents[0]?.status === "completed" ? current : undefined
+        }),
+        "agent node never completed",
+      )
+      const exitCompleted = yield* Effect.exit(workflow.skipAgent({ id: run.id, agentId: "1" }))
+      expect(Exit.isFailure(exitCompleted)).toBe(true)
+      expect(Exit.isFailure(exitCompleted) ? Cause.pretty(exitCompleted.cause) : "").toContain("is not running")
+
+      const exitUnknownAgent = yield* Effect.exit(workflow.skipAgent({ id: run.id, agentId: "99" }))
+      expect(Exit.isFailure(exitUnknownAgent)).toBe(true)
+      expect(Exit.isFailure(exitUnknownAgent) ? Cause.pretty(exitUnknownAgent.cause) : "").toContain("not found")
+
+      // Unknown run id → undefined (HTTP 404).
+      const unknown = yield* workflow.skipAgent({
+        id: Workflow.RunID.make("job_skip_unknown"),
+        agentId: "1",
+      })
+      expect(unknown).toBeUndefined()
+
+      // A persisted run without a live registry entry has nothing to skip → 409.
+      const persistedId = Workflow.RunID.make("job_skip_notlive")
+      yield* seedCompletedRow(persistedId, test.directory)
+      const exitNotLive = yield* Effect.exit(workflow.skipAgent({ id: persistedId, agentId: "1" }))
+      expect(Exit.isFailure(exitNotLive)).toBe(true)
+      expect(Exit.isFailure(exitNotLive) ? Cause.pretty(exitNotLive.cause) : "").toContain("is not live")
+
+      // Cleanup: stop the hanging body.
+      yield* workflow.cancel(run.id)
+    }),
+  )
+
+  // Item 15 (onError:"null"): a failing step resolves null so the body can
+  // branch; its node still records the failure.
+  it.instance("onError:null resolves a failing agent to null while the node stays failed", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, ONERROR_NULL_FIXTURE, ONERROR_NULL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const run = yield* workflow.start({ name: ONERROR_NULL_FIXTURE, args: {}, prompt: failingPromptOps() })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("run did not finish")))
+      expect(done.status).toBe("completed")
+      expect(done.result).toEqual({ isNull: true })
+      expect(done.agents[0]?.status).toBe("failed")
+      expect(done.agents[0]?.error ?? "").toContain("boom")
+    }),
+  )
+
+  // Item 15: budget exhaustion is NEVER swallowed by onError:"null" — otherwise
+  // a while-loop with onError:null would spin forever against an exhausted cap.
+  it.instance("onError:null does NOT swallow budget exhaustion", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, ONERROR_BUDGET_FIXTURE, ONERROR_BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+
+      const run = yield* workflow.start({
+        name: ONERROR_BUDGET_FIXTURE,
+        args: {},
+        prompt: immediatePromptOps(),
+        budget: 0,
+      })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("run did not finish")))
+      expect(done.status).toBe("failed")
+      expect(done.error ?? "").toMatch(/budget exhausted/i)
+    }),
+  )
+
+  // Item 15: a `skipped` node survives the DB→fromRow roundtrip.
+  it.instance("a skipped agent node round-trips through fromRow", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const id = Workflow.RunID.make("job_skipped_roundtrip")
+      const now = Date.now()
+      yield* db
+        .insert(WorkflowRunTable)
+        .values({
+          id,
+          workflow: HELLO_FIXTURE,
+          status: "completed",
+          started_at: now,
+          completed_at: now,
+          directory: test.directory,
+          logs: [],
+          agents: [{ id: "1", status: "skipped", started_at: now, completed_at: now, prompt: "skipped step" }],
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const persisted = (yield* workflow.get(id)) ?? (yield* Effect.fail(new Error("seeded run not readable")))
+      expect(persisted.agents[0]?.status).toBe("skipped")
     }),
   )
 

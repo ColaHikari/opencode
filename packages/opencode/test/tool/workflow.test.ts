@@ -65,9 +65,7 @@ async function writeWorkflow(dir: string, name: string, source: string) {
 // (survives the tmpdir instance); sweep the per-run directory so test runs do
 // not accumulate artifacts there.
 function cleanupPersistedScript(runId: string) {
-  return Effect.promise(() =>
-    fs.rm(path.join(Global.Path.data, "workflow", runId), { recursive: true, force: true }),
-  )
+  return Effect.promise(() => fs.rm(path.join(Global.Path.data, "workflow", runId), { recursive: true, force: true }))
 }
 
 function requestRecorder() {
@@ -468,7 +466,10 @@ export async function run(args, ctx) { return { ok: true } }
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
         // Project-RELATIVE path: resolved against the project root, like create.
-        const result = yield* tool.execute({ action: "start", script_path: path.join("scratch", "wf.ts") }, recorder.ctx)
+        const result = yield* tool.execute(
+          { action: "start", script_path: path.join("scratch", "wf.ts") },
+          recorder.ctx,
+        )
         const workflowAsk = recorder.requests.find((req) => req.permission === "workflow")
         expect(workflowAsk).toBeDefined()
         expect(workflowAsk!.patterns).toEqual(["Scripted"])
@@ -542,7 +543,10 @@ export async function run() { return "ok" }
       Effect.gen(function* () {
         const file = path.join(dir, "iter.ts")
         yield* Effect.promise(() =>
-          Bun.write(file, `export const meta = { name: "Iter" }\nexport async function run() { return "first-result" }\n`),
+          Bun.write(
+            file,
+            `export const meta = { name: "Iter" }\nexport async function run() { return "first-result" }\n`,
+          ),
         )
         const tool = yield* workflowTool()
         const recorder = requestRecorder()
@@ -550,7 +554,10 @@ export async function run() { return "ok" }
         expect(first.output).toContain("first-result")
 
         yield* Effect.promise(() =>
-          Bun.write(file, `export const meta = { name: "Iter" }\nexport async function run() { return "second-result" }\n`),
+          Bun.write(
+            file,
+            `export const meta = { name: "Iter" }\nexport async function run() { return "second-result" }\n`,
+          ),
         )
         const second = yield* tool.execute({ action: "start", script_path: file }, recorder.ctx)
         expect(second.output).toContain("second-result")
@@ -1426,6 +1433,223 @@ export async function run() {
     ),
   )
 
+  // Item 8: a DEFAULT start (no background/timeout) waits only the configured
+  // grace window, then switches the still-running run to the background and
+  // returns the enriched background result instead of blocking up to an hour.
+  it.live("foreground start switches to background after the grace window", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            writeWorkflow(
+              dir,
+              "pending",
+              `export const meta = { name: "Pending" }\nexport async function run() { await new Promise(() => {}) }\n`,
+            ),
+          )
+          const tool = yield* workflowTool()
+          const recorder = requestRecorder()
+          const started = yield* awaitWithTimeout(
+            tool.execute({ action: "start", name: "pending" }, recorder.ctx),
+            "default start did not switch to background after the grace window",
+            "5 seconds",
+          )
+          expect(started.metadata.background).toBe(true)
+          expect(started.metadata.jobId).toBeTruthy()
+          expect(started.metadata.timedOut).toBe(false)
+          expect(started.output).toContain("<session_id>")
+          expect(started.output).toContain('action="inspect"')
+          // Cleanup: stop the deliberately hanging run.
+          yield* tool.execute({ action: "cancel", run_id: started.metadata.runId as string }, recorder.ctx)
+        }),
+      { config: { workflows: { foreground_grace_ms: 200 } } },
+    ),
+  )
+
+  // Item 8: an explicit timeout opts into the old foreground wait and keeps its
+  // still-running contract (no background switch, wait instruction).
+  it.live("explicit timeout keeps the foreground still-running contract", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "pending",
+            `export const meta = { name: "Pending" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const started = yield* tool.execute({ action: "start", name: "pending", timeout: 100 }, recorder.ctx)
+        expect(started.metadata.background).toBe(false)
+        expect(started.metadata.timedOut).toBe(true)
+        expect(started.output).toContain('action="wait"')
+        // Cleanup: stop the deliberately hanging run.
+        yield* tool.execute({ action: "cancel", run_id: started.metadata.runId as string }, recorder.ctx)
+      }),
+    ),
+  )
+
+  // Item 8: background=false is the explicit opt-out — the tool keeps the long
+  // foreground wait and never auto-switches, even with a tiny configured grace.
+  it.live("background=false keeps the long foreground wait", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            writeWorkflow(
+              dir,
+              "pending",
+              `export const meta = { name: "Pending" }\nexport async function run() { await new Promise(() => {}) }\n`,
+            ),
+          )
+          const tool = yield* workflowTool()
+          const recorder = requestRecorder()
+          const controller = new AbortController()
+          const ctx: Tool.Context = { ...recorder.ctx, abort: controller.signal }
+          const fiber = yield* Effect.forkScoped(
+            tool.execute({ action: "start", name: "pending", background: false }, ctx),
+          )
+          // 5x the configured grace: a buggy auto-switch would have returned the
+          // tool call at ~100ms; the explicit opt-out must still be waiting.
+          const settled = yield* Effect.raceFirst(
+            Fiber.await(fiber).pipe(Effect.as(true)),
+            Effect.sleep("500 millis").pipe(Effect.as(false)),
+          )
+          expect(settled).toBe(false)
+          // Cleanup: abort the turn — the N10 race cancels the run and unblocks.
+          controller.abort()
+          yield* awaitWithTimeout(Fiber.await(fiber), "tool did not return after ctx.abort", "8 seconds")
+        }),
+      { config: { workflows: { foreground_grace_ms: 100 } } },
+    ),
+  )
+
+  // Item 12: a start through the tool captures the caller session's resolved
+  // model via promptOps.currentModel and threads it as caller_model — so a
+  // default-agent step's dispatched prompt carries the caller's model.
+  it.live("start threads the caller session's resolved model into default-agent steps", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "inherit",
+            `export const meta = { name: "Inherit" }
+export async function run(args, ctx) { await ctx.agent({ prompt: "inherit-step" }); return "ok" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const ctx: Tool.Context = {
+          ...recorder.ctx,
+          extra: {
+            promptOps: {
+              ...(recorder.ctx.extra!.promptOps as Record<string, unknown>),
+              currentModel: () => Effect.succeed({ providerID: "stub", modelID: "caller" }),
+            },
+          },
+        }
+        const result = yield* tool.execute({ action: "start", name: "inherit" }, ctx)
+        expect(result.output).toContain('state="completed"')
+        // The recorded agent dispatch (not the noReply start banner) carries the
+        // caller's model.
+        const dispatched = recorder.prompts.find((input) =>
+          input.parts?.some((part) => part.type === "text" && part.text.includes("inherit-step")),
+        )
+        expect(dispatched).toBeTruthy()
+        expect(String(dispatched?.model?.providerID)).toBe("stub")
+        expect(String(dispatched?.model?.modelID)).toBe("caller")
+      }),
+    ),
+  )
+
+  // Item 12: a failing currentModel lookup must never kill the start — the run
+  // merely loses the inheritance tier.
+  it.live("a failing currentModel lookup does not fail the start", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "inherit",
+            `export const meta = { name: "Inherit" }
+export async function run(args, ctx) { await ctx.agent({ prompt: "inherit-step" }); return "ok" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const ctx: Tool.Context = {
+          ...recorder.ctx,
+          extra: {
+            promptOps: {
+              ...(recorder.ctx.extra!.promptOps as Record<string, unknown>),
+              currentModel: () => Effect.fail(new Error("model lookup broke")),
+            },
+          },
+        }
+        const result = yield* tool.execute({ action: "start", name: "inherit" }, ctx)
+        expect(result.output).toContain('state="completed"')
+        const dispatched = recorder.prompts.find((input) =>
+          input.parts?.some((part) => part.type === "text" && part.text.includes("inherit-step")),
+        )
+        expect(dispatched?.model).toBeUndefined()
+      }),
+    ),
+  )
+
+  // Item 17: the budget_tokens parameter reaches the engine as a token cap —
+  // tokens:0 refuses the very first agent step (consistent with budget:0), so
+  // the foreground start surfaces the token-budget failure.
+  it.live("budget_tokens is forwarded as a token cap (0 refuses the first step)", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "stepper",
+            `export const meta = { name: "Stepper" }
+export async function run(args, ctx) { await ctx.agent({ prompt: "go" }); return "ok" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const exit = yield* Effect.exit(
+          tool.execute({ action: "start", name: "stepper", budget_tokens: 0 }, recorder.ctx),
+        )
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("token budget exhausted")
+      }),
+    ),
+  )
+
+  // Item 8: the enriched background result names the definition path and the
+  // run's session id, so the model can inspect without a follow-up read.
+  it.live("enriched background start output names path and session id", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "pending",
+            `export const meta = { name: "Pending" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const started = yield* tool.execute({ action: "start", name: "pending", background: true }, recorder.ctx)
+        expect(started.output).toContain("<workflow>pending</workflow>")
+        expect(started.output).toContain("<path>")
+        expect(started.output).toContain("<session_id>")
+        // Cleanup: stop the deliberately hanging run.
+        yield* tool.execute({ action: "cancel", run_id: started.metadata.runId as string }, recorder.ctx)
+      }),
+    ),
+  )
+
   // Fund 53 (low): create on an existing file without overwrite must fail.
   it.live("create on an existing file without overwrite fails", () =>
     provideTmpdirInstance((dir) =>
@@ -1667,7 +1891,7 @@ export async function run() { return "ok" }
   // InvalidArgumentsError; the model then re-emitted the same stringified value,
   // looped on the identical invalid call, and the session eventually aborted. The
   // arg boundary must coerce "true"/"false" so the first call proceeds.
-  it.live("create tolerates overwrite supplied as the string \"true\" (no InvalidArgumentsError)", () =>
+  it.live('create tolerates overwrite supplied as the string "true" (no InvalidArgumentsError)', () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         // A file already exists: with overwrite truthy the create must PROCEED
@@ -1694,7 +1918,7 @@ export async function run() { return "ok" }
     ),
   )
 
-  it.live("create with overwrite=\"false\" (string) decodes to false and hits the already-exists guard", () =>
+  it.live('create with overwrite="false" (string) decodes to false and hits the already-exists guard', () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
@@ -1751,7 +1975,7 @@ export async function run() { return "ok" }
   // The same stringified-arg failure class applies to the numeric caps. The
   // coercion must accept a numeric string while STILL rejecting non-finite /
   // negative values so the budget/timeout guards stay honest.
-  it.live("budget supplied as the string \"5\" is accepted (coerces to a finite cap)", () =>
+  it.live('budget supplied as the string "5" is accepted (coerces to a finite cap)', () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
@@ -1769,7 +1993,7 @@ export async function run() { return "ok" }
     ),
   )
 
-  it.live("budget=\"abc\"/\"Infinity\"/\"-1\" (strings) are rejected as invalid arguments", () =>
+  it.live('budget="abc"/"Infinity"/"-1" (strings) are rejected as invalid arguments', () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
@@ -1824,7 +2048,7 @@ export async function run() { return "ok" }
   // timeout is the other LooseNonNegativeFinite consumer and the load-bearing
   // wait-bound: a stringified "Infinity" must be rejected, exactly as the native
   // Infinity is (so wait can never be told to hang forever via a string).
-  it.live("timeout supplied as the string \"Infinity\" is rejected as invalid arguments", () =>
+  it.live('timeout supplied as the string "Infinity" is rejected as invalid arguments', () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>
@@ -1838,10 +2062,7 @@ export async function run() { return "ok" }
         const recorder = requestRecorder()
         const started = yield* tool.execute({ action: "start", name: "slow", background: true }, recorder.ctx)
         const exit = yield* Effect.exit(
-          tool.execute(
-            { action: "wait", run_id: started.metadata.runId as string, timeout: "Infinity" },
-            recorder.ctx,
-          ),
+          tool.execute({ action: "wait", run_id: started.metadata.runId as string, timeout: "Infinity" }, recorder.ctx),
         )
         expect(Exit.isFailure(exit)).toBe(true)
         expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("invalid arguments")
@@ -1895,7 +2116,8 @@ export async function run() { return "ok" }
         const backgroundMessages = recorder.prompts.filter((prompt) =>
           prompt.parts?.some(
             (part) =>
-              part.type === "text" && (part.text.includes("Background workflow") || part.text.includes("<workflow_run")),
+              part.type === "text" &&
+              (part.text.includes("Background workflow") || part.text.includes("<workflow_run")),
           ),
         )
         expect(backgroundMessages).toEqual([])
@@ -1990,7 +2212,7 @@ export async function run(args, ctx) { if (args.hang) await new Promise(() => {}
 
   // background is the other LooseBoolean consumer: a stringified "true" must
   // decode without an InvalidArgumentsError (the run starts in the background).
-  it.live("start tolerates background supplied as the string \"true\" (no InvalidArgumentsError)", () =>
+  it.live('start tolerates background supplied as the string "true" (no InvalidArgumentsError)', () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         yield* Effect.promise(() =>

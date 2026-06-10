@@ -1,4 +1,5 @@
 import { BackgroundJob } from "@/background/job"
+import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Format } from "@/format"
@@ -21,6 +22,10 @@ import AUTHORING_GUIDE from "./workflow.txt"
 
 const WORKFLOW_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT = 60 * 60 * 1000
+// Item 8: how long a DEFAULT start (no explicit background/timeout) stays in the
+// foreground before the run is switched to the background. Overridable via
+// config workflows.foreground_grace_ms.
+const FOREGROUND_GRACE = 45_000
 
 const Action = Schema.Literals(["read", "start", "wait", "inspect", "create", "cancel", "pause"])
 const InspectView = Schema.Literals(["summary", "logs", "agents", "agent", "result", "all"])
@@ -85,8 +90,13 @@ const Parameters = Schema.Struct({
     description:
       "Optional cost cap in USD for the whole run. Checked before each agent step; once cumulative cost reaches the cap, the next step fails with a budget error. This is a soft cap — agent steps already running in parallel can push total spend past it. Omit for unlimited.",
   }),
+  budget_tokens: Schema.optional(LooseNonNegativeFinite).annotate({
+    description:
+      "Optional output-token cap for the whole run; soft cap like budget (counts each step's output+reasoning tokens). Combinable with budget — whichever cap exhausts first gates the next step. Omit for unlimited.",
+  }),
   background: Schema.optional(LooseBoolean).annotate({
-    description: "Start the workflow asynchronously and notify this session when it finishes",
+    description:
+      "true starts the workflow asynchronously and notifies this session when it finishes; false opts out of the default grace window and keeps the old long foreground wait",
   }),
   // Non-negative finite, mirroring the budget field above: a plain Schema.Number
   // accepts NaN/±Infinity. timeout:Infinity would override the 1h DEFAULT_TIMEOUT
@@ -94,7 +104,8 @@ const Parameters = Schema.Struct({
   // false) so wait times out at once yet still reports "still running". Rejecting
   // both at the argument boundary keeps the wait bound honest.
   timeout: Schema.optional(LooseNonNegativeFinite).annotate({
-    description: "Maximum milliseconds to wait for foreground start/wait before returning the running state",
+    description:
+      "Maximum milliseconds to wait for foreground start/wait before returning the running state. Setting it on start implies an explicit foreground wait (no background switch).",
   }),
   run_id: Schema.optional(Schema.String).annotate({
     description: "Workflow run id for wait/inspect/cancel/pause",
@@ -131,7 +142,7 @@ const DESCRIPTION = [
   "Do not use workflows by default. Use this only when the user explicitly asks for a workflow, asks to create one, or confirms workflow automation.",
   "Actions:",
   "- read: with name, return one workflow's metadata, arguments, phases, and path; WITHOUT name, return the workflow AUTHORING GUIDE (module shape, ctx API, patterns, copyable examples) plus all available workflows. Read the guide before writing or editing any workflow source.",
-  "- start: start an existing workflow (project, global, or built-in). Foreground waits for completion (up to the timeout, default 1 hour) and then returns the running state; background=true returns immediately and injects a completion message later; script_path starts a script file directly (edit + re-invoke to iterate).",
+  "- start: start a workflow (project, global, or built-in). Waits a short grace window (default 45s); a run still going then continues in the background and notifies this session on completion. background=true returns immediately; background=false or an explicit timeout keeps the old foreground wait. script_path starts a script file directly (edit + re-invoke to iterate).",
   "- wait: wait for a running workflow by run_id.",
   "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
   "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
@@ -332,12 +343,19 @@ function scriptPathBlock(scriptPath: string | undefined) {
   ].join("\n")
 }
 
+// Item 8: rich enough that the model can keep working without an immediate
+// follow-up call — names the run, its definition path, the session executing it,
+// and the inspect/wait affordances (instead of the old bare id + two lines).
 function backgroundStarted(run: Workflow.Run, scriptPath?: string) {
   return [
     `<workflow_run id="${escapeXmlAttr(run.id)}" state="running">`,
-    "<summary>Workflow started in background.</summary>",
+    `<workflow>${escapeXmlText(run.workflow)}</workflow>`,
+    run.definition ? `<path>${escapeXmlText(run.definition.path)}</path>` : undefined,
+    run.session_id ? `<session_id>${escapeXmlText(run.session_id)}</session_id>` : undefined,
+    run.current_phase ? `<current_phase>${escapeXmlText(run.current_phase)}</current_phase>` : undefined,
     scriptPathBlock(scriptPath),
-    "<instructions>You will be notified automatically when it finishes; do not poll unless the user asks for progress.</instructions>",
+    "<summary>Workflow is running in the background.</summary>",
+    '<instructions>You will be notified automatically when it finishes. Use action="inspect" with this run_id for progress, or action="wait" to block on the result; do not poll unless the user asks.</instructions>',
     "</workflow_run>",
   ]
     .filter((line): line is string => line !== undefined)
@@ -455,6 +473,7 @@ function startWorkflow(input: {
   background: BackgroundJob.Interface
   sessions: Session.Interface
   fs: FSUtil.Interface
+  config: Config.Interface
   scope: Scope.Scope
   params: Params
   // The named workflow to start. OMITTED for a P3 inline-source start: the engine
@@ -470,17 +489,32 @@ function startWorkflow(input: {
 }) {
   return Effect.gen(function* () {
     const ops = promptOps(input.ctx)
+    // Item 12: capture the CALLER session's resolved model so default-agent steps
+    // can inherit it. Best-effort — a model-lookup failure must never kill the
+    // start, the run merely loses the inheritance tier.
+    const callerModel = ops.currentModel
+      ? yield* ops.currentModel(input.ctx.sessionID).pipe(
+          Effect.map((model) => ({ providerID: model.providerID, modelID: model.modelID })),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        )
+      : undefined
     const run = yield* input.workflow
       .start({
         name: input.name,
         args: input.params.args,
-        budget: input.params.budget,
+        // Item 17: either cap present ⇒ the struct form; both absent ⇒ unlimited
+        // (the engine also accepts a naked USD number for back-compat).
+        budget:
+          input.params.budget !== undefined || input.params.budget_tokens !== undefined
+            ? { usd: input.params.budget, tokens: input.params.budget_tokens }
+            : undefined,
         prompt: ops,
         permissionSessionID: input.ctx.sessionID,
         // Pass the caller's identity so every subagent the run spawns inherits
         // this session's deny/external_directory rules and this agent's edit-class
         // denies (Plan Mode) — the same ruleset the task tool derives (#26514).
         caller: { sessionID: input.ctx.sessionID, agent: input.ctx.agent },
+        caller_model: callerModel,
         source: input.source,
         temporary: input.temporary,
         resume_of: input.resumeOf,
@@ -500,12 +534,10 @@ function startWorkflow(input: {
       const persisted = path.join(Global.Path.data, "workflow", run.id, "script.ts")
       // Best-effort: a write failure (full disk, permissions) must never fail
       // the start — the result merely lacks the iteration path.
-      const wrote = yield* input.fs
-        .writeWithDirs(persisted, input.source)
-        .pipe(
-          Effect.as(true),
-          Effect.catch(() => Effect.succeed(false)),
-        )
+      const wrote = yield* input.fs.writeWithDirs(persisted, input.source).pipe(
+        Effect.as(true),
+        Effect.catch(() => Effect.succeed(false)),
+      )
       if (wrote) scriptPath = persisted
     }
 
@@ -514,62 +546,67 @@ function startWorkflow(input: {
       metadata: workflowMetadata(run, input.params.background === true, scriptPath),
     })
 
-    if (input.params.background) {
-      const job = yield* input.background.start({
-        id: run.id,
-        type: "workflow",
-        title: run.workflow,
-        metadata: {
-          ...workflowMetadata(run, true, scriptPath),
-          parentSessionId: input.ctx.sessionID,
-        },
-        run: waitForWorkflow(input.workflow, run).pipe(
-          Effect.flatMap((waited) => {
-            const error = runFailure(waited.run)
-            return error ? Effect.fail(error) : Effect.succeed(terminalOutput(waited.run))
-          }),
-          Effect.tap((output) =>
-            input.sessions.get(input.ctx.sessionID).pipe(
-              Effect.flatMap((session) =>
-                ops.prompt({
-                  sessionID: input.ctx.sessionID,
-                  agent: session.agent ?? input.ctx.agent,
-                  parts: [
-                    {
-                      type: "text",
-                      synthetic: true,
-                      text: backgroundMessage(run, "completed", output),
-                    },
-                  ],
-                }),
-              ),
-              Effect.ignore,
-              Effect.forkIn(input.scope, { startImmediately: true }),
+    // Item 8: the background registration is shared by BOTH async paths — the
+    // explicit background=true start (immediate) and the grace-window switch
+    // below (after the foreground grace elapses). Registering exactly once per
+    // run is guaranteed structurally: the two call sites are disjoint branches.
+    const registerBackground = input.background.start({
+      id: run.id,
+      type: "workflow",
+      title: run.workflow,
+      metadata: {
+        ...workflowMetadata(run, true, scriptPath),
+        parentSessionId: input.ctx.sessionID,
+      },
+      run: waitForWorkflow(input.workflow, run).pipe(
+        Effect.flatMap((waited) => {
+          const error = runFailure(waited.run)
+          return error ? Effect.fail(error) : Effect.succeed(terminalOutput(waited.run))
+        }),
+        Effect.tap((output) =>
+          input.sessions.get(input.ctx.sessionID).pipe(
+            Effect.flatMap((session) =>
+              ops.prompt({
+                sessionID: input.ctx.sessionID,
+                agent: session.agent ?? input.ctx.agent,
+                parts: [
+                  {
+                    type: "text",
+                    synthetic: true,
+                    text: backgroundMessage(run, "completed", output),
+                  },
+                ],
+              }),
             ),
-          ),
-          Effect.catchCause((cause) =>
-            input.sessions.get(input.ctx.sessionID).pipe(
-              Effect.flatMap((session) =>
-                ops.prompt({
-                  sessionID: input.ctx.sessionID,
-                  agent: session.agent ?? input.ctx.agent,
-                  parts: [
-                    {
-                      type: "text",
-                      synthetic: true,
-                      text: backgroundMessage(run, "error", Cause.pretty(cause)),
-                    },
-                  ],
-                }),
-              ),
-              Effect.ignore,
-              Effect.forkIn(input.scope, { startImmediately: true }),
-              Effect.andThen(Effect.failCause(cause)),
-            ),
+            Effect.ignore,
+            Effect.forkIn(input.scope, { startImmediately: true }),
           ),
         ),
-      })
+        Effect.catchCause((cause) =>
+          input.sessions.get(input.ctx.sessionID).pipe(
+            Effect.flatMap((session) =>
+              ops.prompt({
+                sessionID: input.ctx.sessionID,
+                agent: session.agent ?? input.ctx.agent,
+                parts: [
+                  {
+                    type: "text",
+                    synthetic: true,
+                    text: backgroundMessage(run, "error", Cause.pretty(cause)),
+                  },
+                ],
+              }),
+            ),
+            Effect.ignore,
+            Effect.forkIn(input.scope, { startImmediately: true }),
+            Effect.andThen(Effect.failCause(cause)),
+          ),
+        ),
+      ),
+    })
 
+    if (input.params.background) {
+      const job = yield* registerBackground
       return {
         title: `Workflow started: ${run.workflow}`,
         metadata: { ...workflowMetadata(run, true, scriptPath), jobId: job.id, timedOut: false },
@@ -577,41 +614,60 @@ function startWorkflow(input: {
       }
     }
 
-    const waited = yield* waitForWorkflowHonoringAbort(
-      input.workflow,
-      run,
-      input.ctx.abort,
-      input.params.timeout ?? DEFAULT_TIMEOUT,
-    )
-    // Fund 30: a TERMINAL non-completed run (failed/cancelled/interrupted) must fail
-    // the tool here too, consistent with the background path — never report
-    // "Workflow finished" for a run that did not succeed. A timed-out run is still
-    // running, so it is reported as such, not failed.
-    //
-    // N10 carve-out: when the PARENT TURN aborted (ctx.abort), the run was cancelled
-    // as the deliberate, graceful response to that abort — not a workflow failure.
-    // Returning the cancelled state as success (rather than failing) keeps the abort
-    // flow clean; failing here would surface a spurious "Workflow cancelled" error
-    // for a user-initiated stop. A run that failed/cancelled/interrupted on its own
-    // (no abort) still fails the tool.
-    if (!waited.timedOut && !input.ctx.abort.aborted) {
-      const failure = runFailure(waited.run)
-      if (failure) return yield* Effect.fail(failure)
+    // Item 8 semantics matrix:
+    // - background=true → immediate background (handled above, unchanged)
+    // - background=false → old long foreground wait (explicit opt-out)
+    // - timeout set → explicit foreground wait with the still-running result
+    //   (back-compat for existing callers)
+    // - all unset (default) → short grace window, then auto-switch to background
+    const explicitForeground = input.params.background === false || input.params.timeout !== undefined
+    const grace = (yield* input.config.get()).workflows?.foreground_grace_ms ?? FOREGROUND_GRACE
+    const bound = explicitForeground ? (input.params.timeout ?? DEFAULT_TIMEOUT) : grace
+    const waited = yield* waitForWorkflowHonoringAbort(input.workflow, run, input.ctx.abort, bound)
+    if (!waited.timedOut) {
+      // Fund 30: a TERMINAL non-completed run (failed/cancelled/interrupted) must fail
+      // the tool here too, consistent with the background path — never report
+      // "Workflow finished" for a run that did not succeed. A timed-out run is still
+      // running, so it is reported as such, not failed.
+      //
+      // N10 carve-out: when the PARENT TURN aborted (ctx.abort), the run was cancelled
+      // as the deliberate, graceful response to that abort — not a workflow failure.
+      // Returning the cancelled state as success (rather than failing) keeps the abort
+      // flow clean; failing here would surface a spurious "Workflow cancelled" error
+      // for a user-initiated stop. A run that failed/cancelled/interrupted on its own
+      // (no abort) still fails the tool.
+      if (!input.ctx.abort.aborted) {
+        const failure = runFailure(waited.run)
+        if (failure) return yield* Effect.fail(failure)
+      }
+      return {
+        title: `Workflow finished: ${run.workflow}`,
+        metadata: { ...workflowMetadata(run, false, scriptPath), jobId: "", timedOut: false },
+        output: [scriptPathBlock(scriptPath), terminalOutput(waited.run)]
+          .filter((line): line is string => line !== undefined)
+          .join("\n"),
+      }
     }
+    if (explicitForeground) {
+      return {
+        title: `Workflow still running: ${run.workflow}`,
+        metadata: { ...workflowMetadata(run, false, scriptPath), jobId: "", timedOut: true },
+        output: [
+          formatRunSummary(waited.run),
+          scriptPathBlock(scriptPath),
+          '<instructions>Use the workflow tool with action="wait" and this run_id to wait for completion.</instructions>',
+        ]
+          .filter((line): line is string => line !== undefined)
+          .join("\n"),
+      }
+    }
+    // Grace elapsed, run still alive → continue in the background and notify
+    // this session on completion, exactly like an explicit background start.
+    const job = yield* registerBackground
     return {
-      title: waited.timedOut ? `Workflow still running: ${run.workflow}` : `Workflow finished: ${run.workflow}`,
-      metadata: { ...workflowMetadata(run, false, scriptPath), jobId: "", timedOut: waited.timedOut },
-      output: waited.timedOut
-        ? [
-            formatRunSummary(waited.run),
-            scriptPathBlock(scriptPath),
-            '<instructions>Use the workflow tool with action="wait" and this run_id to wait for completion.</instructions>',
-          ]
-            .filter((line): line is string => line !== undefined)
-            .join("\n")
-        : [scriptPathBlock(scriptPath), terminalOutput(waited.run)]
-            .filter((line): line is string => line !== undefined)
-            .join("\n"),
+      title: `Workflow running in background: ${run.workflow}`,
+      metadata: { ...workflowMetadata(run, true, scriptPath), jobId: job.id, timedOut: false },
+      output: backgroundStarted(waited.run, scriptPath),
     }
   })
 }
@@ -624,6 +680,7 @@ export const WorkflowTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
     const fs = yield* FSUtil.Service
+    const config = yield* Config.Service
     const events = yield* EventV2Bridge.Service
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
@@ -725,6 +782,7 @@ export const WorkflowTool = Tool.define(
                   background,
                   sessions,
                   fs,
+                  config,
                   scope,
                   params,
                   // Omit name: the engine takes its inline source-string load path when
@@ -748,8 +806,7 @@ export const WorkflowTool = Tool.define(
               // external_directory permission before anything is read.
               yield* assertExternalDirectoryEffect(ctx, resolved)
               const source = yield* fs.readFileStringSafe(resolved)
-              if (source === undefined)
-                return yield* Effect.fail(new Error(`Workflow script not found: ${resolved}`))
+              if (source === undefined) return yield* Effect.fail(new Error(`Workflow script not found: ${resolved}`))
               return yield* startFromSource(source, resolved)
             }
 
@@ -810,6 +867,7 @@ export const WorkflowTool = Tool.define(
               background,
               sessions,
               fs,
+              config,
               scope,
               params,
               name: params.name,
@@ -883,7 +941,7 @@ export const WorkflowTool = Tool.define(
             // fiber FIRST (job id === run.id) so the synthetic
             // backgroundMessage("error") prompt never fires for a deliberate stop.
             yield* background.cancel(runId).pipe(Effect.ignore)
-            const run = yield* (params.action === "cancel" ? workflow.cancel(runId) : workflow.pause(runId))
+            const run = yield* params.action === "cancel" ? workflow.cancel(runId) : workflow.pause(runId)
             if (!run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
             // Idempotency is reported honestly: cancel/pause of an already-terminal
             // run returns its real snapshot (e.g. "Workflow completed: …") as SUCCESS

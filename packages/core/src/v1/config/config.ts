@@ -176,6 +176,14 @@ export const Info = Schema.Struct({
       approved: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
         description: "Workflow names that have been approved via 'Yes, always' in the interactive start dialog.",
       }),
+      foreground_grace_ms: Schema.optional(NonNegativeInt).annotate({
+        description:
+          "How long a workflow start waits in the foreground before switching the run to the background (milliseconds, default 45000). Only applies when neither background nor timeout is set explicitly.",
+      }),
+      budget_directive: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Detect the `+$N` budget directive in the prompt and highlight it; on submit it reserves that budget for workflow orchestration in the turn (default: true)",
+      }),
     }),
   ).annotate({ description: "Workflow orchestration options" }),
   experimental: Schema.optional(

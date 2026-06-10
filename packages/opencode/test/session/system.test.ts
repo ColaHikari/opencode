@@ -72,6 +72,7 @@ const it = testEffect(
           wait: () => Effect.succeed({ timedOut: false }),
           cancel: () => Effect.succeed(undefined),
           pause: () => Effect.succeed(undefined),
+          skipAgent: () => Effect.succeed(undefined),
           answer: () => Effect.succeed(undefined),
           save: () => Effect.succeed({ path: "/tmp/test.ts" }),
           remove: () => Effect.succeed(false),

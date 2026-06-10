@@ -2085,6 +2085,8 @@ export type Config = {
     ultracode_keyword?: boolean
     approval?: "always" | "first-run" | "never"
     approved?: Array<string>
+    foreground_grace_ms?: number
+    budget_directive?: boolean
   }
   experimental?: {
     disable_paste_summary?: boolean
@@ -2809,14 +2811,16 @@ export type WorkflowLogEntry = {
 
 export type WorkflowAgentRun = {
   id: string
-  status: "running" | "completed" | "failed"
+  status: "running" | "completed" | "failed" | "skipped"
   started_at: number
   completed_at?: number
   phase?: string
   agent?: string
+  label?: string
   model?: string
   session_id?: string
   message_id?: string
+  worktree?: string
   prompt: string
   output?: string
   cost?: number
@@ -2901,6 +2905,7 @@ export type WorkflowStartPayload = {
     [key: string]: unknown
   }
   budget?: number
+  budget_tokens?: number
   permissionSessionID?: string
   resume_of?: string
   invalidate_agents?: Array<number>
@@ -9938,6 +9943,45 @@ export type WorkflowPauseResponses = {
 }
 
 export type WorkflowPauseResponse = WorkflowPauseResponses[keyof WorkflowPauseResponses]
+
+export type WorkflowSkipData = {
+  body?: never
+  path: {
+    id: string
+    agentId: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/agent/{agentId}/skip"
+}
+
+export type WorkflowSkipErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowSkipError = WorkflowSkipErrors[keyof WorkflowSkipErrors]
+
+export type WorkflowSkipResponses = {
+  /**
+   * Workflow run after requesting the skip
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowSkipResponse = WorkflowSkipResponses[keyof WorkflowSkipResponses]
 
 export type WorkflowAnswerData = {
   body?: WorkflowAnswerPayload

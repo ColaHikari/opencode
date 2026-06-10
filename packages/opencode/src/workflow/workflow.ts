@@ -14,6 +14,8 @@ import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { Global } from "@opencode-ai/core/global"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
 import type { WorkflowAgentRow, WorkflowDefinitionRow, WorkflowLogRow } from "@opencode-ai/core/workflow/sql"
@@ -147,16 +149,28 @@ export type LogEntry = DeepMutable<Schema.Schema.Type<typeof LogEntry>>
 
 export const AgentRun = Schema.Struct({
   id: Schema.String,
-  status: Schema.Literals(["running", "completed", "failed"]),
+  // `skipped` (Item 15): a human skipped this step via skipAgent — the step's
+  // ctx.agent call resolved `null` and the run continued. Distinct from `failed`
+  // so run views can tell a deliberate skip apart from an error.
+  status: Schema.Literals(["running", "completed", "failed", "skipped"]),
   // Epoch millis — always finite. `Schema.Finite` keeps the SDK wire type a
   // plain `number` instead of the NaN/Infinity-string union (Fund 18).
   started_at: Schema.Finite,
   completed_at: Schema.optional(Schema.Finite),
   phase: Schema.optional(Schema.String),
   agent: Schema.optional(Schema.String),
+  // Per-call display name (Item 16): set from `ctx.agent({ label })` so run views
+  // can show an author-chosen step name instead of the agent name. Display-only —
+  // deliberately NOT part of the resume journal key (see journalKey).
+  label: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
   session_id: Schema.optional(Schema.String),
   message_id: Schema.optional(Schema.String),
+  // Item 7: the isolated `git worktree` base directory this step ran in (set
+  // only for `isolation: "worktree"` steps). Makes the step's work location
+  // inspectable (inspect/dashboard) and anchors the preserve log when the
+  // worktree is kept at run end (uncommitted changes / new commits).
+  worktree: Schema.optional(Schema.String),
   prompt: Schema.String,
   output: Schema.optional(Schema.String),
   cost: Schema.optional(Schema.Finite),
@@ -280,6 +294,22 @@ export const Event = {
   Finished: EventV2.define({ type: "workflow.run.finished", schema: RunEventData }),
 }
 
+// Non-negative finite number — the only shape a budget cap may take: a
+// negative/NaN/Infinity cap is a validation error at the boundary, never a
+// confusing runtime budget failure.
+const NonNegFinite = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
+
+// Item 17: the budget cap. A NAKED number stays USD (backward compatibility for
+// every existing caller); the struct form adds an independent output-TOKEN cap.
+// Both caps may be set — whichever exhausts first gates the next step.
+const BudgetInput = Schema.Union([
+  NonNegFinite,
+  Schema.Struct({
+    usd: Schema.optional(NonNegFinite),
+    tokens: Schema.optional(NonNegFinite),
+  }),
+])
+
 export const StartInput = Schema.Struct({
   // Optional so an inline-source start can omit it: when `source` is supplied with
   // no `name`, start() loads the module straight from the source string (the
@@ -287,15 +317,13 @@ export const StartInput = Schema.Struct({
   // Every other start path supplies a name to select a discovered workflow.
   name: Schema.optional(Schema.String),
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
-  // Optional cost cap in USD for the whole run. The unit is USD because that is
-  // exactly the per-agent telemetry the engine already records (`AgentRun.cost`,
-  // read from the assistant message's `cost`, the same number the dashboard
-  // shows). After each agent step the remaining budget is decremented by that
-  // step's cost; before each `ctx.agent` call the engine fails the step with a
-  // BudgetExceededError once nothing is left. Omitted ⇒ unlimited (Infinity).
-  // Must be a non-negative finite number: a negative/NaN/Infinity cap is a
-  // validation error here, never a confusing runtime budget failure.
-  budget: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  // Optional cost cap for the whole run: a naked number is USD (back-compat), the
+  // struct form is `{ usd?, tokens? }`. USD is gated against the per-agent cost
+  // telemetry the engine already records (`AgentRun.cost`); tokens against each
+  // step's output+reasoning tokens (Item 17). After each agent step the spend
+  // accumulators advance; before each `ctx.agent` call the engine fails the step
+  // with a BudgetExceededError once a set cap is exhausted. Omitted ⇒ unlimited.
+  budget: Schema.optional(BudgetInput),
 }).annotate({ identifier: "WorkflowStartInput" })
 export type StartInput = Schema.Schema.Type<typeof StartInput>
 
@@ -308,6 +336,15 @@ export type PromptOps = {
    * that never start agents need not provide it.
    */
   cancel?: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * The RESOLVED model of a session (session.model → last user-message model →
+   * provider default). The workflow tool reads the CALLER session's model
+   * through this before start so default-agent steps can inherit it (Item 12).
+   * Optional so existing prompt-ops stubs keep compiling.
+   */
+  currentModel?: (
+    sessionID: SessionID,
+  ) => Effect.Effect<{ providerID: string; modelID: string; variant?: string }, unknown>
 }
 
 export type StartOptions = StartInput & {
@@ -328,6 +365,16 @@ export type StartOptions = StartInput & {
    * `agent` is currently informational only.
    */
   caller?: { sessionID: SessionID; agent?: string }
+  /**
+   * The caller session's RESOLVED model at start time (Item 12), already parsed
+   * into `{ providerID, modelID }` — never re-parsed via Provider.parseModel.
+   * A `ctx.agent` step that uses the DEFAULT agent (no `agent:` override) and
+   * has no explicit/phase model resolves to this, so subagents follow the main
+   * loop's model (incl. a TUI model switch). An explicitly chosen agent is a
+   * deliberate authoring decision including its model, so it is unaffected.
+   * Absent on HTTP/programmatic starts with no session-model context.
+   */
+  caller_model?: { providerID: string; modelID: string }
   /**
    * Resume a previous (paused, interrupted, failed, or completed) run by id.
    * When set, start() loads the SOURCE run's persisted agent journal
@@ -384,12 +431,13 @@ export type AnswerInput = {
    * - `prompt`: the prompt-ops vector (dispatch + abort) the agent steps need.
    * - `permissionSessionID`: where interactive permission prompts surface.
    * - `caller`: identity used to derive each subagent's inherited permission ruleset.
-   * - `budget`: cost cap (USD) for the resumed run.
+   * - `budget`: cost cap for the resumed run — naked number = USD (back-compat),
+   *   or `{ usd?, tokens? }` (Item 17), mirroring StartInput.budget.
    */
   prompt?: PromptOps
   permissionSessionID?: SessionID
   caller?: { sessionID: SessionID; agent?: string }
-  budget?: number
+  budget?: number | { usd?: number; tokens?: number }
 }
 
 // Where save() writes a workflow file. `project` (default) targets the workspace
@@ -459,6 +507,9 @@ export class BudgetExceededError extends Schema.TaggedErrorClass<BudgetExceededE
   message: Schema.String,
   budget: Schema.Finite,
   spent: Schema.Finite,
+  // Item 17: which cap tripped — "usd" (cost) or "tokens" (output tokens).
+  // Optional for backward compatibility with errors persisted before the field.
+  unit: Schema.optional(Schema.Literals(["usd", "tokens"])),
 }) {}
 
 /**
@@ -534,6 +585,12 @@ export class CancelledError extends Error {
   }
 }
 
+// Item 15: sentinel resolved through the agent dispatch when a human skipped the
+// step (skipAgent). The success settlement maps it to `null` WITHOUT touching
+// the node — its `skipped` state was already persisted inside the dispatch gen.
+// A module-scoped symbol so it can never collide with a real step result.
+const SKIPPED = Symbol("workflow-agent-skipped")
+
 export type AgentInput = {
   agent?: string
   prompt: string
@@ -545,6 +602,17 @@ export type AgentInput = {
   schema?: Record<string, unknown>
   permissionSessionID?: SessionID
   /**
+   * Explicit progress group for THIS call (Item 16). Pins the step's node to the
+   * named phase regardless of where `ctx.setPhase` currently points — closing
+   * the race window when setPhase and agent() do not share a microtask under
+   * parallel/pipeline concurrency. A phase declared in `meta.phases` with a
+   * `model` activates that model as this call's default (explicit `model` still
+   * wins); the run's `current_phase` is NOT changed (no setPhase side effect).
+   */
+  phase?: string
+  /** Display name for this step in run views (defaults to the agent name). */
+  label?: string
+  /**
    * Run this step's subagent in a FRESH `git worktree` instead of the run's
    * workspace, so parallel agents that mutate files do not conflict. The
    * worktree is created on first dispatch and auto-removed when the run finishes
@@ -552,6 +620,13 @@ export type AgentInput = {
    * a git repository; otherwise the step fails with a WorkflowInvalidError.
    */
   isolation?: "worktree"
+  /**
+   * What a FAILING step resolves to (Item 15). Default `"fail"`: the error
+   * propagates (run fails unless caught). `"null"`: the step resolves `null`
+   * (the node stays `failed` with its error recorded) so the body can branch.
+   * Budget/lifetime gates and aborts are NEVER swallowed — they always throw.
+   */
+  onError?: "fail" | "null"
 }
 
 // Pipeline/parallel option and stage shapes are the public workflow-authoring
@@ -565,14 +640,32 @@ export type PipelineStage<Prev, Item, Next> = WorkflowPipelineStage<Prev, Item, 
 export type PipelineFn = WorkflowPipelineFn
 
 export type ContextApi = {
+  /** @deprecated USD-only view; prefer `ctx.budget.remaining()` (and `tokensRemaining()` for the token cap). */
   readonly budgetRemaining: number
-  /** Cost budget (USD) in Claude-Code API shape: `total` (null when unlimited), `spent()` so far, `remaining()` (Infinity when unlimited). */
-  readonly budget: { readonly total: number | null; spent(): number; remaining(): number }
+  /**
+   * Budget in Claude-Code API shape. USD: `total` (null when unlimited),
+   * `spent()` so far, `remaining()` (Infinity when unlimited). Tokens (Item 17):
+   * `tokensTotal`/`tokensSpent()`/`tokensRemaining()` — the same trio for the
+   * independent output-token cap.
+   */
+  readonly budget: {
+    readonly total: number | null
+    spent(): number
+    remaining(): number
+    readonly tokensTotal: number | null
+    tokensSpent(): number
+    tokensRemaining(): number
+  }
   readonly setPhase: (phase: string) => void
   readonly log: (message: string) => void
   readonly parallel: <T>(tasks: readonly (() => Promise<T>)[], options?: ParallelOptions) => Promise<(T | null)[]>
   readonly pipeline: PipelineFn
-  readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  /**
+   * Resolves `null` when a human skips the step (skipAgent), or — with
+   * `onError: "null"` — when the step fails (Item 15). Guard the result before
+   * dereferencing (`if (!r) …`).
+   */
+  readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string } | null>
   /**
    * Deterministic non-LLM step: run a shell command in the run's workspace and
    * resolve to `{ output, exitCode }`. Does NOT consume an LLM turn or the run's
@@ -695,6 +788,19 @@ type Active = {
    */
   costSpent: number
   /**
+   * Output-token cap (Item 17), or `undefined` when no token budget was set
+   * (unlimited). Gated in `ctx.agent` exactly like the USD cap — a soft cap with
+   * the same audited parallel-overspend bound (comment T5).
+   */
+  tokensBudgetTotal?: number
+  /**
+   * Output tokens (output + reasoning; reasoning is output-billed) actually
+   * spent so far. Accumulated at the SAME settlement site (and under the same
+   * guards) as `costSpent` — ALWAYS, even with no token budget, so
+   * `ctx.budget.tokensSpent()` works regardless. Starts at 0.
+   */
+  tokensSpent: number
+  /**
    * Run-wide concurrency gate over EVERY `ctx.agent` dispatch (agent/parallel/
    * pipeline all funnel through ctx.agent). Sized to the host CPU count clamped
    * to [2, 16] at run start. A per-call `concurrencyLimit` still applies on top
@@ -749,6 +855,22 @@ type Active = {
    * resolution (explicit input.model > this phase model > selected agent's model).
    */
   currentPhaseModel?: string
+  /**
+   * The caller session's RESOLVED model at start time (Item 12), captured by the
+   * workflow tool via promptOps.currentModel. A DEFAULT-agent `ctx.agent` step
+   * (no `agent:` override) with no explicit/phase model resolves to it, so
+   * subagents follow the main loop's model. Absent on starts with no
+   * session-model context (HTTP/programmatic). Shared by ctx.workflow children
+   * automatically (same `active`).
+   */
+  callerModel?: { providerID: string; modelID: string }
+  /**
+   * Node IDs a human asked to skip via `skipAgent` (Item 15). Added BEFORE the
+   * node's session is aborted (the same request-flag-first ordering cancel uses,
+   * Fund 16) so the abort settlement can tell a skip apart from a cancel. The
+   * step's ctx.agent call resolves `null` and the node finishes `skipped`.
+   */
+  skipRequests: Set<string>
 }
 
 type State = {
@@ -786,6 +908,17 @@ export interface Interface {
    * returned as-is (idempotent); a non-live but persisted row is returned verbatim.
    */
   readonly pause: (id: RunID) => Effect.Effect<Run | undefined>
+  /**
+   * Skips ONE in-flight agent step of a LIVE run (Item 15): the step's
+   * `ctx.agent` call resolves `null`, the node finishes `skipped` (no budget
+   * charge), and the run continues. Returns `undefined` for an id unknown to
+   * this workspace (HTTP → 404); fails with InvalidError when the run is not
+   * live (no registry entry — a persisted/terminal run has nothing to skip),
+   * the node does not exist, the node is a `question`, or the node is not
+   * `running` (HTTP → 409). The skip request is recorded BEFORE the node's
+   * session is aborted, mirroring cancel's request-flag-first ordering.
+   */
+  readonly skipAgent: (input: { id: RunID; agentId: string }) => Effect.Effect<Run | undefined, InvalidError>
   /**
    * Answers the open human-in-the-loop question on a run (Tasks 12/13):
    * - a LIVE run waiting in `ctx.question` → resolve the Deferred so the body
@@ -1058,6 +1191,12 @@ export const __testHooks = {
   captureSpend: (sink: (id: string, spend: { budgetRemaining: number; costSpent: number }) => void) => {
     captureSpendHook = sink
   },
+  /**
+   * Run the startup worktree sweep against `directory` (Item 7). Lets a test
+   * prove the preserved-marker / dirty-tree skip directly, without forcing a
+   * full instance-state re-materialization.
+   */
+  sweepWorktrees: (directory: string): Promise<void> => sweepWorktrees(directory),
 }
 
 class TerminalPersistTestError extends Error {
@@ -1417,6 +1556,12 @@ function mutableMeta(meta: Meta): Definition["meta"] {
 // call fail to match and re-run live. The key therefore matches on the stable,
 // reconstructible fields [prompt, resolvedAgent, phase]; the lookup's own schema
 // presence still drives how the replayed output is interpreted at replay time.
+//
+// `label` (Item 16) is deliberately NOT part of the key: it is display-only, so
+// relabeling a step between runs must not invalidate its journal entry. A per-call
+// `phase` (Item 16) needs no special handling — both the seed side and the live
+// lookup key on `node.phase`, which carries the (prefixed) per-call phase, so a
+// pinned step is automatically resume-stable.
 function journalKey(parts: { prompt: string; agent?: string; phase?: string }): string {
   return JSON.stringify([parts.prompt, parts.agent ?? null, parts.phase ?? null])
 }
@@ -1463,6 +1608,11 @@ const TEMP_FILE_MAX_AGE_MS = 60 * 60 * 1000
 // so the sweep matches exactly the dirs the engine mints.
 const WORKTREE_PREFIX = "oc-wf-"
 const WORKTREE_MAX_AGE_MS = 60 * 60 * 1000
+// Item 7: marker file the run-scope finalizer writes into a worktree it
+// deliberately PRESERVES (uncommitted changes / new commits). The startup sweep
+// skips dirs carrying it — otherwise a preserved worktree would be silently
+// deleted one hour later by the orphan sweep.
+const WORKTREE_PRESERVED_MARKER = ".oc-wf-preserved"
 
 function tempFileName(file: string): string {
   const ext = path.extname(file)
@@ -1603,6 +1753,18 @@ async function sweepWorktrees(directory: string) {
         const full = path.join(tmp, name)
         const stat = await fs.stat(full).catch(() => undefined)
         if (!stat || !stat.isDirectory() || stat.mtimeMs >= cutoff) return
+        // Item 7: a worktree the run finalizer deliberately preserved carries the
+        // marker — never sweep it, no matter how old.
+        const preserved = await fs
+          .stat(path.join(full, WORKTREE_PRESERVED_MARKER))
+          .then(() => true)
+          .catch(() => false)
+        if (preserved) return
+        // Fallback for a preserve whose marker write failed (or a crashed run
+        // with real work in flight): the same dirty check the finalizer uses. A
+        // non-git/leaked dir fails git-status and is swept as before.
+        const status = spawnSync("git", ["status", "--porcelain"], { cwd: full })
+        if (status.status === 0 && status.stdout.toString().trim().length > 0) return
         // Detach the registration from the owning repo (best-effort), then remove
         // the leaked dir. `remove --force` covers the common case; the explicit rm
         // is the backstop for a dir git no longer recognizes as a worktree.
@@ -1702,7 +1864,7 @@ function saveTargetPath(ctx: { directory: string; worktree: string }, scope: Sav
 
 function createContext(input: {
   active: Active
-  agent: (input: AgentInput) => Promise<{ data: unknown; text: string }>
+  agent: (input: AgentInput, callOpts?: { phaseModel?: string }) => Promise<{ data: unknown; text: string } | null>
   shell: ContextApi["shell"]
   question: ContextApi["question"]
   workflow: ContextApi["workflow"]
@@ -1759,6 +1921,16 @@ function createContext(input: {
         input.active.budgetTotal === undefined
           ? Infinity
           : Math.max(0, input.active.budgetTotal - input.active.costSpent),
+      // Item 17: the token trio, mirroring the USD trio above 1:1 (live reads,
+      // null/Infinity for an unset cap).
+      get tokensTotal() {
+        return input.active.tokensBudgetTotal ?? null
+      },
+      tokensSpent: () => input.active.tokensSpent,
+      tokensRemaining: () =>
+        input.active.tokensBudgetTotal === undefined
+          ? Infinity
+          : Math.max(0, input.active.tokensBudgetTotal - input.active.tokensSpent),
     },
     setPhase(phase: string) {
       input.active.run.current_phase = (input.logPrefix ?? "") + phase
@@ -1902,7 +2074,17 @@ function createContext(input: {
         ),
       )
     }) as ContextApi["pipeline"],
-    agent: input.agent,
+    // Item 16: a per-call `phase` is resolved HERE because only createContext
+    // knows this context's logPrefix and declared phases. The phase reaching the
+    // engine closure is already PREFIXED (consistent with setPhase above), so a
+    // nested ctx.workflow child's per-call phase is attributed to the child; the
+    // declared phase's default `model` rides along as a per-call option. No
+    // global state moves: current_phase/currentPhaseModel are untouched.
+    agent: (ai) => {
+      if (ai.phase === undefined) return input.agent(ai)
+      const declared = input.phases?.find((entry) => entry.title === ai.phase)
+      return input.agent({ ...ai, phase: (input.logPrefix ?? "") + ai.phase }, { phaseModel: declared?.model })
+    },
     shell: input.shell,
     question: input.question,
     workflow: input.workflow,
@@ -2227,6 +2409,10 @@ export const layer = Layer.effect(
     })
 
     const start: Interface["start"] = Effect.fn("Workflow.start")(function* (input) {
+      // Item 17: normalize the budget ONCE — a naked number is USD (back-compat
+      // for every existing caller), the struct form carries independent usd/token
+      // caps; unset ⇒ both unlimited.
+      const budget = typeof input.budget === "number" ? { usd: input.budget } : (input.budget ?? {})
       // Resolve the start TARGET — `{ name, path, source? }` — either by discovery
       // (a named workflow: project/global file or bundled builtin) or, when an
       // inline `source` is supplied WITHOUT a name (P3), as a synthetic inline
@@ -2425,12 +2611,15 @@ export const layer = Layer.effect(
         cancelSession: input.prompt?.cancel,
         // Unset budget ⇒ Infinity ⇒ the gate never trips and the decrement is a
         // no-op, preserving the previous unlimited behavior exactly.
-        budget: input.budget ?? Number.POSITIVE_INFINITY,
-        budgetRemaining: input.budget ?? Number.POSITIVE_INFINITY,
+        budget: budget.usd ?? Number.POSITIVE_INFINITY,
+        budgetRemaining: budget.usd ?? Number.POSITIVE_INFINITY,
         // Kept as the raw validated budget (undefined ⇒ no budget) so
         // `ctx.budget.total` reports `null` rather than coercing to Infinity.
-        budgetTotal: input.budget,
+        budgetTotal: budget.usd,
         costSpent: 0,
+        // Item 17: independent output-token cap; undefined ⇒ unlimited.
+        tokensBudgetTotal: budget.tokens,
+        tokensSpent: 0,
         agentSemaphore,
         agentStarted: 0,
         agentLimit: agentLimitOverride ?? DEFAULT_AGENT_LIMIT,
@@ -2438,6 +2627,11 @@ export const layer = Layer.effect(
         journalCursor: input.resume_of ? new Map<string, number>() : undefined,
         resumeOf: input.resume_of,
         questionJournal: input.resume_of && questionJournal.size > 0 ? questionJournal : undefined,
+        // Item 12: the caller session's resolved model — default-agent steps
+        // without an explicit/phase model inherit it (see the chain in agent()).
+        callerModel: input.caller_model,
+        // Item 15: node ids a human asked to skip.
+        skipRequests: new Set<string>(),
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, events, active)
@@ -2482,7 +2676,7 @@ export const layer = Layer.effect(
           }),
         )
 
-      const agent = async (agentInput: AgentInput) => {
+      const agentStep = async (agentInput: AgentInput, callOpts?: { phaseModel?: string }) => {
         // Gate the step: a fired run signal OR a landed cancel/pause all mean the
         // run is unwinding, so refuse to start another agent step (Fund 5/4).
         if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
@@ -2505,6 +2699,20 @@ export const layer = Layer.effect(
             message: `Workflow budget exhausted: spent ${spent} of ${active.budget} (USD) budget; refusing to start another agent step`,
             budget: active.budget,
             spent,
+            unit: "usd",
+          })
+        }
+        // Item 17: second gate for the independent output-TOKEN cap. Same
+        // soft-cap semantics as the USD gate above (comment T5 applies to both:
+        // parallel steps already in flight may push past the cap; the NEXT step
+        // is refused). Checked after the USD gate, so with both caps exhausted
+        // the USD verdict reports first.
+        if (active.tokensBudgetTotal !== undefined && active.tokensSpent >= active.tokensBudgetTotal) {
+          throw new BudgetExceededError({
+            message: `Workflow token budget exhausted: spent ${active.tokensSpent} of ${active.tokensBudgetTotal} output tokens; refusing to start another agent step`,
+            budget: active.tokensBudgetTotal,
+            spent: active.tokensSpent,
+            unit: "tokens",
           })
         }
         // Lifetime gate — ordered after the abort + budget gates so a cancelled
@@ -2526,13 +2734,20 @@ export const layer = Layer.effect(
         // parallel/pipeline steps may move the phase before this fiber runs, so
         // capturing it at call time keeps each step bound to the phase it was
         // dispatched under (matching how `node.phase` snapshots current_phase).
-        const phaseModel = active.currentPhaseModel
+        //
+        // Item 16: an EXPLICIT per-call phase uses ITS declared model (or none) —
+        // never the global current phase's model: the author pinned this step to a
+        // phase, so the global default would be the wrong phase's model.
+        const phaseModel = agentInput.phase !== undefined ? callOpts?.phaseModel : active.currentPhaseModel
         const node: AgentRun = {
           id: `${active.run.agents.length + 1}`,
           status: "running",
           started_at: Date.now(),
-          phase: active.run.current_phase,
+          // Item 16: a per-call phase (already logPrefix-ed by createContext) pins
+          // the node; otherwise the node snapshots the run's current phase.
+          phase: agentInput.phase ?? active.run.current_phase,
           agent: agentInput.agent,
+          label: agentInput.label,
           model: agentInput.model,
           prompt: agentInput.prompt,
         }
@@ -2561,7 +2776,13 @@ export const layer = Layer.effect(
             //   2. The active PHASE'S default `model` (Task 15) — captured at call
             //      time as `phaseModel`; used only when the call gave no explicit
             //      model, so an explicit model always wins over the phase default.
-            //   3. The selected agent's own model.
+            //   3. The CALLER session's resolved model (Item 12) — DEFAULT-agent
+            //      steps only (`!agentInput.agent`): an explicitly chosen agent is
+            //      a deliberate authoring decision including its model, while the
+            //      default-agent step should follow the main loop's model.
+            //      `caller_model` arrives pre-parsed ({providerID, modelID}), so it
+            //      is used as-is, never re-run through Provider.parseModel.
+            //   4. The selected agent's own model.
             const smallModel = agentInput.model === "small" ? (yield* config.get()).small_model : undefined
             if (agentInput.model === "small" && !smallModel) {
               return yield* new InvalidError({
@@ -2575,7 +2796,16 @@ export const layer = Layer.effect(
                 ? Provider.parseModel(agentInput.model)
                 : phaseModel
                   ? Provider.parseModel(phaseModel)
-                  : selected.model
+                  : !agentInput.agent && active.callerModel
+                    ? // Pre-parsed components are only re-BRANDED here (plain
+                      // brands, no refinement): model ids legitimately contain
+                      // slashes, so the joined string must never go back through
+                      // Provider.parseModel.
+                      {
+                        providerID: ProviderV2.ID.make(active.callerModel.providerID),
+                        modelID: ModelV2.ID.make(active.callerModel.modelID),
+                      }
+                    : selected.model
             // OTel: enrich the enclosing `workflow.agent` span with the RESOLVED
             // agent name and model now that both are known (the boundary above set
             // only the static/requested attributes). Purely observational.
@@ -2802,6 +3032,12 @@ export const layer = Layer.effect(
                   message: `ctx.agent isolation:"worktree" requires a git repository (${detail.trim()})`,
                 })
               }
+              // Item 7: capture the worktree's base commit so the finalizer can
+              // tell "new commits were made here" apart from "unchanged". A
+              // rev-parse failure leaves baseRef undefined — then only the dirty
+              // check decides.
+              const baseHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: base })
+              const baseRef = baseHead.status === 0 ? baseHead.stdout.toString().trim() : undefined
               // Cleanup on the RUN scope: survives parallel steps, fires on
               // cancel/finish. Register EXPLICITLY on `active.runScope` rather
               // than via `Effect.addFinalizer` (which targets the ambient Scope):
@@ -2809,23 +3045,59 @@ export const layer = Layer.effect(
               // SUPERVISES the fiber under the run scope but does NOT provide that
               // scope as the `Scope` service in context — so an ambient
               // `addFinalizer` would attach to the wrong (or no) scope. Targeting
-              // the run scope object directly guarantees the worktree is removed
+              // the run scope object directly guarantees the finalizer runs
               // exactly once when the run terminates (finish closes runScope) or
               // is cancelled/removed (abortRun closes it), never per step.
+              //
+              // Item 7: only an UNCHANGED worktree is removed. A worktree with
+              // uncommitted changes OR new commits (not merged back to the main
+              // tree) is PRESERVED — including its git registration, so
+              // `git worktree list` still shows it — and the preserve is logged
+              // with the path. A git-status failure is conservatively treated as
+              // dirty (better to preserve than to lose data).
               yield* Scope.addFinalizer(
                 active.runScope,
-                Effect.sync(() => {
-                  spawnSync("git", ["worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
-                  // `git worktree remove` deletes the worktree dir on success; force
-                  // a recursive rm as a backstop so the private base never lingers
-                  // even if the git removal was partial (e.g. dirty/locked tree).
-                  fs.rm(base, { recursive: true, force: true }).catch(() => {})
+                Effect.gen(function* () {
+                  const status = spawnSync("git", ["status", "--porcelain"], { cwd: base })
+                  const dirty = status.status !== 0 || status.stdout.toString().trim().length > 0
+                  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: base })
+                  const moved = baseRef !== undefined && head.status === 0 && head.stdout.toString().trim() !== baseRef
+                  if (!dirty && !moved) {
+                    spawnSync("git", ["worktree", "remove", "--force", base], { cwd: instanceCtx.directory })
+                    // `git worktree remove` deletes the worktree dir on success;
+                    // force a recursive rm as a backstop so the private base never
+                    // lingers even if the git removal was partial. Runs ONLY on the
+                    // unchanged branch — a preserved worktree is never rm'd.
+                    yield* Effect.promise(() => fs.rm(base, { recursive: true, force: true })).pipe(Effect.ignore)
+                    return
+                  }
+                  // Marker file so the startup orphan sweep (sweepWorktrees) skips
+                  // this deliberately-preserved dir even past its age cutoff.
+                  yield* Effect.promise(() => fs.writeFile(path.join(base, WORKTREE_PRESERVED_MARKER), "")).pipe(
+                    Effect.ignore,
+                  )
+                  active.run.logs.push({
+                    time: Date.now(),
+                    message: `worktree preserved at ${base}: ${dirty ? "uncommitted changes" : "new commits"}`,
+                  })
+                  // On the normal finish path the runScope closes AFTER the
+                  // terminal persist, so this write emits a SECOND finished event
+                  // (persistRun picks the event by status). The TUI notification
+                  // dedupes per run id and the app merely refetches — accepted.
+                  // On cancel, abortRun closes the scope BEFORE finish, so the log
+                  // rides the regular terminal persist. For a removed run,
+                  // persistRun no-ops (tombstone) — the worktree stays preserved
+                  // anyway (files > run row).
+                  yield* persistRun(db, events, active).pipe(Effect.ignore)
                 }),
               )
               // A fresh worktree is a self-contained working tree, so both the
               // working directory AND the worktree root point at `base`.
               promptInstanceCtx = { ...instanceCtx, directory: base, worktree: base }
               sessionDirectory = base
+              // Item 7: record the work location on the node (persisted by the
+              // existing persistRun after session creation below).
+              node.worktree = base
             }
             const session = yield* sessions.create({
               parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
@@ -2850,6 +3122,16 @@ export const layer = Layer.effect(
               if (active.cancelSession) yield* active.cancelSession(session.id).pipe(Effect.ignore)
             }
             yield* persistRun(db, events, active)
+            // Item 15: a skip that landed BEFORE this step's session was
+            // registered (skipAgent had no session_id to abort yet) is caught
+            // here, right before the prompt would dispatch — the step never
+            // spends and resolves null via the SKIPPED settlement below.
+            if (active.skipRequests.has(node.id)) {
+              node.status = "skipped"
+              node.completed_at = Date.now()
+              yield* persistRun(db, events, active)
+              return SKIPPED
+            }
             const message = yield* prompt
               .prompt({
                 sessionID: session.id,
@@ -2940,6 +3222,26 @@ export const layer = Layer.effect(
             // fail it as cancelled so the body unwinds as `cancelled` and the
             // settlement callbacks below never flip the node to `completed`.
             aborted = isAbortedMessage(message)
+            // Item 15: an abort caused by a SKIP request (skipAgent aborted this
+            // node's session, no run-level cancel/pause in flight) settles the
+            // step as `skipped` and resolves null — checked BEFORE the cancel
+            // branch below. A prompt that resolved NORMALLY before the abort
+            // landed (aborted === false) keeps its result: the skip came too
+            // late. Budget: aborted === true ⇒ the ensuring below skips the
+            // charge, so skip-artifact cost is never billed.
+            if (
+              aborted &&
+              active.skipRequests.has(node.id) &&
+              !active.cancelling &&
+              !active.removed &&
+              !active.pausing
+            ) {
+              node.status = "skipped"
+              node.completed_at = Date.now()
+              node.output = undefined
+              yield* persistRun(db, events, active)
+              return SKIPPED
+            }
             if (active.cancelling || active.removed || aborted) {
               return yield* Effect.die(new CancelledError())
             }
@@ -2999,6 +3301,12 @@ export const layer = Layer.effect(
                 // makes `spent()`/`remaining()`/`total` mutually consistent.
                 active.budgetRemaining -= node.cost ?? 0
                 active.costSpent += node.cost ?? 0
+                // Item 17: token accounting at the SAME site, under the SAME
+                // guards. Counted: output + reasoning (reasoning is output-billed
+                // — the original counts the turn's output tokens); input/cache
+                // deliberately NOT counted. Journal replays charge automatically
+                // (node.tokens is copied on a cache hit before this runs).
+                active.tokensSpent += node.tokens ? node.tokens.output + node.tokens.reasoning : 0
               }),
             ),
             // Run-wide concurrency cap (Spec §5.1): acquire one permit around
@@ -3031,6 +3339,11 @@ export const layer = Layer.effect(
           ),
         ).then(
           (result) => {
+            // Item 15: a skipped step resolves `null` — BEFORE the terminal
+            // settlement guard below (the run may legitimately finish while the
+            // skip settles) and without a second persist (the dispatch gen
+            // already persisted the node's `skipped` state).
+            if (result === SKIPPED) return null
             // Settlement guard (Fund 4): once the run is cancelling/pausing/
             // removed or already terminal, the success branch is a NO-OP for the
             // node and emits NO further write. Otherwise a resolve-on-abort step
@@ -3060,6 +3373,26 @@ export const layer = Layer.effect(
           },
         )
       }
+
+      // Item 15 (onError:"null"): the public agent vector. A FINAL catch over the
+      // whole step (gates included — the failure settlement above has already
+      // recorded the node as `failed` with its error by the time it fires):
+      // with `onError: "null"` a failing step resolves `null` so the body can
+      // branch instead of unwinding. Budget/lifetime gates and aborts are NEVER
+      // swallowed (excluded below) — silently nulling those inside a while-loop
+      // would spin forever against an exhausted budget or a cancelled run.
+      const agent = (agentInput: AgentInput, callOpts?: { phaseModel?: string }) =>
+        agentStep(agentInput, callOpts).catch((error) => {
+          if (
+            agentInput.onError === "null" &&
+            !(error instanceof CancelledError) &&
+            !(error instanceof BudgetExceededError) &&
+            !(error instanceof AgentLimitError)
+          ) {
+            return null
+          }
+          throw error
+        })
 
       // Deterministic non-LLM step. Runs a shell command in the run's workspace
       // (or an explicit `cwd`) and resolves to `{ output, exitCode }` WITHOUT
@@ -3529,6 +3862,61 @@ export const layer = Layer.effect(
       return finished ?? (yield* persisted())
     })
 
+    // Item 15: skip ONE in-flight agent step of a LIVE run. Only live runs are
+    // skippable (a persisted/terminal run has no step to resolve); the skip
+    // request is recorded BEFORE the node's session is aborted (the Fund-16
+    // request-flag-first ordering cancel uses), so the abort settlement in
+    // agent() reliably reads it even when the abort lands instantly.
+    const skipAgent: Interface["skipAgent"] = Effect.fn("Workflow.skipAgent")(function* (input) {
+      const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(input.id)
+      if (!active) {
+        // Distinguish 404 (unknown to this workspace) from 409 (known but not
+        // live) via the directory-scoped row, mirroring cancel/pause.
+        const directory = yield* InstanceState.directory
+        const row = yield* db
+          .select()
+          .from(WorkflowRunTable)
+          .where(and(eq(WorkflowRunTable.id, input.id), eq(WorkflowRunTable.directory, directory)))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return undefined
+        return yield* new InvalidError({
+          path: row.workflow,
+          message: `Workflow run is not live: ${input.id} (${row.status})`,
+        })
+      }
+      const node = active.run.agents.find((agent) => agent.id === input.agentId)
+      if (!node) {
+        return yield* new InvalidError({
+          path: active.run.workflow,
+          message: `Workflow agent run not found: ${input.agentId}`,
+        })
+      }
+      // A question step is answered, never skipped — skipping it would strand
+      // the body's ctx.question await without an answer.
+      if (node.kind === "question") {
+        return yield* new InvalidError({
+          path: active.run.workflow,
+          message: `Workflow agent run is a question; answer it instead of skipping: ${input.agentId}`,
+        })
+      }
+      if (node.status !== "running") {
+        return yield* new InvalidError({
+          path: active.run.workflow,
+          message: `Workflow agent run is not running: ${input.agentId} (${node.status})`,
+        })
+      }
+      // Request flag FIRST (race window — see Fund 16), THEN abort the step's
+      // session so the in-flight prompt resolves abort-marked and settles as
+      // `skipped`. A node without a session yet is caught by the pre-prompt
+      // check in agent() instead.
+      active.skipRequests.add(node.id)
+      if (node.session_id && active.cancelSession) {
+        yield* active.cancelSession(SessionID.make(node.session_id)).pipe(Effect.ignore)
+      }
+      return snapshot(active)
+    })
+
     const answer: Interface["answer"] = Effect.fn("Workflow.answer")(function* (input) {
       const id = input.id
       const active = (yield* SynchronizedRef.get((yield* InstanceState.get(state)).runs)).get(id)
@@ -3713,7 +4101,7 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, read, runs, get, start, wait, cancel, pause, answer, save, remove, sweep })
+    return Service.of({ list, read, runs, get, start, wait, cancel, pause, skipAgent, answer, save, remove, sweep })
   }),
 )
 
@@ -3726,6 +4114,13 @@ export const defaultLayer = layer.pipe(
   Layer.provide(EventV2Bridge.defaultLayer),
 )
 
-export const node = LayerNode.make(layer, [Database.node, Session.node, Agent.node, Provider.node, Config.node, EventV2Bridge.node])
+export const node = LayerNode.make(layer, [
+  Database.node,
+  Session.node,
+  Agent.node,
+  Provider.node,
+  Config.node,
+  EventV2Bridge.node,
+])
 
 export * as Workflow from "./workflow"
