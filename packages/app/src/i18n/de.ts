@@ -929,6 +929,9 @@ export const dict = {
   "dialog.workflow.approval.no": "Nein",
 
   "toast.workflow.start.failed.title": "Workflow konnte nicht gestartet werden",
+  "toast.workflow.budget.invalid.title": "Ungültiges Budget",
+  "toast.workflow.budget.invalid.description":
+    "budget={{value}} ist kein gültiger USD-Betrag; der Start wurde abgebrochen.",
   "toast.workflow.started.title": "Workflow gestartet",
   "toast.workflow.started.description": "{{name}} gestartet.",
   "toast.workflow.approval.cancelled.title": "Workflow {{name}} abgebrochen",

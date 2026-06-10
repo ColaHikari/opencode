@@ -113,6 +113,34 @@ export function parseWorkflowArgs(input: string, declaration: WorkflowArgDeclara
   )
 }
 
+// `budget=<n>` is a RESERVED `/workflow` argument: it never reaches the
+// workflow's args but becomes the start payload's cost cap
+// (WorkflowStartPayload.budget, USD). Semantics are identical to the TUI's
+// extractReservedBudget (prompt/workflow-autocomplete.ts):
+//   - A workflow that DECLARES its own `budget` argument owns the name — no
+//     reservation, args pass through untouched (backwards compatibility).
+//   - Otherwise the `budget` key is pulled out; the raw value (number or
+//     numeric string, a leading `$` is tolerated so `budget=$5` works) must be
+//     finite and >= 0 — the engine explicitly allows a 0 cap (HTTP schema:
+//     Finite >= 0), so 0 is valid here too (deliberate deviation from the
+//     original app spec's `> 0` to keep both UIs character-identical).
+//   - An invalid value (`abc`, `-1`, empty) reports `invalid` with the raw
+//     value so the caller can toast and ABORT the start instead of silently
+//     dropping the cap.
+export function extractReservedBudget(
+  args: Record<string, unknown>,
+  declaration: WorkflowArgDeclaration,
+): { args: Record<string, unknown>; budget?: number; invalid?: string } {
+  if (declaration["budget"] !== undefined) return { args }
+  if (!("budget" in args)) return { args }
+  const raw = String(args["budget"])
+  const bare = raw.replace(/^\$/, "")
+  const numeric = Number(bare)
+  if (bare.trim() === "" || !Number.isFinite(numeric) || numeric < 0) return { args, invalid: raw }
+  const { budget: _, ...rest } = args
+  return { args: rest, budget: numeric }
+}
+
 export type WorkflowCommandOption = { name: string; description?: string }
 
 // Direct `/<name>` slash commands for every DISCOVERED workflow (Claude-Code

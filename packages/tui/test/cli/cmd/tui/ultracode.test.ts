@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test"
 import {
+  budgetDirectiveText,
+  detectBudgetDirective,
   detectUltracodeKeyword,
+  stripBudgetDirective,
   stripUltracodeKeyword,
   ultracodeReminder,
   ULTRACODE_PROMPT_DIRECTIVE,
@@ -93,5 +96,72 @@ describe("ultracode keyword", () => {
       expect(wrapped.startsWith("<system-reminder>")).toBeTrue()
       expect(wrapped.endsWith("</system-reminder>")).toBeTrue()
     }
+  })
+})
+
+describe("budget directive", () => {
+  it("matcht '+$5' als eigenständiges Token mit index/length/value/unit", () => {
+    expect(detectBudgetDirective("+$5")).toEqual({ index: 0, length: 3, value: 5, unit: "usd" })
+    expect(detectBudgetDirective("audit +$5 src/")).toEqual({ index: 6, length: 3, value: 5, unit: "usd" })
+  })
+
+  it("matcht Dezimalwerte wie '+$0.50'", () => {
+    expect(detectBudgetDirective("+$0.50")).toEqual({ index: 0, length: 6, value: 0.5, unit: "usd" })
+  })
+
+  it("matcht in Klammern und akzeptiert '+$0'", () => {
+    expect(detectBudgetDirective("(+$5)")?.index).toBe(1)
+    expect(detectBudgetDirective("+$0")?.value).toBe(0)
+  })
+
+  it("matcht nicht, wenn das Token nicht alleine steht", () => {
+    expect(detectBudgetDirective("x+$5")).toBeUndefined()
+    expect(detectBudgetDirective("+$5x")).toBeUndefined()
+    expect(detectBudgetDirective("+5")).toBeUndefined()
+    expect(detectBudgetDirective("+$")).toBeUndefined()
+  })
+
+  // Teilmatch-Verhalten dokumentiert: '+$5.5.5' liefert KEINEN Teilmatch '+$5.5'
+  // — der Punkt im Lookahead verwirft jede kürzere Variante, also gar kein Treffer.
+  it("'+$5.5.5' matcht überhaupt nicht (kein Teilmatch)", () => {
+    expect(detectBudgetDirective("+$5.5.5")).toBeUndefined()
+  })
+
+  it("liefert das erste Vorkommen bei mehreren Direktiven", () => {
+    const hit = detectBudgetDirective("+$3 dann +$7")
+    expect(hit?.index).toBe(0)
+    expect(hit?.value).toBe(3)
+  })
+
+  it("ohne Direktive kommt undefined zurück", () => {
+    expect(detectBudgetDirective("just a normal prompt")).toBeUndefined()
+    expect(detectBudgetDirective("")).toBeUndefined()
+  })
+
+  it("stripBudgetDirective entfernt alle Vorkommen und kollabiert Whitespace", () => {
+    expect(stripBudgetDirective("+$3 audit +$7 src/")).toBe("audit src/")
+    expect(stripBudgetDirective("+$5")).toBe("")
+    // Parität zur stripUltracodeKeyword-Pipeline: hängende Interpunktion wird
+    // angeklebt, führender Doppelpunkt/Whitespace entfernt, Ergebnis getrimmt.
+    expect(stripBudgetDirective("+$5: audit")).toBe("audit")
+    expect(stripBudgetDirective("audit +$5 , fertig")).toBe("audit, fertig")
+  })
+
+  it("Kombination: 'ultracode +$5 audit src/' nach beiden Strips = 'audit src/'", () => {
+    expect(stripBudgetDirective(stripUltracodeKeyword("ultracode +$5 audit src/"))).toBe("audit src/")
+  })
+
+  it("budgetDirectiveText nennt budget, den Betrag und ctx.budget.remaining", () => {
+    const text = budgetDirectiveText(5)
+    expect(text).toContain("budget")
+    expect(text).toContain("$5")
+    expect(text).toContain("ctx.budget.remaining")
+  })
+
+  it("budgetDirectiveText im Reminder-Wrapper bleibt wortgleich enthalten", () => {
+    const wrapped = ultracodeReminder(budgetDirectiveText(3))
+    expect(wrapped).toContain(budgetDirectiveText(3))
+    expect(wrapped.startsWith("<system-reminder>")).toBeTrue()
+    expect(wrapped.endsWith("</system-reminder>")).toBeTrue()
   })
 })

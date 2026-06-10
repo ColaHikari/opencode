@@ -21,8 +21,13 @@ import { buildRequestParts } from "./build-request-parts"
 import { setCursorPosition } from "./editor-dom"
 import { formatServerError } from "@/utils/server-errors"
 import { ScopedKey } from "@/utils/server-scope"
-import { buildUltracodeParts } from "./ultracode"
-import { parseWorkflowArgs, parseWorkflowCommand, type WorkflowArgDeclaration } from "./workflow-command"
+import { buildBudgetPart, buildUltracodeParts } from "./ultracode"
+import {
+  extractReservedBudget,
+  parseWorkflowArgs,
+  parseWorkflowCommand,
+  type WorkflowArgDeclaration,
+} from "./workflow-command"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
 import {
@@ -494,6 +499,20 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           const declaration = (info?.meta.arguments ?? {}) as WorkflowArgDeclaration
           const parsedArgs = parseWorkflowArgs(args, declaration)
 
+          // Reserved `budget=` argument: a workflow-declared budget argument wins
+          // and passes through untouched; otherwise the value becomes the start
+          // payload's cost cap (USD). An invalid value aborts the start with a
+          // toast — never a silently dropped cap. Validated BEFORE the approval
+          // gate so the user is never asked to approve an invalid start.
+          const reserved = extractReservedBudget(parsedArgs, declaration)
+          if (reserved.invalid !== undefined) {
+            showToast({
+              title: language.t("toast.workflow.budget.invalid.title"),
+              description: language.t("toast.workflow.budget.invalid.description", { value: reserved.invalid }),
+            })
+            return
+          }
+
           // Approval gate (parity with the TUI start gate). An unknown name has no
           // info, so it cannot render a meaningful dialog — let the start surface
           // the engine's "not found" rather than asking to approve a non-existent
@@ -527,7 +546,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             name,
             directory: sessionDirectory,
             workflowStartPayload: {
-              args: parsedArgs,
+              args: reserved.args,
+              ...(reserved.budget !== undefined ? { budget: reserved.budget } : {}),
               permissionSessionID: session.id,
             },
           })
@@ -558,15 +578,24 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     if (mode === "normal" && !text.trimStart().startsWith("/")) {
       const keywordEnabled = sync.data.config?.workflows?.ultracode_keyword ?? true
       const ultracode = buildUltracodeParts({ text, session: input.ultracodeSession(), keywordEnabled })
-      if (ultracode.directives.length > 0) {
-        draft.directives = ultracode.directives
-        // Strip the keyword from the visible text parts so the user prompt the
-        // model sees no longer contains the trigger word. Collapse the body to
-        // a single text part when stripping (the keyword span was computed over
-        // the joined text) while preserving non-text parts.
-        if (ultracode.text !== text) {
+      // Budget directive (`+$<n>`): applied AFTER the ultracode strip, on
+      // ultracode.text, so the strip order is deterministic (ultracode first,
+      // budget second). The config gate (workflows.budget_directive) lands with
+      // the engine track's config/SDK regen; the cast keeps the defensive
+      // `?? true` read compiling until the generated type carries the field.
+      const budgetEnabled =
+        (sync.data.config?.workflows as { budget_directive?: boolean } | undefined)?.budget_directive ?? true
+      const budget = buildBudgetPart({ text: ultracode.text, enabled: budgetEnabled })
+      const directives = [...ultracode.directives, ...(budget.directive !== undefined ? [budget.directive] : [])]
+      if (directives.length > 0) {
+        draft.directives = directives
+        // Strip the keyword/directive from the visible text parts so the user
+        // prompt the model sees no longer contains the trigger tokens. Collapse
+        // the body to a single text part when stripping (the spans were computed
+        // over the joined text) while preserving non-text parts.
+        if (budget.text !== text) {
           const nonText = currentPrompt.filter((part) => part.type !== "text")
-          draft.prompt = [{ type: "text", content: ultracode.text, start: 0, end: 0 }, ...nonText]
+          draft.prompt = [{ type: "text", content: budget.text, start: 0, end: 0 }, ...nonText]
         }
       }
     }

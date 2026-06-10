@@ -22,8 +22,14 @@ const storedSessions: Record<string, Array<{ id: string; title?: string }>> = {}
 const promoted: Array<{ directory: string; sessionID: string }> = []
 const sentShell: string[] = []
 const syncedDirectories: string[] = []
-const workflowStarts: Array<{ name: string; directory?: string; args?: Record<string, unknown>; permission?: string }> =
-  []
+const workflowStarts: Array<{
+  name: string
+  directory?: string
+  args?: Record<string, unknown>
+  budget?: number
+  permission?: string
+}> = []
+const toasts: Array<{ title?: string; description?: string }> = []
 const promptParts: Array<Array<{ type: string; text?: string; synthetic?: boolean }>> = []
 let dashboardOpened = 0
 let workflowListData: Array<{ name: string; valid?: boolean; meta: { name: string; arguments?: any } }> = []
@@ -78,6 +84,7 @@ const clientFor = (directory: string) => {
           name: input.name,
           directory: input.directory,
           args: input.workflowStartPayload?.args,
+          budget: input.workflowStartPayload?.budget,
           permission: input.workflowStartPayload?.permissionSessionID,
         })
         return { data: { id: "run-1", session_id: workflowStartSessionId } }
@@ -117,7 +124,10 @@ beforeAll(async () => {
   }))
 
   mock.module("@/utils/toast", () => ({
-    showToast: () => 0,
+    showToast: (input: { title?: string; description?: string }) => {
+      toasts.push({ title: input?.title, description: input?.description })
+      return 0
+    },
   }))
 
   mock.module("@opencode-ai/core/util/encode", () => ({
@@ -295,6 +305,7 @@ beforeEach(() => {
   sentShell.length = 0
   syncedDirectories.length = 0
   workflowStarts.length = 0
+  toasts.length = 0
   promptParts.length = 0
   dashboardOpened = 0
   workflowListData = []
@@ -613,6 +624,47 @@ describe("workflow command routing on submit", () => {
     // No info to gate, so the start still fires (the engine surfaces not-found).
     expect(workflowStarts).toHaveLength(1)
   })
+
+  test("reserved budget= leaves the args and rides the start payload", async () => {
+    params = { id: "session-1" }
+    workflowListData = [{ name: "w", valid: true, meta: { name: "w" } }]
+    promptValue = [{ type: "text", content: "/workflow w budget=5 msg=hi", start: 0, end: 27 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowStarts).toHaveLength(1)
+    expect(workflowStarts[0]).toMatchObject({ name: "w", args: { msg: "hi" }, budget: 5 })
+    expect(workflowStarts[0]?.args).not.toHaveProperty("budget")
+  })
+
+  test("a workflow-declared budget argument stays a normal arg (no payload budget)", async () => {
+    params = { id: "session-1" }
+    workflowListData = [{ name: "w", valid: true, meta: { name: "w", arguments: { budget: { type: "number" } } } }]
+    promptValue = [{ type: "text", content: "/workflow w budget=5", start: 0, end: 20 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowStarts).toHaveLength(1)
+    expect(workflowStarts[0]?.args).toEqual({ budget: 5 })
+    expect(workflowStarts[0]?.budget).toBeUndefined()
+  })
+
+  test("budget=abc aborts the start with a toast", async () => {
+    params = { id: "session-1" }
+    workflowListData = [{ name: "w", valid: true, meta: { name: "w" } }]
+    promptValue = [{ type: "text", content: "/workflow w budget=abc", start: 0, end: 22 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowStarts).toEqual([])
+    expect(toasts.some((toast) => toast.title === "toast.workflow.budget.invalid.title")).toBe(true)
+  })
 })
 
 describe("ultracode injection on submit", () => {
@@ -674,6 +726,40 @@ describe("ultracode injection on submit", () => {
       .join("")
     expect(text).toContain("ultracode fix the bug")
     expect(text).not.toContain("opted into workflow orchestration")
+  })
+
+  test("strips a +$ budget directive and sends the confirmation as reminder part", async () => {
+    params = { id: "session-1" }
+    promptValue = [{ type: "text", content: "+$5 do x", start: 0, end: 8 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    const [first, second] = promptParts[0]
+    expect(first).toMatchObject({ type: "text", synthetic: true })
+    expect(first?.text).toStartWith("<system-reminder>")
+    expect(first?.text).toContain("cost budget of $5")
+    // The visible user part carries the stripped text without the directive.
+    expect(second?.synthetic).toBeUndefined()
+    expect(second?.text).toBe("do x")
+  })
+
+  test("ultracode keyword and budget directive combine (both reminders, both strips)", async () => {
+    params = { id: "session-1" }
+    promptValue = [{ type: "text", content: "ultracode +$3 audit src/", start: 0, end: 24 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+
+    await flush()
+
+    const [first, second, third] = promptParts[0]
+    expect(first?.text).toContain("opted into workflow orchestration")
+    expect(second?.text).toContain("cost budget of $3")
+    expect(third?.text).toBe("audit src/")
+    expect(third?.synthetic).toBeUndefined()
   })
 
   test("queued drafts carry directives and the stripped prompt", async () => {

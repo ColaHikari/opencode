@@ -38,6 +38,9 @@ function formatArgs(args: Record<string, unknown>) {
 export function DialogWorkflowApproval(props: {
   info: WorkflowInfo
   args: Record<string, unknown>
+  // Reserved `budget=` cost cap (USD) extracted from the args; shown so the user
+  // approves the cap together with the start.
+  budget?: number
   controller: ApprovalStackController
 }) {
   const { theme } = useTheme()
@@ -118,6 +121,10 @@ export function DialogWorkflowApproval(props: {
         <text fg={theme.text}>Arguments:</text>
         <text fg={theme.textMuted}>{`  ${formatArgs(props.args)}`}</text>
       </box>
+
+      <Show when={props.budget !== undefined}>
+        <text fg={theme.textMuted}>{`Budget: $${props.budget} (cost cap for this run)`}</text>
+      </Show>
 
       <box flexDirection="column" paddingBottom={1}>
         <For each={OPTIONS}>
@@ -210,13 +217,16 @@ function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void })
 // dismissal resolves "cancel" so the start is always abort-safe. The stack
 // choreography (swap to source pager and back without prematurely resolving) lives
 // in createApprovalStack so it can be unit-tested against a fake dialog.
-DialogWorkflowApproval.show = (dialog: DialogContext, input: { info: WorkflowInfo; args: Record<string, unknown> }) => {
+DialogWorkflowApproval.show = (
+  dialog: DialogContext,
+  input: { info: WorkflowInfo; args: Record<string, unknown>; budget?: number },
+) => {
   return new Promise<WorkflowApprovalResult>((resolve) => {
     const controller = createApprovalStack({
       dialog,
       resolve,
       renderApproval: (controller) => () => (
-        <DialogWorkflowApproval info={input.info} args={input.args} controller={controller} />
+        <DialogWorkflowApproval info={input.info} args={input.args} budget={input.budget} controller={controller} />
       ),
       renderSource: (controller) => () => <DialogWorkflowSource info={input.info} onBack={() => controller.back()} />,
     })

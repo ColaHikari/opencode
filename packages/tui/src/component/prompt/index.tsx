@@ -53,7 +53,7 @@ import { DialogWorkflow } from "../dialog-workflow"
 import { DialogWorkflowApproval } from "../dialog-workflow-approval"
 import { approvalDecision, isSessionApproved, rememberSessionApproval } from "../dialog-workflow-approval-helpers"
 import { parseWorkflowCommand } from "../dialog-workflow-helpers"
-import { listWorkflowInfos, parseWorkflowArgs } from "./workflow-autocomplete"
+import { extractReservedBudget, listWorkflowInfos, parseWorkflowArgs } from "./workflow-autocomplete"
 import {
   confirmWorkspaceFileChanges,
   openWorkspaceSelect,
@@ -67,7 +67,10 @@ import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import {
+  budgetDirectiveText,
+  detectBudgetDirective,
   detectUltracodeKeyword,
+  stripBudgetDirective,
   stripUltracodeKeyword,
   ultracodeReminder,
   ULTRACODE_PROMPT_DIRECTIVE,
@@ -250,6 +253,8 @@ export function Prompt(props: PromptProps) {
   // Separate extmark type for the live ultracode keyword highlight so it never
   // collides with the part-backed extmarks (file/agent/paste) tracked above.
   let ultracodeKeywordTypeId = 0
+  // Same isolation for the live `+$<n>` budget-directive highlight.
+  let budgetDirectiveTypeId = 0
   const event = useEvent()
 
   // Session toggle (/ultracode): when on, every submit gets the session directive
@@ -261,6 +266,14 @@ export function Prompt(props: PromptProps) {
 
   // Config gates only the keyword detection (default true).
   const ultracodeKeywordEnabled = createMemo(() => sync.data.config.workflows?.ultracode_keyword ?? true)
+  // Config gate for the `+$<n>` budget directive ("+$5" can occur in normal
+  // prose, so it must be switch-off-able). The schema field
+  // (workflows.budget_directive) lands with the engine track's config/SDK regen;
+  // the cast keeps the defensive `?? true` read compiling until the generated
+  // type carries the field.
+  const budgetDirectiveEnabled = createMemo(
+    () => (sync.data.config.workflows as { budget_directive?: boolean } | undefined)?.budget_directive ?? true,
+  )
 
   event.on("tui.prompt.append", (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
@@ -338,6 +351,16 @@ export function Prompt(props: PromptProps) {
     // leading-slash dispatch detection.
     if (store.prompt.input.trimStart().startsWith("/")) return undefined
     return detectUltracodeKeyword(store.prompt.input)
+  })
+
+  // Live `+$<n>` budget-directive hit — same guards as the keyword memo (config
+  // gate, shell mode, slash dispatch) so the highlight mirrors the submit
+  // behaviour exactly.
+  const budgetHit = createMemo(() => {
+    if (!budgetDirectiveEnabled()) return undefined
+    if (store.mode === "shell") return undefined
+    if (store.prompt.input.trimStart().startsWith("/")) return undefined
+    return detectBudgetDirective(store.prompt.input)
   })
 
   createEffect(
@@ -730,6 +753,25 @@ export function Prompt(props: PromptProps) {
       virtual: false,
       styleId: ultracodeStyleId,
       typeId: ultracodeKeywordTypeId,
+    })
+  })
+
+  // Live budget-directive highlight, same lifecycle as the keyword highlight
+  // above. Reuses the ultracode extmark style — one "directive" look, no extra
+  // theme entry.
+  createEffect(() => {
+    const hit = budgetHit()
+    if (!input || input.isDestroyed || budgetDirectiveTypeId === 0) return
+    for (const extmark of input.extmarks.getAllForTypeId(budgetDirectiveTypeId)) {
+      input.extmarks.delete(extmark.id)
+    }
+    if (!hit) return
+    input.extmarks.create({
+      start: hit.index,
+      end: hit.index + hit.length,
+      virtual: false,
+      styleId: ultracodeStyleId,
+      typeId: budgetDirectiveTypeId,
     })
   })
 
@@ -1158,19 +1200,28 @@ export function Prompt(props: PromptProps) {
     // correct, the placeholder spans are protected with unique sentinels across the
     // strip, then expanded normally.
     const keywordActive = ultracodeKeywordEnabled() && detectUltracodeKeyword(store.prompt.input) !== undefined
-    const promptText = keywordActive
+    // Budget directive (`+$<n>`): detected on the SAME raw input as the keyword
+    // (see above — a directive inside pasted content must not trigger), stripped
+    // from the visible text, and confirmed via a synthetic reminder part. The
+    // first hit sets the value; the strip removes every hit.
+    const budgetActive = budgetDirectiveEnabled() ? detectBudgetDirective(store.prompt.input) : undefined
+    const stripActive = keywordActive || budgetActive !== undefined
+    const promptText = stripActive
       ? (() => {
-          // Replace each placeholder span with a sentinel the keyword strip cannot
-          // touch: no `ultracode`, no whitespace (so the `\s+` collapse, leading-`\s`
-          // strip, and trim leave it intact), no colon/punctuation (so the dangling-
-          // punctuation cleanup skips it). NUL delimiters keep it from colliding with
-          // real input. Strip on the raw text, then expand the sentinels back.
+          // Replace each placeholder span with a sentinel the strips cannot touch:
+          // no `ultracode`, no `+$<n>`, no whitespace (so the `\s+` collapse,
+          // leading-`\s` strip, and trim leave it intact), no colon/punctuation (so
+          // the dangling-punctuation cleanup skips it). NUL delimiters keep it from
+          // colliding with real input. Strip on the raw text, then expand the
+          // sentinels back. Strip order is deterministic: keyword first, budget second.
           const sentinels = pastedRanges.map((range, i) => ({ ...range, sentinel: "\u0000P" + i + "\u0000" }))
           const protectedRaw = expandTrackedPastedText(
             store.prompt.input,
             sentinels.map((s) => ({ start: s.start, end: s.end, text: s.sentinel })),
           )
-          const stripped = stripUltracodeKeyword(protectedRaw)
+          let stripped = protectedRaw
+          if (keywordActive) stripped = stripUltracodeKeyword(stripped)
+          if (budgetActive) stripped = stripBudgetDirective(stripped)
           return sentinels.reduce((acc, s) => acc.replace(s.sentinel, s.text), stripped)
         })()
       : inputText
@@ -1180,6 +1231,9 @@ export function Prompt(props: PromptProps) {
         : []),
       ...(keywordActive
         ? [{ type: "text" as const, text: ultracodeReminder(ULTRACODE_PROMPT_DIRECTIVE), synthetic: true }]
+        : []),
+      ...(budgetActive
+        ? [{ type: "text" as const, text: ultracodeReminder(budgetDirectiveText(budgetActive.value)), synthetic: true }]
         : []),
     ]
 
@@ -1213,67 +1267,82 @@ export function Prompt(props: PromptProps) {
         const infos = await listWorkflowInfos(sdk.client.workflow, true)
         const info = infos.find((info) => info.name === name)
         const args = parseWorkflowArgs(workflowCommand.args, info?.meta.arguments ?? {})
-        const startWorkflow = () =>
-          void sdk.client.workflow
-            // Fund 35: route the start's permission prompts (the workflow gate and any
-            // agent-step asks) to the ACTIVE session so they surface here in the TUI,
-            // instead of an orphaned session the user is not looking at.
-            .start({
-              name,
-              workflowStartPayload: {
-                args,
-                permissionSessionID: sessionID,
-              },
-            })
-            .then((result) => {
-              if (!result.data) {
-                toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
-                return
-              }
-              toast.show({ message: `Started workflow ${name}`, variant: "info" })
-              if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
-            })
-            .catch(toast.error)
-
-        // Track D: gate every interactive start behind an approval dialog. The
-        // workflow *tool* keeps its own ask-gate (Permission service) untouched;
-        // this is the TUI pendant for `/workflow <name>`. An unknown name has no
-        // info, so it cannot render a meaningful dialog — let the start surface the
-        // engine's "not found" error as before rather than asking to approve a
-        // workflow that does not exist.
-        const approved = sync.data.config.workflows?.approved ?? []
-        const decision = !info
-          ? "start"
-          : approvalDecision({
-              mode: sync.data.config.workflows?.approval,
-              // OR in the session-local cache so a "Yes, always" earlier in this
-              // session is honoured immediately, even before the config re-sync
-              // makes the persisted value visible here.
-              alreadyApproved: approved.includes(name) || isSessionApproved(name),
-            })
-        if (decision === "start") {
-          startWorkflow()
+        // Reserved `budget=` argument: pulled out of the parsed args (a workflow
+        // that declares its own `budget` argument wins — passthrough) and sent as
+        // the start payload's cost cap. An invalid value aborts the start with a
+        // toast (same fall-through as a cancelled approval: the submit tail below
+        // still clears the prompt).
+        const extracted = extractReservedBudget(args, info?.meta.arguments ?? {})
+        if (extracted.error) {
+          toast.show({ message: extracted.error, variant: "error" })
         } else {
-          const reply = await DialogWorkflowApproval.show(dialog, { info: info!, args })
-          if (reply === "cancel") {
-            toast.show({ message: `Cancelled workflow ${name}`, variant: "info" })
-          } else {
-            // "Yes, always" persists consent so first-run never asks again for this
-            // workflow; the array is rewritten whole (config.update deep-merges and
-            // replaces arrays), which is fine since we append to the loaded list.
-            // Note: under approval:"always" this persists with no behavioural effect
-            // (always asks every start by design); we still record it so switching
-            // back to first-run later honours the prior consent.
-            if (reply === "always") {
-              // Remember in-session first so a second start this session never
-              // re-asks even before the persisted config re-syncs.
-              rememberSessionApproval(name)
-              if (!approved.includes(name))
-                await sdk.client.config
-                  .update({ config: { workflows: { approved: [...approved, name] } } })
-                  .catch(toast.error)
-            }
+          const startWorkflow = () =>
+            void sdk.client.workflow
+              // Fund 35: route the start's permission prompts (the workflow gate and any
+              // agent-step asks) to the ACTIVE session so they surface here in the TUI,
+              // instead of an orphaned session the user is not looking at.
+              .start({
+                name,
+                workflowStartPayload: {
+                  args: extracted.args,
+                  ...(extracted.budget !== undefined ? { budget: extracted.budget } : {}),
+                  permissionSessionID: sessionID,
+                },
+              })
+              .then((result) => {
+                if (!result.data) {
+                  toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
+                  return
+                }
+                toast.show({ message: `Started workflow ${name}`, variant: "info" })
+                if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
+              })
+              .catch(toast.error)
+
+          // Track D: gate every interactive start behind an approval dialog. The
+          // workflow *tool* keeps its own ask-gate (Permission service) untouched;
+          // this is the TUI pendant for `/workflow <name>`. An unknown name has no
+          // info, so it cannot render a meaningful dialog — let the start surface the
+          // engine's "not found" error as before rather than asking to approve a
+          // workflow that does not exist.
+          const approved = sync.data.config.workflows?.approved ?? []
+          const decision = !info
+            ? "start"
+            : approvalDecision({
+                mode: sync.data.config.workflows?.approval,
+                // OR in the session-local cache so a "Yes, always" earlier in this
+                // session is honoured immediately, even before the config re-sync
+                // makes the persisted value visible here.
+                alreadyApproved: approved.includes(name) || isSessionApproved(name),
+              })
+          if (decision === "start") {
             startWorkflow()
+          } else {
+            const reply = await DialogWorkflowApproval.show(dialog, {
+              info: info!,
+              args: extracted.args,
+              budget: extracted.budget,
+            })
+            if (reply === "cancel") {
+              toast.show({ message: `Cancelled workflow ${name}`, variant: "info" })
+            } else {
+              // "Yes, always" persists consent so first-run never asks again for this
+              // workflow; the array is rewritten whole (config.update deep-merges and
+              // replaces arrays), which is fine since we append to the loaded list.
+              // Note: under approval:"always" this persists with no behavioural effect
+              // (always asks every start by design); we still record it so switching
+              // back to first-run later honours the prior consent.
+              if (reply === "always") {
+                // Remember in-session first so a second start this session never
+                // re-asks even before the persisted config re-syncs.
+                rememberSessionApproval(name)
+                if (!approved.includes(name))
+                  await sdk.client.config
+                    .update({ config: { workflows: { approved: [...approved, name] } } })
+                    .catch(toast.error)
+              }
+              startWorkflow()
+            }
           }
         }
       }
@@ -1678,6 +1747,9 @@ export function Prompt(props: PromptProps) {
                 }
                 if (ultracodeKeywordTypeId === 0) {
                   ultracodeKeywordTypeId = input.extmarks.registerType("ultracode-keyword")
+                }
+                if (budgetDirectiveTypeId === 0) {
+                  budgetDirectiveTypeId = input.extmarks.registerType("budget-directive")
                 }
                 props.ref?.(ref)
                 setTimeout(() => {

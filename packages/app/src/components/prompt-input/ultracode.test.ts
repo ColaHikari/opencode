@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import {
+  budgetDirectiveText,
+  buildBudgetPart,
   buildUltracodeParts,
+  detectBudgetDirective,
   detectUltracodeKeyword,
+  stripBudgetDirective,
   stripUltracodeKeyword,
   systemReminder,
   ultracodeToggle,
@@ -59,6 +63,53 @@ describe("buildUltracodeParts", () => {
     const out = buildUltracodeParts({ text: "ultracode fix bug", session: false, keywordEnabled: false })
     expect(out.directives).toEqual([])
     expect(out.text).toBe("ultracode fix bug")
+  })
+})
+
+describe("budget directive", () => {
+  test("detects standalone +$ amounts with span and value", () => {
+    expect(detectBudgetDirective("+$5")).toEqual({ index: 0, length: 3, usd: 5 })
+    expect(detectBudgetDirective("+$5.50")).toEqual({ index: 0, length: 6, usd: 5.5 })
+    expect(detectBudgetDirective("mitten +$5 im Satz")).toEqual({ index: 7, length: 3, usd: 5 })
+  })
+  test("ignores glued or malformed forms", () => {
+    expect(detectBudgetDirective("a+$5")).toBeUndefined()
+    expect(detectBudgetDirective("+$5x")).toBeUndefined()
+    expect(detectBudgetDirective("+5")).toBeUndefined()
+    expect(detectBudgetDirective("5$")).toBeUndefined()
+    expect(detectBudgetDirective("+$")).toBeUndefined()
+    // No partial match either: the trailing-dot lookahead rejects "+$5.2".
+    expect(detectBudgetDirective("+$5.2.3")).toBeUndefined()
+  })
+  test("strips every occurrence and collapses leftover whitespace", () => {
+    expect(stripBudgetDirective("+$3 audit +$7 src/")).toBe("audit src/")
+    expect(stripBudgetDirective("+$5: do x")).toBe("do x")
+    expect(stripBudgetDirective("+$5")).toBe("")
+  })
+  test("budgetDirectiveText carries the amount", () => {
+    expect(budgetDirectiveText(5)).toContain("$5")
+    expect(budgetDirectiveText(5)).toContain("budget: 5")
+  })
+})
+
+describe("buildBudgetPart", () => {
+  test("returns directive + stripped text + usd when enabled", () => {
+    const out = buildBudgetPart({ text: "+$5 do x", enabled: true })
+    expect(out.directive).toBe(budgetDirectiveText(5))
+    expect(out.text).toBe("do x")
+    expect(out.usd).toBe(5)
+  })
+  test("enabled:false leaves the text untouched and adds no directive", () => {
+    expect(buildBudgetPart({ text: "+$5 do x", enabled: false })).toEqual({ text: "+$5 do x" })
+  })
+  test("text without a directive passes through", () => {
+    expect(buildBudgetPart({ text: "do x", enabled: true })).toEqual({ text: "do x" })
+  })
+  test("composes with the ultracode strip (ultracode first, budget second)", () => {
+    const ultracode = buildUltracodeParts({ text: "ultracode +$5 audit src/", session: false, keywordEnabled: true })
+    const budget = buildBudgetPart({ text: ultracode.text, enabled: true })
+    expect(budget.text).toBe("audit src/")
+    expect(budget.usd).toBe(5)
   })
 })
 

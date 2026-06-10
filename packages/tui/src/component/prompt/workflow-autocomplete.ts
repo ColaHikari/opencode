@@ -181,12 +181,27 @@ export function workflowCommandOption(input: TextareaRenderable): AutocompleteOp
   }
 }
 
+// Replaces the arg-name query being typed with `text`, placing the cursor at the
+// end minus `cursorBack` (1 for a string arg so the cursor lands inside the `""`).
+function replaceArgQuery(input: TextareaRenderable, ctx: WorkflowArgContext, text: string, cursorBack: number) {
+  const startOffset = input.cursorOffset - ctx.query.length
+  const cursorOffset = input.cursorOffset
+  input.cursorOffset = startOffset
+  const start = input.logicalCursor
+  input.cursorOffset = cursorOffset
+  const end = input.logicalCursor
+  input.deleteRange(start.row, start.col, end.row, end.col)
+  input.insertText(text)
+  input.cursorOffset = startOffset + Bun.stringWidth(text) - cursorBack
+}
+
 export function workflowArgOptions(
   input: TextareaRenderable,
   ctx: WorkflowArgContext,
   workflow: WorkflowInfo | undefined,
 ): AutocompleteOption[] {
-  return Object.entries(workflow?.meta.arguments ?? {})
+  const declared = workflow?.meta.arguments ?? {}
+  const options = Object.entries(declared)
     .filter(([name]) => !ctx.used.has(name))
     .map(
       ([name, argument]): AutocompleteOption => ({
@@ -201,18 +216,22 @@ export function workflowArgOptions(
           .join(" · "),
         onSelect: () => {
           const text = argument.type === "string" ? `${name}=""` : `${name}=`
-          const startOffset = input.cursorOffset - ctx.query.length
-          const cursorOffset = input.cursorOffset
-          input.cursorOffset = startOffset
-          const start = input.logicalCursor
-          input.cursorOffset = cursorOffset
-          const end = input.logicalCursor
-          input.deleteRange(start.row, start.col, end.row, end.col)
-          input.insertText(text)
-          input.cursorOffset = startOffset + Bun.stringWidth(text) - (argument.type === "string" ? 1 : 0)
+          replaceArgQuery(input, ctx, text, argument.type === "string" ? 1 : 0)
         },
       }),
     )
+  // Reserved `budget=` (extractReservedBudget): offered only while the workflow
+  // does not declare its own `budget` argument (declared wins, no reservation)
+  // and it has not been typed yet. Inserted like a number arg — no quote wrap.
+  if (declared["budget"] === undefined && !ctx.used.has("budget")) {
+    options.push({
+      display: "budget=",
+      value: "budget",
+      description: "reserved · USD cost cap for this run",
+      onSelect: () => replaceArgQuery(input, ctx, "budget=", 0),
+    })
+  }
+  return options
 }
 
 export function workflowOptions(
@@ -283,4 +302,31 @@ export function parseWorkflowArgs(input: string, declaration: WorkflowArgDeclara
       return [[name, Number.isFinite(numeric) && value.trim() !== "" ? numeric : value]]
     }),
   )
+}
+
+// `budget=<n>` is a RESERVED `/workflow` argument: it never reaches the
+// workflow's args but becomes the start payload's cost cap
+// (WorkflowStartPayload.budget, USD). Rules:
+//   - A workflow that DECLARES its own `budget` argument owns the name — no
+//     reservation, args pass through untouched (backwards compatibility).
+//   - Otherwise a `budget` key is pulled out of the args; the raw value is
+//     parsed as a number (a leading `$` is tolerated, so `budget=$5` works) and
+//     must be finite and >= 0 — the engine explicitly allows a 0 cap (HTTP
+//     schema: Finite >= 0).
+//   - An invalid value (`abc`, `-1`, empty) reports `error` so the caller can
+//     toast and ABORT the start instead of silently dropping the cap.
+export function extractReservedBudget(
+  args: Record<string, unknown>,
+  declaration: WorkflowArgDeclaration = {},
+): { args: Record<string, unknown>; budget?: number; error?: string } {
+  if (declaration["budget"] !== undefined) return { args }
+  if (!("budget" in args)) return { args }
+  const raw = String(args["budget"])
+  const bare = raw.replace(/^\$/, "")
+  const numeric = Number(bare)
+  if (bare.trim() === "" || !Number.isFinite(numeric) || numeric < 0) {
+    return { args, error: `Invalid budget value: ${raw}` }
+  }
+  const { budget: _, ...rest } = args
+  return { args: rest, budget: numeric }
 }

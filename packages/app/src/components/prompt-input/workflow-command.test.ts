@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  extractReservedBudget,
   parseWorkflowArgs,
   parseWorkflowCommand,
   sanitizeWorkflowFilename,
@@ -36,6 +37,28 @@ describe("parseWorkflowArgs", () => {
   })
   test("keeps quoted value with spaces intact", () =>
     expect(parseWorkflowArgs('msg="a b"', {})).toEqual({ msg: "a b" }))
+})
+
+describe("extractReservedBudget", () => {
+  test("number value sets budget and removes the key", () =>
+    expect(extractReservedBudget({ budget: 5, msg: "hi" }, {})).toEqual({ args: { msg: "hi" }, budget: 5 }))
+  test("numeric string and $-prefixed values parse", () => {
+    expect(extractReservedBudget({ budget: "2.5" }, {})).toEqual({ args: {}, budget: 2.5 })
+    expect(extractReservedBudget({ budget: "$5" }, {})).toEqual({ args: {}, budget: 5 })
+  })
+  test("budget=0 is valid (the engine allows a zero cap)", () =>
+    expect(extractReservedBudget({ budget: "0" }, {})).toEqual({ args: {}, budget: 0 }))
+  test("a workflow-declared budget argument passes through untouched", () =>
+    expect(extractReservedBudget({ budget: "5" }, { budget: { type: "number" } })).toEqual({
+      args: { budget: "5" },
+    }))
+  test("invalid values report the raw value so the caller can abort", () => {
+    expect(extractReservedBudget({ budget: "abc" }, {}).invalid).toBe("abc")
+    expect(extractReservedBudget({ budget: "-1" }, {}).invalid).toBe("-1")
+    expect(extractReservedBudget({ budget: "" }, {}).invalid).toBe("")
+  })
+  test("no budget key passes through unchanged", () =>
+    expect(extractReservedBudget({ msg: "hi" }, {})).toEqual({ args: { msg: "hi" } }))
 })
 
 describe("workflowCommandOptions", () => {
