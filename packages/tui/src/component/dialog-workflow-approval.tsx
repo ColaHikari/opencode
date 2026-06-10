@@ -12,6 +12,7 @@ import {
   type ApprovalStackController,
   type WorkflowApprovalResult,
 } from "./dialog-workflow-approval-helpers"
+import { phaseTitles } from "./dialog-workflow-helpers"
 
 export type { WorkflowApprovalResult }
 
@@ -42,7 +43,9 @@ export function DialogWorkflowApproval(props: {
   const { theme } = useTheme()
   const [active, setActive] = createSignal(0)
 
-  const phases = createMemo(() => props.info.meta.phases ?? [])
+  // Item 9: phases may be structured entries (string | {title, …}); normalize to
+  // the title strings so a structured phase never renders as "[object Object]".
+  const phases = createMemo(() => phaseTitles(props.info.meta.phases))
   const description = createMemo(() => props.info.meta.description)
   const whenToUse = createMemo(() => props.info.meta.whenToUse)
 
@@ -78,13 +81,20 @@ export function DialogWorkflowApproval(props: {
 
   return (
     <box paddingLeft={2} paddingRight={2} gap={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text attributes={TextAttributes.BOLD} fg={theme.text}>
-          Start workflow: {props.info.name}
-        </text>
-        <text fg={theme.textMuted} onMouseUp={() => choose({ id: "cancel", label: "No" })}>
-          esc
-        </text>
+      <box flexDirection="column">
+        <box flexDirection="row" justifyContent="space-between">
+          {/* Item 9: title with the workflow's DISPLAY name (meta.name); the
+              command/file name reads as a muted subtitle when it differs. */}
+          <text attributes={TextAttributes.BOLD} fg={theme.text}>
+            Start workflow: {props.info.meta.name}
+          </text>
+          <text fg={theme.textMuted} onMouseUp={() => choose({ id: "cancel", label: "No" })}>
+            esc
+          </text>
+        </box>
+        <Show when={props.info.meta.name !== props.info.name}>
+          <text fg={theme.textMuted}>{`/${props.info.name} — ${props.info.path}`}</text>
+        </Show>
       </box>
 
       <Show when={description()}>

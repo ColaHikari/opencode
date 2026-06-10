@@ -7,12 +7,14 @@ import {
   parseWorkflowCommand,
   phaseIcon,
   phaseStatus,
+  phaseTitles,
   questionBadge,
   reanchorSelection,
   sanitizeWorkflowFilename,
   saveTargets,
   spentThisMonth,
   statusIcon,
+  workflowPermissionDisplay,
 } from "../../../../src/component/dialog-workflow-helpers"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import path from "path"
@@ -355,5 +357,87 @@ describe("saveTargets (project vs global workflow file destinations)", () => {
     const targets = saveTargets("/proj", "/home/.config/opencode", "review")
     expect(targets.project).toBe(path.join("/proj", ".opencode", "workflows", "review.ts"))
     expect(targets.global).toBe(path.join("/home/.config/opencode", "workflows", "review.ts"))
+  })
+})
+
+describe("workflowPermissionDisplay (Item 9 — workflow permission prompt derivation)", () => {
+  test("fully populated metadata titles with the display name and derives every field", () => {
+    const d = workflowPermissionDisplay({
+      name: "deep-research",
+      display_name: "Deep Research",
+      description: "Researches a topic in depth.",
+      action: "start",
+      args: { topic: "effect", rounds: 3 },
+      background: true,
+    })
+    expect(d.title).toBe("Start workflow: Deep Research")
+    expect(d.description).toBe("Researches a topic in depth.")
+    // display name differs from the command name, so the command name surfaces.
+    expect(d.commandName).toBe("deep-research")
+    expect(d.args).toEqual([
+      ["topic", "effect"],
+      ["rounds", "3"],
+    ])
+    expect(d.background).toBe(true)
+  })
+
+  test("commandName stays unset when the display name equals the name", () => {
+    const d = workflowPermissionDisplay({ name: "Inline", display_name: "Inline" })
+    expect(d.title).toBe("Start workflow: Inline")
+    expect(d.commandName).toBeUndefined()
+  })
+
+  test("empty or undefined metadata degrades to the generic title without crashing", () => {
+    for (const metadata of [undefined, {}]) {
+      const d = workflowPermissionDisplay(metadata)
+      expect(d.title).toBe("Start workflow: workflow")
+      expect(d.description).toBeUndefined()
+      expect(d.commandName).toBeUndefined()
+      expect(d.args).toEqual([])
+      expect(d.background).toBe(false)
+    }
+  })
+
+  test("action create titles with Create", () => {
+    const d = workflowPermissionDisplay({ name: "made", display_name: "Made Nicely", action: "create" })
+    expect(d.title).toBe("Create workflow: Made Nicely")
+  })
+
+  test("non-string and malformed fields are ignored defensively", () => {
+    const d = workflowPermissionDisplay({
+      name: 42,
+      display_name: { evil: true },
+      description: 7,
+      args: ["not", "a", "record"],
+      background: "true",
+    })
+    expect(d.title).toBe("Start workflow: workflow")
+    expect(d.description).toBeUndefined()
+    expect(d.args).toEqual([])
+    // background must be a real boolean true, never a truthy string.
+    expect(d.background).toBe(false)
+  })
+
+  test("non-string arg values are coerced via String()", () => {
+    const d = workflowPermissionDisplay({ name: "x", args: { flag: true, count: 2, obj: { a: 1 } } })
+    expect(d.args).toEqual([
+      ["flag", "true"],
+      ["count", "2"],
+      ["obj", "[object Object]"],
+    ])
+  })
+})
+
+describe("phaseTitles (Item 9 — structured phase normalization)", () => {
+  test("plain string phases pass through", () => {
+    expect(phaseTitles(["plan", "build"])).toEqual(["plan", "build"])
+  })
+
+  test("structured entries are reduced to their titles (no [object Object])", () => {
+    expect(phaseTitles(["plan", { title: "build" }, { title: "verify" }])).toEqual(["plan", "build", "verify"])
+  })
+
+  test("undefined phases yield an empty list", () => {
+    expect(phaseTitles(undefined)).toEqual([])
   })
 })

@@ -154,6 +154,50 @@ export function questionBadge(run: WorkflowRun): "⏳" | "" {
   return ""
 }
 
+// Item 9: pure display derivation for the `workflow` permission prompt. The
+// tool's ask metadata carries name (sanitized, also the pattern/`always` key),
+// display_name + description (from the statically parsed meta, display only),
+// action ("start"/"create"), args, and background. metadata is untrusted
+// Record<string, unknown> (possibly from an older server), so every field is
+// type-checked defensively — missing/empty metadata degrades to a generic
+// title, never a crash.
+export function workflowPermissionDisplay(metadata: Record<string, unknown> | undefined): {
+  title: string
+  description?: string
+  commandName?: string
+  args: [string, string][]
+  background: boolean
+} {
+  const meta = metadata ?? {}
+  const name = typeof meta["name"] === "string" && meta["name"] ? meta["name"] : "workflow"
+  const displayName = typeof meta["display_name"] === "string" && meta["display_name"] ? meta["display_name"] : undefined
+  const action = meta["action"] === "create" ? "Create" : "Start"
+  const description = typeof meta["description"] === "string" && meta["description"] ? meta["description"] : undefined
+  const args =
+    typeof meta["args"] === "object" && meta["args"] !== null && !Array.isArray(meta["args"])
+      ? Object.entries(meta["args"] as Record<string, unknown>).map(
+          ([key, value]) => [key, String(value)] as [string, string],
+        )
+      : []
+  return {
+    title: `${action} workflow: ${displayName ?? name}`,
+    description,
+    // The command/file name reads as a secondary line only when the display name
+    // actually differs from it.
+    commandName: displayName && displayName !== name ? name : undefined,
+    args,
+    background: meta["background"] === true,
+  }
+}
+
+// Item 9: meta.phases entries are string | {title, …} (structured phases carry
+// detail/model). Normalize to the title strings — exactly like runPhases in
+// dialog-workflow.tsx, which Item 14 will converge onto this helper. Rendering
+// the raw entry produced "[object Object]" for structured phases.
+export function phaseTitles(phases: readonly (string | { title: string })[] | undefined): string[] {
+  return (phases ?? []).map((phase) => (typeof phase === "string" ? phase : phase.title))
+}
+
 export type WorkflowCommand = { type: "dashboard" } | { type: "start"; name: string; args: string }
 
 // Fund 59: dispatch `/workflows ...` to the dashboard and `/workflow <name> ...`

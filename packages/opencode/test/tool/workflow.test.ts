@@ -1,4 +1,5 @@
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Global } from "@opencode-ai/core/global"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { afterEach, describe, expect } from "bun:test"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
@@ -8,6 +9,7 @@ import path from "path"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { WorkflowTool } from "@/tool/workflow"
+import AUTHORING_GUIDE from "@/tool/workflow.txt"
 import { Workflow } from "@/workflow/workflow"
 import { Session } from "@/session/session"
 import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
@@ -57,6 +59,15 @@ async function writeWorkflow(dir: string, name: string, source: string) {
   const workflows = path.join(dir, ".opencode", "workflows")
   await fs.mkdir(workflows, { recursive: true })
   await Bun.write(path.join(workflows, `${name}.ts`), source)
+}
+
+// Item 18: temporary starts persist their script under the GLOBAL data dir
+// (survives the tmpdir instance); sweep the per-run directory so test runs do
+// not accumulate artifacts there.
+function cleanupPersistedScript(runId: string) {
+  return Effect.promise(() =>
+    fs.rm(path.join(Global.Path.data, "workflow", runId), { recursive: true, force: true }),
+  )
 }
 
 function requestRecorder() {
@@ -148,6 +159,91 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
         expect(result.output).toContain("Say hello.")
         expect(result.output).toContain(`<argument name="value" type="number">Value to echo.</argument>`)
         expect(result.output).not.toContain("export async function run")
+      }),
+    ),
+  )
+
+  // Item 1: read WITHOUT a name is the authoring-guide path — guide text plus
+  // the startable workflows and the dispatchable agent roster, instead of the
+  // old hard "name is required" failure.
+  it.live("read without name returns the authoring guide with workflow list and agent roster", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello", description: "Say hello." }
+export async function run() { return "ok" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "read" }, requestRecorder().ctx)
+        expect(result.title).toBe("Workflow authoring guide")
+        // Pipeline-first doctrine anchor (the literal smell-test sentence).
+        expect(result.output).toContain("you did not need the barrier")
+        expect(result.output).toContain("<available_agents>")
+        // The discovered workflow shows up in the appended list.
+        expect(result.output).toContain("<available_workflows>")
+        expect(result.output).toContain("<name>hello</name>")
+      }),
+    ),
+  )
+
+  it.live("read without name in a project without own workflows still returns the guide", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "read" }, requestRecorder().ctx)
+        expect(result.output).toContain("WORKFLOW AUTHORING GUIDE")
+        // Builtin workflows may exist even in an empty project, so the list block
+        // is either populated or the explicit empty marker — never absent.
+        expect(
+          result.output.includes("<available_workflows>") ||
+            result.output.includes("No workflows are currently available."),
+        ).toBe(true)
+        expect(result.output).toContain("<available_agents>")
+      }),
+    ),
+  )
+
+  // Item 1 canary against guide drift: the guide must keep describing every ctx
+  // primitive of the REAL authoring API plus the load-bearing idioms. A rename or
+  // dropped section fails here before it misleads a model.
+  it.live("authoring guide documents every ctx primitive and the core idioms (canary)", () =>
+    Effect.sync(() => {
+      for (const anchor of [
+        "ctx.agent",
+        "ctx.parallel",
+        "ctx.pipeline",
+        "ctx.shell",
+        "ctx.question",
+        "ctx.setPhase",
+        "ctx.log",
+        "ctx.workflow",
+        "ctx.budget",
+        "filter((x) => x !== null)",
+        "run(args, ctx)",
+      ]) {
+        expect(AUTHORING_GUIDE).toContain(anchor)
+      }
+    }),
+  )
+
+  // Item 1: a failed meta validation on create points the author at the guide.
+  it.live("create with invalid meta points to the authoring guide", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        // Non-literal meta name → MetaReader rejects it statically after the write.
+        const source = `export const meta = { name: someVar }
+export async function run() {}
+`
+        const exit = yield* Effect.exit(tool.execute({ action: "create", name: "badmeta", source }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("authoring guide")
       }),
     ),
   )
@@ -285,6 +381,12 @@ export async function run(args, ctx) { return { value: args.value } }
         expect(recorder.requests.length).toBe(1)
         expect(recorder.requests[0].permission).toBe("workflow")
         expect(recorder.requests[0].patterns).toEqual(["Inline"])
+        // Item 9: the ask metadata carries the display fields for the approval UI.
+        expect(recorder.requests[0].metadata).toMatchObject({
+          display_name: "Inline",
+          description: "Inline run.",
+          action: "start",
+        })
         expect(result.output).toContain(`state="completed"`)
         expect(result.output).toContain('"value": 9')
         // The run is flagged temporary in its definition.
@@ -324,6 +426,196 @@ export async function run() {}
     ),
   )
 
+  // Item 18: every inline start leaves an editable, durable script copy under
+  // Global.Path.data/workflow/<runId>/script.ts; the result advertises it both
+  // in metadata.scriptPath and as a <script_path> output line.
+  it.live("inline start persists the script and returns its path", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Inline", description: "Inline run." }
+export async function run(args, ctx) { return { value: args.value } }
+`
+        const result = yield* tool.execute({ action: "start", source, args: { value: 9 } }, recorder.ctx)
+        const runId = result.metadata.runId as string
+        const scriptPath = result.metadata.scriptPath as string
+        expect(scriptPath).toBe(path.join(Global.Path.data, "workflow", runId, "script.ts"))
+        const persisted = yield* Effect.promise(() => fs.readFile(scriptPath, "utf8"))
+        expect(persisted).toBe(source)
+        expect(result.output).toContain(`<script_path>${scriptPath}</script_path>`)
+        yield* cleanupPersistedScript(runId)
+      }),
+    ),
+  )
+
+  // Item 18: script_path starts the file's source as a temporary run; the
+  // permission ask keys on the script's meta name (same N15 shape as inline) and
+  // carries the resolved path for the approval display.
+  it.live("script_path starts a temporary run from a file", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "scratch", "wf.ts")
+        yield* Effect.promise(async () => {
+          await fs.mkdir(path.dirname(file), { recursive: true })
+          await Bun.write(
+            file,
+            `export const meta = { name: "Scripted", description: "From a file." }
+export async function run(args, ctx) { return { ok: true } }
+`,
+          )
+        })
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        // Project-RELATIVE path: resolved against the project root, like create.
+        const result = yield* tool.execute({ action: "start", script_path: path.join("scratch", "wf.ts") }, recorder.ctx)
+        const workflowAsk = recorder.requests.find((req) => req.permission === "workflow")
+        expect(workflowAsk).toBeDefined()
+        expect(workflowAsk!.patterns).toEqual(["Scripted"])
+        expect(workflowAsk!.metadata?.path).toBe(file)
+        // An in-project script never trips the external_directory gate.
+        expect(recorder.requests.some((req) => req.permission === "external_directory")).toBe(false)
+        expect(result.output).toContain('state="completed"')
+        expect(result.output).toContain("<temporary>true</temporary>")
+        yield* cleanupPersistedScript(result.metadata.runId as string)
+      }),
+    ),
+  )
+
+  // Item 18: exactly ONE of name | source | script_path selects the workflow.
+  it.live("script_path is mutually exclusive with name and source", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const combos: Array<Record<string, unknown>> = [
+          { action: "start", name: "x", script_path: "y.ts" },
+          { action: "start", source: 'export const meta = { name: "X" }', script_path: "y.ts" },
+        ]
+        for (const combo of combos) {
+          const exit = yield* Effect.exit(tool.execute(combo as never, recorder.ctx))
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain(
+            "Provide exactly one of name, source, or script_path for action=start",
+          )
+        }
+        expect(recorder.requests.length).toBe(0)
+      }),
+    ),
+  )
+
+  // Item 18: a script outside the project runs through the external_directory
+  // permission BEFORE anything is read — the same gate create applies to writes.
+  it.live("script_path outside the project goes through the external_directory gate", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const outsideDir = path.join(os.tmpdir(), `oc-wf-ext-${Math.random().toString(16).slice(2)}`)
+        const outside = path.join(outsideDir, "wf.ts")
+        yield* Effect.promise(async () => {
+          await fs.mkdir(outsideDir, { recursive: true })
+          await Bun.write(
+            outside,
+            `export const meta = { name: "Outside" }
+export async function run() { return "ok" }
+`,
+          )
+        })
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const result = yield* tool.execute({ action: "start", script_path: outside }, recorder.ctx)
+        // The external_directory ask fired (the recorder grants it), then the
+        // workflow ask, then the run completed.
+        expect(recorder.requests.some((req) => req.permission === "external_directory")).toBe(true)
+        expect(recorder.requests.some((req) => req.permission === "workflow")).toBe(true)
+        expect(result.output).toContain('state="completed"')
+        yield* cleanupPersistedScript(result.metadata.runId as string)
+        yield* Effect.promise(() => fs.rm(outsideDir, { recursive: true, force: true }))
+      }),
+    ),
+  )
+
+  // Item 18: the iteration loop — the file is read FRESH on every start (the
+  // engine's loadModule writes a unique temp copy per load, so there is no module
+  // cache to defeat).
+  it.live("edited script re-invoked via script_path picks up the change", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "iter.ts")
+        yield* Effect.promise(() =>
+          Bun.write(file, `export const meta = { name: "Iter" }\nexport async function run() { return "first-result" }\n`),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const first = yield* tool.execute({ action: "start", script_path: file }, recorder.ctx)
+        expect(first.output).toContain("first-result")
+
+        yield* Effect.promise(() =>
+          Bun.write(file, `export const meta = { name: "Iter" }\nexport async function run() { return "second-result" }\n`),
+        )
+        const second = yield* tool.execute({ action: "start", script_path: file }, recorder.ctx)
+        expect(second.output).toContain("second-result")
+        yield* cleanupPersistedScript(first.metadata.runId as string)
+        yield* cleanupPersistedScript(second.metadata.runId as string)
+      }),
+    ),
+  )
+
+  // Item 18: script_path composes with resume_of — pause a script-started source
+  // run, then re-invoke the same script with resume_of; the engine's identity
+  // guard accepts it (same meta.name) and the run carries resume_of.
+  it.live("script_path with resume_of resumes a paused source run", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "scriptecho.ts")
+        yield* Effect.promise(() =>
+          Bun.write(
+            file,
+            `export const meta = { name: "ScriptEcho" }
+export async function run(args, ctx) { if (args.hang) await new Promise(() => {}); return { value: args.value } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const first = yield* tool.execute(
+          { action: "start", script_path: file, args: { value: 1, hang: true }, background: true },
+          recorder.ctx,
+        )
+        const sourceId = first.metadata.runId as string
+        const paused = yield* tool.execute({ action: "pause", run_id: sourceId }, recorder.ctx)
+        expect(paused.output).toContain('state="paused"')
+
+        const resumed = yield* tool.execute(
+          { action: "start", script_path: file, args: { value: 1 }, resume_of: sourceId },
+          recorder.ctx,
+        )
+        const workflow = yield* Workflow.Service
+        const run = yield* workflow.get(Workflow.RunID.make(resumed.metadata.runId as string))
+        expect(run?.resume_of as string | undefined).toBe(sourceId)
+        expect(resumed.output).toContain('state="completed"')
+        yield* cleanupPersistedScript(sourceId)
+        yield* cleanupPersistedScript(resumed.metadata.runId as string)
+      }),
+    ),
+  )
+
+  // Item 18: only .ts/.js scripts are startable — anything else is rejected
+  // before any permission ask or read.
+  it.live("non-.ts/.js script_path is rejected", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const exit = yield* Effect.exit(tool.execute({ action: "start", script_path: "wf.txt" }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain(
+          "Workflow scripts must be .ts or .js files",
+        )
+        expect(recorder.requests.length).toBe(0)
+      }),
+    ),
+  )
+
   it.live("routes workflow agent permission asks to the caller session", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
@@ -345,6 +637,83 @@ export async function run(args, ctx) {
 
         expect(result.output).toContain(`<workflow_run id="${result.metadata.runId}" state="completed">`)
         expect(recorder.prompts.some((prompt) => prompt.permissionSessionID === recorder.ctx.sessionID)).toBe(true)
+      }),
+    ),
+  )
+
+  // Item 9: a named start enriches the ask metadata with the workflow's display
+  // name + description so the permission prompt can title with them — while the
+  // patterns/`always` stay keyed on the sanitized file/command name (N15).
+  it.live("start asks with display_name and description in metadata", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "displayed",
+            `export const meta = { name: "Display Name", description: "Does X." }
+export async function run() { return "ok" }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        yield* tool.execute({ action: "start", name: "displayed" }, recorder.ctx)
+        expect(recorder.requests.length).toBe(1)
+        expect(recorder.requests[0].metadata).toMatchObject({
+          name: "displayed",
+          display_name: "Display Name",
+          description: "Does X.",
+          action: "start",
+        })
+        // The display name NEVER leaks into the permission patterns/`always`.
+        expect(recorder.requests[0].patterns).toEqual(["displayed"])
+        expect(recorder.requests[0].always).toEqual(["displayed"])
+      }),
+    ),
+  )
+
+  // Item 9: create pre-parses the source statically (display only) so its ask
+  // carries action:"create" plus the display fields.
+  it.live("create asks with action create and the display fields", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: "Made Nicely", description: "Creates things." }
+export async function run() { return "ok" }
+`
+        yield* tool.execute({ action: "create", name: "made", source }, recorder.ctx)
+        const workflowAsk = recorder.requests.find((req) => req.permission === "workflow")
+        expect(workflowAsk).toBeDefined()
+        expect(workflowAsk!.metadata).toMatchObject({
+          name: "made",
+          display_name: "Made Nicely",
+          description: "Creates things.",
+          action: "create",
+        })
+      }),
+    ),
+  )
+
+  // Item 9: an INVALID source still asks (the pre-parse is display-only and
+  // tolerant) — just without the display fields — and the unchanged post-write
+  // validation still fails the create afterwards.
+  it.live("create with an invalid source still asks without display fields and fails after the write", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `export const meta = { name: 42 }
+export async function run() { return "ok" }
+`
+        const exit = yield* Effect.exit(tool.execute({ action: "create", name: "badmeta", source }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        const workflowAsk = recorder.requests.find((req) => req.permission === "workflow")
+        expect(workflowAsk).toBeDefined()
+        expect(workflowAsk!.metadata).toMatchObject({ name: "badmeta", action: "create" })
+        expect(workflowAsk!.metadata?.display_name).toBeUndefined()
+        expect(workflowAsk!.metadata?.description).toBeUndefined()
       }),
     ),
   )
@@ -1476,6 +1845,145 @@ export async function run() { return "ok" }
         )
         expect(Exit.isFailure(exit)).toBe(true)
         expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("invalid arguments")
+      }),
+    ),
+  )
+
+  // Item 5: cancel stops a running background run TERMINALLY, and because the
+  // agent initiated the stop deliberately, the BackgroundJob wait fiber is
+  // cancelled FIRST — the synthetic backgroundMessage("error") prompt for the
+  // now-cancelled run must never reach the parent session.
+  it.live("cancel action stops a running background run and suppresses the completion message", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "hang",
+            `export const meta = { name: "Hang" }\nexport async function run() { await new Promise(() => {}) }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        // A real caller session: the background completion path looks it up before
+        // delivering its synthetic message, so a fake id would make the
+        // "no message" assertion vacuous.
+        const sessions = yield* Session.Service
+        const caller = yield* sessions.create({ title: "caller" })
+        const ctx: Tool.Context = { ...recorder.ctx, sessionID: caller.id }
+        const started = yield* tool.execute({ action: "start", name: "hang", background: true }, ctx)
+        const runId = started.metadata.runId as string
+
+        const cancelled = yield* tool.execute({ action: "cancel", run_id: runId }, ctx)
+        expect(cancelled.output).toContain('state="cancelled"')
+        expect(cancelled.metadata.action).toBe("cancel")
+
+        // The engine settled on the terminal cancelled state ...
+        const workflow = yield* Workflow.Service
+        yield* pollWithTimeout(
+          workflow
+            .get(Workflow.RunID.make(runId))
+            .pipe(Effect.map((run) => (run?.status === "cancelled" ? run : undefined))),
+          "run never settled as cancelled",
+        )
+        // ... and no synthetic background error message was delivered to the
+        // parent session (the prompt is forked, so give a stray one a moment to
+        // land before asserting). The recorder also sees the engine's noReply
+        // "Workflow started" notification into the run's OWN session, so the
+        // assertion targets the backgroundMessage envelope, not prompt count.
+        yield* Effect.sleep("300 millis")
+        const backgroundMessages = recorder.prompts.filter((prompt) =>
+          prompt.parts?.some(
+            (part) =>
+              part.type === "text" && (part.text.includes("Background workflow") || part.text.includes("<workflow_run")),
+          ),
+        )
+        expect(backgroundMessages).toEqual([])
+      }),
+    ),
+  )
+
+  // Item 5: pause parks the run resumable (journal kept) and the tool output
+  // carries the resume instruction; a follow-up start with resume_of picks the
+  // parked run up and completes.
+  it.live("pause action parks the run and resume_of picks it up", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        // Hangs only when args.hang is set, exactly like the resume_of test above:
+        // the paused source run hangs deterministically, the resumed run settles.
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "echo",
+            `export const meta = { name: "Echo", description: "Echo." }
+export async function run(args, ctx) { if (args.hang) await new Promise(() => {}); return { value: args.value } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const first = yield* tool.execute(
+          { action: "start", name: "echo", args: { value: 1, hang: true }, background: true },
+          recorder.ctx,
+        )
+        const sourceId = first.metadata.runId as string
+
+        const paused = yield* tool.execute({ action: "pause", run_id: sourceId }, recorder.ctx)
+        expect(paused.output).toContain('state="paused"')
+        expect(paused.metadata.action).toBe("pause")
+        // The resume instruction is rendered only for a genuinely paused run.
+        expect(paused.output).toContain("<instructions>Resume by starting this workflow again with resume_of")
+
+        const resumed = yield* tool.execute(
+          { action: "start", name: "echo", args: { value: 1 }, resume_of: sourceId },
+          recorder.ctx,
+        )
+        const workflow = yield* Workflow.Service
+        const run = yield* workflow.get(Workflow.RunID.make(resumed.metadata.runId as string))
+        expect(run?.resume_of as string | undefined).toBe(sourceId)
+        expect(resumed.output).toContain(`state="completed"`)
+      }),
+    ),
+  )
+
+  // Item 5: a malformed run_id takes the same clean not-found path wait/inspect
+  // use (Fund-7 pattern) — never the RunID schema defect through orDie.
+  it.live("cancel with malformed run_id fails cleanly as not-found", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const exit = yield* Effect.exit(tool.execute({ action: "cancel", run_id: "not-a-job-id" }, recorder.ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        const pretty = Exit.isFailure(exit) ? Cause.pretty(exit.cause) : ""
+        expect(pretty).toContain("Workflow run not found: not-a-job-id")
+        expect(pretty).not.toContain("isStartsWith")
+      }),
+    ),
+  )
+
+  // Item 5: cancel of an already-completed run is idempotent SUCCESS — the agent
+  // sees the run's real terminal snapshot ("Workflow completed: …"), never an
+  // error for a run that is already stopped.
+  it.live("cancel of a completed run returns the snapshot idempotently", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "hello",
+            `export const meta = { name: "Hello" }\nexport async function run() { return "done" }\n`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const started = yield* tool.execute({ action: "start", name: "hello" }, recorder.ctx)
+        const cancelled = yield* tool.execute(
+          { action: "cancel", run_id: started.metadata.runId as string },
+          recorder.ctx,
+        )
+        expect(cancelled.title).toBe(`Workflow completed: ${started.metadata.workflow}`)
+        expect(cancelled.output).toContain('state="completed"')
       }),
     ),
   )
