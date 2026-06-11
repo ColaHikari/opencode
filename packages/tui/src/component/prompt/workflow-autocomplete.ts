@@ -168,6 +168,38 @@ export function workflowCommandOptions(
     }))
 }
 
+// Item 30: the collision set enforcing the Commands > Workflows precedence — a
+// workflow can never shadow a real command. Shared by the `/` popover filter
+// (autocomplete.tsx) and the typed `/<name>` submit dispatch (prompt/index.tsx)
+// so the two routes can never disagree on what counts as a real command:
+//   - built-in palette slashes by display (leading `/` stripped) AND aliases (a
+//     typed alias is just as much a real command trigger as the primary name);
+//   - server commands by name, with the popover's `:mcp` suffix convention
+//     stripped defensively in case a display string is passed through;
+//   - EXCEPT source-"workflow" entries: those are discovery mirrors of the
+//     workflows themselves (surfaced in Command.list() for /help parity, with
+//     an empty template that must never run as a prompt) — reserving them would
+//     block direct routing for every discovered workflow;
+//   - the dispatch words `workflow`/`workflows` are always reserved (typed they
+//     hit the dedicated /workflow[s] routes, so a workflow so named could only
+//     ever start via the explicit `/workflow workflows` spelling).
+export function reservedSlashNames(
+  slashes: readonly { display: string; aliases?: readonly string[] }[],
+  serverCommands: readonly { name: string; source?: string }[],
+): Set<string> {
+  const strip = (display: string) => display.replace(/^\//, "").replace(/:mcp$/, "")
+  const names = new Set<string>(["workflow", "workflows"])
+  for (const slash of slashes) {
+    names.add(strip(slash.display))
+    for (const alias of slash.aliases ?? []) names.add(strip(alias))
+  }
+  for (const command of serverCommands) {
+    if (command.source === "workflow") continue
+    names.add(strip(command.name))
+  }
+  return names
+}
+
 export function workflowCommandOption(input: TextareaRenderable): AutocompleteOption {
   return {
     display: "/workflow",

@@ -6,7 +6,7 @@ import {
   stepSelectableRow,
   type WorkflowPhaseRow,
 } from "../../../../src/component/dialog-workflow-helpers"
-import { phaseProgress } from "../../../../src/component/dialog-workflow"
+import { agentLabel, phaseProgress } from "../../../../src/component/dialog-workflow"
 import type { WorkflowRun } from "@opencode-ai/sdk/v2"
 
 // Builder pattern shared with dialog-workflow-phase.test.ts: only the fields the
@@ -187,5 +187,19 @@ describe("phaseProgress (Item 19 — narrator rows count in neither side)", () =
   test("a logs-only phase reads as empty progress", () => {
     const run = makeRun({ logs: [makeLog({ time: 1_000, phase: "a" })] })
     expect(phaseProgress(run, ["a", "b"], "a")).toBe("")
+  })
+})
+
+describe("agentLabel (Item 16 — per-call label wins over the agent type name)", () => {
+  test("a persisted label is the display name", () => {
+    expect(agentLabel(makeAgent({ agent: "explore", label: "Scan auth module" }))).toBe("Scan auth module")
+  })
+
+  test("without a label the agent (subagent type) name renders", () => {
+    expect(agentLabel(makeAgent({ agent: "explore" }))).toBe("explore")
+  })
+
+  test("with neither, the node id is the fallback", () => {
+    expect(agentLabel(makeAgent({ id: "n1" }))).toBe("agent:n1")
   })
 })

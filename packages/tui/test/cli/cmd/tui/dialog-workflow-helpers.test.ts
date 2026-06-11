@@ -3,6 +3,7 @@ import {
   formatPhase,
   formatShortElapsed,
   mergeRunEvent,
+  parseDirectWorkflowCommand,
   parseWorkflowCommand,
   phaseIcon,
   phaseStatus,
@@ -234,6 +235,49 @@ describe("parseWorkflowCommand (Fund 59 — dispatch, Fund 60 — raw remainder)
   test("non-workflow input is not a workflow command", () => {
     expect(parseWorkflowCommand("/help")).toBeUndefined()
     expect(parseWorkflowCommand("hello")).toBeUndefined()
+  })
+})
+
+describe("parseDirectWorkflowCommand (Item 30 — typed /<name> direct routing)", () => {
+  test("a bare /<name> parses with empty args", () => {
+    expect(parseDirectWorkflowCommand("/review")).toEqual({ name: "review", args: "" })
+  })
+
+  test("args are the raw remainder, preserving quotes and multiple spaces (Fund 60)", () => {
+    expect(parseDirectWorkflowCommand('/review a=1 b="x y"')).toEqual({ name: "review", args: 'a=1 b="x y"' })
+    expect(parseDirectWorkflowCommand('/review msg="hello   world"')).toEqual({
+      name: "review",
+      args: 'msg="hello   world"',
+    })
+  })
+
+  test("the full discovery-name charset is accepted", () => {
+    expect(parseDirectWorkflowCommand("/deep_research-2 x=1")).toEqual({ name: "deep_research-2", args: "x=1" })
+  })
+
+  test("leading whitespace before the slash is tolerated (parseWorkflowCommand parity)", () => {
+    expect(parseDirectWorkflowCommand("  /review a=1")).toEqual({ name: "review", args: "a=1" })
+  })
+
+  test("the /workflow[s] dispatch words never parse as a direct command", () => {
+    expect(parseDirectWorkflowCommand("/workflow x")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/workflow")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/workflows")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/workflows foo")).toBeUndefined()
+  })
+
+  test("a bare slash, non-slash input, and out-of-charset names are rejected", () => {
+    expect(parseDirectWorkflowCommand("/")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("hello")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("review")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/re$view")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/re.view x")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("")).toBeUndefined()
+  })
+
+  test("only the first line is parsed (parseWorkflowCommand consistency)", () => {
+    expect(parseDirectWorkflowCommand("/review a=1\nsecond line")).toEqual({ name: "review", args: "a=1" })
+    expect(parseDirectWorkflowCommand("hello\n/review")).toBeUndefined()
   })
 })
 

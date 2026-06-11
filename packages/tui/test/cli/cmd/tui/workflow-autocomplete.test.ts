@@ -7,6 +7,7 @@ import {
   isWorkflowNameInput,
   listWorkflowInfos,
   parseWorkflowArgs,
+  reservedSlashNames,
   workflowArgContext,
   workflowArgOptions,
   workflowAutocompleteTriggerIndex,
@@ -189,6 +190,54 @@ describe("workflowCommandOptions (direct /<name> slash commands)", () => {
 
   test("no infos yields no options", () => {
     expect(workflowCommandOptions([], new Set())).toEqual([])
+  })
+})
+
+describe("reservedSlashNames (Item 30 — Commands > Workflows collision set)", () => {
+  test("palette slash displays are reserved with the leading slash stripped", () => {
+    const names = reservedSlashNames([{ display: "/help" }, { display: "/models" }], [])
+    expect(names.has("help")).toBe(true)
+    expect(names.has("models")).toBe(true)
+  })
+
+  test("palette slash aliases are reserved too (a typed alias is a real command trigger)", () => {
+    const names = reservedSlashNames([{ display: "/quit", aliases: ["/exit", "/q"] }], [])
+    expect(names.has("quit")).toBe(true)
+    expect(names.has("exit")).toBe(true)
+    expect(names.has("q")).toBe(true)
+  })
+
+  test("server command/mcp/skill names are reserved; a :mcp display suffix is stripped defensively", () => {
+    const names = reservedSlashNames(
+      [],
+      [
+        { name: "deploy", source: "command" },
+        { name: "tools:mcp", source: "mcp" },
+        { name: "brainstorm", source: "skill" },
+        { name: "plain" },
+      ],
+    )
+    expect(names.has("deploy")).toBe(true)
+    expect(names.has("tools")).toBe(true)
+    expect(names.has("brainstorm")).toBe(true)
+    expect(names.has("plain")).toBe(true)
+  })
+
+  test("source-'workflow' entries are NOT reserved (discovery mirrors of the workflows themselves)", () => {
+    const names = reservedSlashNames([], [{ name: "review", source: "workflow" }])
+    expect(names.has("review")).toBe(false)
+  })
+
+  test("the /workflow[s] dispatch words are always reserved", () => {
+    const names = reservedSlashNames([], [])
+    expect(names.has("workflow")).toBe(true)
+    expect(names.has("workflows")).toBe(true)
+  })
+
+  test("a name in the set blocks direct routing, an unknown one does not", () => {
+    const names = reservedSlashNames([{ display: "/review" }], [])
+    expect(names.has("review")).toBe(true)
+    expect(names.has("triage")).toBe(false)
   })
 })
 

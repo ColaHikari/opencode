@@ -37,7 +37,7 @@ import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
-import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, FilePart, UserMessage, WorkflowInfo } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
 import { formatDuration } from "../../util/format"
@@ -52,8 +52,8 @@ import { DialogSkill } from "../dialog-skill"
 import { DialogWorkflow } from "../dialog-workflow"
 import { DialogWorkflowApproval } from "../dialog-workflow-approval"
 import { approvalDecision, isSessionApproved, rememberSessionApproval } from "../dialog-workflow-approval-helpers"
-import { parseWorkflowCommand } from "../dialog-workflow-helpers"
-import { extractReservedBudget, listWorkflowInfos, parseWorkflowArgs } from "./workflow-autocomplete"
+import { parseDirectWorkflowCommand, parseWorkflowCommand } from "../dialog-workflow-helpers"
+import { extractReservedBudget, listWorkflowInfos, parseWorkflowArgs, reservedSlashNames } from "./workflow-autocomplete"
 import {
   confirmWorkspaceFileChanges,
   openWorkspaceSelect,
@@ -62,7 +62,14 @@ import {
 } from "../dialog-workspace-create"
 import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
 import { useArgs } from "../../context/args"
-import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
+import {
+  OPENCODE_BASE_MODE,
+  useBindings,
+  useCommandShortcut,
+  useCommandSlashes,
+  useLeaderActive,
+  useOpencodeKeymap,
+} from "../../keymap"
 import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
@@ -181,6 +188,9 @@ export function Prompt(props: PromptProps) {
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = useOpencodeKeymap()
+  // Item 30: the built-in palette slash entries feed the reserved-name set of the
+  // typed direct `/<name>` workflow dispatch (Commands > Workflows precedence).
+  const slashes = useCommandSlashes()
   const agentShortcut = useCommandShortcut("agent.cycle")
   const paletteShortcut = useCommandShortcut("command.palette.show")
   const renderer = useRenderer()
@@ -1178,6 +1188,124 @@ export function Prompt(props: PromptProps) {
         : []
 
     const workflowCommand = store.mode === "shell" ? undefined : parseWorkflowCommand(inputText)
+    // Item 30: a typed `/<name> args` submit (the popover entry NOT selected) is a
+    // direct workflow start candidate. Parse-only here; the dispatch chain below
+    // resolves it AFTER every real command route (Commands > Workflows) and falls
+    // back to a plain prompt for an unknown name (today's behavior).
+    const directWorkflow = store.mode === "shell" ? undefined : parseDirectWorkflowCommand(inputText)
+
+    // Item 30: the full named-start pipeline, shared by the `/workflow <name>`
+    // dispatch and the typed direct `/<name>` route: declared-type arg coercion,
+    // reserved budget extraction, the approval gate (always/first-run/never plus
+    // session-local "Yes, always"), and the workflow.start call that routes
+    // permission prompts to the active session. `info` is caller-resolved; an
+    // unknown name has none, so it cannot render a meaningful approval dialog —
+    // the start surfaces the engine's "not found" error as before rather than
+    // asking to approve a workflow that does not exist.
+    const startNamedWorkflow = async (name: string, rawArgs: string, info: WorkflowInfo | undefined) => {
+      // Resolve the workflow's declared argument types so parsing coerces only
+      // declared-number args (e.g. `version=1.0` stays the string "1.0"). An
+      // unknown name simply yields no declaration and every arg stays a string
+      // (the safe default).
+      const args = parseWorkflowArgs(rawArgs, info?.meta.arguments ?? {})
+      // Reserved `budget=` argument: pulled out of the parsed args (a workflow
+      // that declares its own `budget` argument wins — passthrough) and sent as
+      // the start payload's cost cap. An invalid value aborts the start with a
+      // toast (same fall-through as a cancelled approval: the submit tail below
+      // still clears the prompt).
+      const extracted = extractReservedBudget(args, info?.meta.arguments ?? {})
+      if (extracted.error) {
+        toast.show({ message: extracted.error, variant: "error" })
+        return
+      }
+      const startWorkflow = () =>
+        void sdk.client.workflow
+          // Fund 35: route the start's permission prompts (the workflow gate and any
+          // agent-step asks) to the ACTIVE session so they surface here in the TUI,
+          // instead of an orphaned session the user is not looking at.
+          .start({
+            name,
+            workflowStartPayload: {
+              args: extracted.args,
+              ...(extracted.budget !== undefined ? { budget: extracted.budget } : {}),
+              permissionSessionID: sessionID,
+            },
+          })
+          .then((result) => {
+            if (!result.data) {
+              toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
+              return
+            }
+            toast.show({ message: `Started workflow ${name}`, variant: "info" })
+            if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
+          })
+          .catch(toast.error)
+
+      // Track D: gate every interactive start behind an approval dialog. The
+      // workflow *tool* keeps its own ask-gate (Permission service) untouched;
+      // this is the TUI pendant for `/workflow <name>`.
+      const approved = sync.data.config.workflows?.approved ?? []
+      const decision = !info
+        ? "start"
+        : approvalDecision({
+            mode: sync.data.config.workflows?.approval,
+            // OR in the session-local cache so a "Yes, always" earlier in this
+            // session is honoured immediately, even before the config re-sync
+            // makes the persisted value visible here.
+            alreadyApproved: approved.includes(name) || isSessionApproved(name),
+          })
+      if (decision === "start") {
+        startWorkflow()
+        return
+      }
+      const reply = await DialogWorkflowApproval.show(dialog, {
+        info: info!,
+        args: extracted.args,
+        budget: extracted.budget,
+      })
+      if (reply === "cancel") {
+        toast.show({ message: `Cancelled workflow ${name}`, variant: "info" })
+        return
+      }
+      // "Yes, always" persists consent so first-run never asks again for this
+      // workflow; the array is rewritten whole (config.update deep-merges and
+      // replaces arrays), which is fine since we append to the loaded list.
+      // Note: under approval:"always" this persists with no behavioural effect
+      // (always asks every start by design); we still record it so switching
+      // back to first-run later honours the prior consent.
+      if (reply === "always") {
+        // Remember in-session first so a second start this session never
+        // re-asks even before the persisted config re-syncs.
+        rememberSessionApproval(name)
+        if (!approved.includes(name))
+          await sdk.client.config
+            .update({ config: { workflows: { approved: [...approved, name] } } })
+            .catch(toast.error)
+      }
+      startWorkflow()
+    }
+
+    // Item 30: typed `/<name>` resolution against the discovered workflows. The
+    // UNFILTERED list() is needed here (unlike listWorkflowInfos, which drops
+    // invalid entries) because a typed name that matches a BROKEN workflow file
+    // must toast its parse error instead of leaking the slash text to the model
+    // as a plain prompt. Returns true when the submit was consumed (started, or
+    // rejected as invalid); false sends the input as a plain prompt — today's
+    // behavior for an unknown slash, and the safe degradation when list() fails.
+    const startDirectWorkflow = async (direct: { name: string; args: string }) => {
+      const result = await sdk.client.workflow.list().catch(() => undefined)
+      const info = result?.data?.find((item) => item.name === direct.name)
+      if (!info) return false
+      if (info.valid === false) {
+        toast.show({
+          message: `Invalid workflow ${direct.name}${info.error ? `: ${info.error}` : ""}`,
+          variant: "error",
+        })
+        return true
+      }
+      await startNamedWorkflow(direct.name, direct.args, info)
+      return true
+    }
 
     // Ultracode opt-in (normal prompt path only). The session directive rides every
     // substantial submit while the toggle is on; the keyword directive fires for the
@@ -1258,97 +1386,23 @@ export function Prompt(props: PromptProps) {
       if (workflowCommand.type === "dashboard") {
         dialog.replace(() => <DialogWorkflow />)
       } else {
-        const name = workflowCommand.name
-        // Resolve the workflow's declared argument types so parsing coerces only
-        // declared-number args (e.g. `version=1.0` stays the string "1.0").
         // listWorkflowInfos already drops invalid entries, so a broken file never
-        // supplies a synthesized meta here; an unknown name simply yields no
-        // declaration and every arg stays a string (the safe default).
+        // supplies a synthesized meta to startNamedWorkflow here.
         const infos = await listWorkflowInfos(sdk.client.workflow, true)
-        const info = infos.find((info) => info.name === name)
-        const args = parseWorkflowArgs(workflowCommand.args, info?.meta.arguments ?? {})
-        // Reserved `budget=` argument: pulled out of the parsed args (a workflow
-        // that declares its own `budget` argument wins — passthrough) and sent as
-        // the start payload's cost cap. An invalid value aborts the start with a
-        // toast (same fall-through as a cancelled approval: the submit tail below
-        // still clears the prompt).
-        const extracted = extractReservedBudget(args, info?.meta.arguments ?? {})
-        if (extracted.error) {
-          toast.show({ message: extracted.error, variant: "error" })
-        } else {
-          const startWorkflow = () =>
-            void sdk.client.workflow
-              // Fund 35: route the start's permission prompts (the workflow gate and any
-              // agent-step asks) to the ACTIVE session so they surface here in the TUI,
-              // instead of an orphaned session the user is not looking at.
-              .start({
-                name,
-                workflowStartPayload: {
-                  args: extracted.args,
-                  ...(extracted.budget !== undefined ? { budget: extracted.budget } : {}),
-                  permissionSessionID: sessionID,
-                },
-              })
-              .then((result) => {
-                if (!result.data) {
-                  toast.show({ message: `Failed to start workflow ${name}`, variant: "error" })
-                  return
-                }
-                toast.show({ message: `Started workflow ${name}`, variant: "info" })
-                if (result.data.session_id) route.navigate({ type: "session", sessionID: result.data.session_id })
-              })
-              .catch(toast.error)
-
-          // Track D: gate every interactive start behind an approval dialog. The
-          // workflow *tool* keeps its own ask-gate (Permission service) untouched;
-          // this is the TUI pendant for `/workflow <name>`. An unknown name has no
-          // info, so it cannot render a meaningful dialog — let the start surface the
-          // engine's "not found" error as before rather than asking to approve a
-          // workflow that does not exist.
-          const approved = sync.data.config.workflows?.approved ?? []
-          const decision = !info
-            ? "start"
-            : approvalDecision({
-                mode: sync.data.config.workflows?.approval,
-                // OR in the session-local cache so a "Yes, always" earlier in this
-                // session is honoured immediately, even before the config re-sync
-                // makes the persisted value visible here.
-                alreadyApproved: approved.includes(name) || isSessionApproved(name),
-              })
-          if (decision === "start") {
-            startWorkflow()
-          } else {
-            const reply = await DialogWorkflowApproval.show(dialog, {
-              info: info!,
-              args: extracted.args,
-              budget: extracted.budget,
-            })
-            if (reply === "cancel") {
-              toast.show({ message: `Cancelled workflow ${name}`, variant: "info" })
-            } else {
-              // "Yes, always" persists consent so first-run never asks again for this
-              // workflow; the array is rewritten whole (config.update deep-merges and
-              // replaces arrays), which is fine since we append to the loaded list.
-              // Note: under approval:"always" this persists with no behavioural effect
-              // (always asks every start by design); we still record it so switching
-              // back to first-run later honours the prior consent.
-              if (reply === "always") {
-                // Remember in-session first so a second start this session never
-                // re-asks even before the persisted config re-syncs.
-                rememberSessionApproval(name)
-                if (!approved.includes(name))
-                  await sdk.client.config
-                    .update({ config: { workflows: { approved: [...approved, name] } } })
-                    .catch(toast.error)
-              }
-              startWorkflow()
-            }
-          }
-        }
+        const info = infos.find((info) => info.name === workflowCommand.name)
+        await startNamedWorkflow(workflowCommand.name, workflowCommand.args, info)
       }
     } else if (
       inputText.startsWith("/") &&
-      sync.data.command.some((x) => x.name === inputText.split("\n")[0].split(" ")[0].slice(1))
+      sync.data.command.some(
+        (x) =>
+          x.name === inputText.split("\n")[0].split(" ")[0].slice(1) &&
+          // Item 30: a source-"workflow" entry is a discovered workflow surfaced
+          // in Command.list() for /help parity only — its template is EMPTY, so
+          // dispatching it via session.command would run an empty prompt. It is
+          // handled by the direct `/<name>` workflow branch below instead.
+          x.source !== "workflow",
+      )
     ) {
       move.startSubmit()
       // Parse command from first line, preserve multi-line content in arguments
@@ -1367,6 +1421,21 @@ export function Prompt(props: PromptProps) {
         variant,
         parts: nonTextParts.filter((x) => x.type === "file"),
       })
+    } else if (
+      // Item 30: typed direct `/<name> args` dispatch (Claude-Code parity with
+      // the popover entries). Runs strictly AFTER the /workflow[s] and real-
+      // command branches and only for names outside the reserved set (built-in
+      // palette slashes incl. aliases + server commands), so a workflow can never
+      // shadow a real command. startDirectWorkflow returns false for a name no
+      // discovered workflow carries — that submit falls through to the plain
+      // prompt exactly as before.
+      directWorkflow &&
+      !reservedSlashNames(slashes(), sync.data.command).has(directWorkflow.name) &&
+      (await startDirectWorkflow(directWorkflow))
+    ) {
+      // Consumed: the workflow was started (incl. its approval flow) or rejected
+      // with an "Invalid workflow" toast — never sent to the model as a prompt.
+      // The shared submit tail below still clears the prompt and history.
     } else {
       move.startSubmit()
       sdk.client.session

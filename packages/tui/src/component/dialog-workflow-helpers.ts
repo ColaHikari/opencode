@@ -391,3 +391,24 @@ export function parseWorkflowCommand(input: string): WorkflowCommand | undefined
   if (nameEnd === -1) return { type: "start", name: remainder, args: "" }
   return { type: "start", name: remainder.slice(0, nameEnd), args: remainder.slice(nameEnd + 1) }
 }
+
+// Item 30: a typed `/<name> args` submit is a DIRECT workflow start candidate
+// (Claude-Code parity with the `/` popover entries, which already insert the
+// routed `/workflow <name> ` text on selection). Pure parse only — the caller
+// owns precedence (a real command of the same name always wins) and resolution
+// against the discovered workflows; an unresolved name falls back to a plain
+// prompt exactly as today. Like parseWorkflowCommand, only the FIRST line is
+// parsed; the first token must be `/` + a discovery-safe name (the basename
+// charset workflow files can actually carry), and the /workflow[s] dispatch
+// words are excluded so this can never shadow the dedicated routes above.
+// `args` is the RAW remainder after the name (multi-spaces preserved, Fund 60)
+// so quoted values survive intact to parseWorkflowArgs.
+export function parseDirectWorkflowCommand(input: string): { name: string; args: string } | undefined {
+  const firstLine = input.split("\n")[0]
+  const trimmed = firstLine.trimStart()
+  const name = trimmed.split(/\s/)[0].match(/^\/([A-Za-z0-9_-]+)$/)?.[1]
+  if (name === undefined || name === "workflow" || name === "workflows") return
+  const nameEnd = trimmed.search(/\s/)
+  if (nameEnd === -1) return { name, args: "" }
+  return { name, args: trimmed.slice(nameEnd + 1) }
+}

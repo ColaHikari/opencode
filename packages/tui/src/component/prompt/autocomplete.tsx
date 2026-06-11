@@ -24,6 +24,7 @@ import { displayCharAt, mentionTriggerIndex } from "../../prompt/display"
 import {
   isWorkflowCommandInput,
   listWorkflowInfos,
+  reservedSlashNames,
   workflowArgContext,
   workflowAutocompleteTriggerIndex,
   workflowCommandOption,
@@ -519,13 +520,22 @@ export function Autocomplete(props: {
       })
     }
 
-    // Discovered workflows as direct `/<name>` slash commands. The collision set
-    // is every command name already in `results` (built-in slashes + server/MCP
-    // commands): strip the leading `/` and any `:mcp` suffix so a workflow never
-    // shadows or duplicates a real command. Selecting one routes EXACTLY like
-    // `/workflow <name>` (the existing parseWorkflowCommand dispatch) — the helper
-    // is pure, so the onSelect that inserts the routed text is attached here.
-    const existingCommandNames = new Set(results.map((item) => item.display.replace(/^\//, "").replace(/:mcp$/, "")))
+    // Discovered workflows as direct `/<name>` slash commands. Item 30: the
+    // collision set is the SAME reservedSlashNames helper that guards the typed
+    // `/<name>` submit dispatch (prompt/index.tsx), so popover and typed routing
+    // can never disagree on what counts as a real command (built-in slashes incl.
+    // aliases, server/MCP/skill commands; skill commands are hidden from this
+    // popover but DO win the typed dispatch, so a colliding workflow must not
+    // surface here either). The popover additionally reserves the source-
+    // "workflow" command entries pushed above — they are the workflows themselves
+    // (discovery mirrors), deliberately NOT reserved for the typed route, but
+    // listing them twice here would duplicate rows. Selecting one routes EXACTLY
+    // like `/workflow <name>` (the existing parseWorkflowCommand dispatch) — the
+    // helper is pure, so the onSelect that inserts the routed text is attached here.
+    const existingCommandNames = reservedSlashNames(slashes(), sync.data.command)
+    for (const serverCommand of sync.data.command) {
+      if ((serverCommand.source as string) === "workflow") existingCommandNames.add(serverCommand.name)
+    }
     for (const option of workflowCommandOptions(slashCommandWorkflowInfos(), existingCommandNames)) {
       const name = option.value!
       results.push({

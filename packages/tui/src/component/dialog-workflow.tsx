@@ -162,8 +162,12 @@ function agentProgress(run: WorkflowRun) {
   return `${run.agents.filter((agent) => agent.status !== "running").length}/${run.agents.length} agents`
 }
 
-function agentLabel(agent: WorkflowRun["agents"][number]) {
-  return agent.agent ?? `agent:${agent.id}`
+// Item 16: a per-call display name (`ctx.agent({label})`, persisted on the
+// node) wins over the subagent type name; a node with neither falls back to its
+// id. Label is display-only — selection, session-open, and the journal key all
+// keep working off the node itself. Exported for tests (pattern: phaseProgress).
+export function agentLabel(agent: WorkflowRun["agents"][number]) {
+  return agent.label ?? agent.agent ?? `agent:${agent.id}`
 }
 
 function modelLabel(agent: WorkflowRun["agents"][number]) {
