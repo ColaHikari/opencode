@@ -877,6 +877,8 @@ export const dict = {
   "command.ultracode.disable": "Ultracode: ausschalten",
   "toast.ultracode.on.title": "Ultracode AN",
   "toast.ultracode.on.description": "Workflows werden in dieser Sitzung standardmäßig geplant und ausgeführt.",
+  "toast.ultracode.on.descriptionBoosted":
+    "Workflows werden in dieser Sitzung standardmäßig geplant und ausgeführt (Reasoning auf {{boost}} erhöht).",
   "toast.ultracode.off.title": "Ultracode AUS",
   "toast.ultracode.off.description": "Zurück zur schrittweisen Arbeit.",
   "command.workflow.start": "Workflow starten",
@@ -902,6 +904,14 @@ export const dict = {
   "dialog.workflow.action.cancel": "Abbrechen",
   "dialog.workflow.action.answer": "Antworten",
   "dialog.workflow.action.save": "Als Befehl speichern",
+  "dialog.workflow.action.delete": "Löschen",
+  "dialog.workflow.action.copy": "Kopieren",
+  "dialog.workflow.action.rerun": "Erneut ausführen",
+  "dialog.workflow.agent.openSession": "Agent-Sitzung öffnen",
+  "dialog.workflow.delete.title": "Workflow-Ausführung löschen",
+  "dialog.workflow.delete.text":
+    "Ausführung {{id}} ({{name}}) aus dem Verlauf löschen? Das kann nicht rückgängig gemacht werden.",
+  "dialog.workflow.delete.confirm": "Löschen",
   "dialog.workflow.save.noSource": "Diese Ausführung hat keinen gespeicherten Quelltext zum Speichern.",
   "dialog.workflow.save.title": "Workflow als Befehl speichern",
   "dialog.workflow.save.description":
@@ -929,12 +939,22 @@ export const dict = {
   "dialog.workflow.approval.no": "Nein",
 
   "toast.workflow.start.failed.title": "Workflow konnte nicht gestartet werden",
+  "toast.workflow.budget.invalid.title": "Ungültiges Budget",
+  "toast.workflow.budget.invalid.description":
+    "budget={{value}} ist kein gültiger USD-Betrag; der Start wurde abgebrochen.",
   "toast.workflow.started.title": "Workflow gestartet",
   "toast.workflow.started.description": "{{name}} gestartet.",
   "toast.workflow.approval.cancelled.title": "Workflow {{name}} abgebrochen",
   "toast.workflow.pause.failed.title": "Ausführung konnte nicht pausiert werden",
   "toast.workflow.resume.failed.title": "Ausführung konnte nicht fortgesetzt werden",
+  "toast.workflow.resumed.title": "Workflow fortgesetzt",
+  "toast.workflow.resumed.description": "{{name}} als neue Ausführung fortgesetzt.",
   "toast.workflow.cancel.failed.title": "Ausführung konnte nicht abgebrochen werden",
+  "toast.workflow.delete.ok.title": "Workflow {{id}} gelöscht",
+  "toast.workflow.delete.alreadyGone.title": "Workflow {{id}} bereits entfernt",
+  "toast.workflow.delete.failed.title": "Ausführung konnte nicht gelöscht werden",
+  "toast.workflow.copy.ok.title": "Workflow-Antwort in die Zwischenablage kopiert",
+  "toast.workflow.copy.failed.title": "Workflow-Antwort konnte nicht kopiert werden",
   "toast.workflow.answer.failed.title": "Antwort konnte nicht gesendet werden",
   "toast.workflow.answer.notFound.description": "Diese Ausführung existiert nicht mehr.",
   "toast.workflow.answer.noQuestion.description": "Diese Ausführung wartet nicht auf eine Antwort.",
@@ -944,4 +964,6 @@ export const dict = {
   "toast.workflow.save.conflict.description": "Ein Workflow namens {{name}} existiert an diesem Ziel bereits.",
   "toast.workflow.save.invalidName.title": "Ungültiger Workflow",
   "toast.workflow.save.failed.title": "Workflow konnte nicht gespeichert werden",
+  "toast.workflow.finished.title": "Workflow {{name}} abgeschlossen",
+  "notification.workflow.finished.title": "Workflow abgeschlossen",
 } satisfies Partial<Record<Keys, string>>

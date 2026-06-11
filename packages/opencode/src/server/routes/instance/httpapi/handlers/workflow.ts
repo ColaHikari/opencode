@@ -64,7 +64,12 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
         .start({
           name: ctx.params.name,
           args: ctx.payload?.args,
-          budget: ctx.payload?.budget,
+          // Item 17: either cap present ⇒ the struct form, mirroring the tool
+          // path; both absent ⇒ unlimited.
+          budget:
+            ctx.payload?.budget !== undefined || ctx.payload?.budget_tokens !== undefined
+              ? { usd: ctx.payload?.budget, tokens: ctx.payload?.budget_tokens }
+              : undefined,
           // Already branded by the StartPayload schema decode (SessionID).
           permissionSessionID: ctx.payload?.permissionSessionID,
           // Resume the named source run's journal when supplied (already branded
@@ -73,12 +78,18 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
           // Copy to a mutable array: the engine's StartOptions takes `number[]`
           // while the decoded schema yields a `readonly number[]`.
           invalidate_agents: ctx.payload?.invalidate_agents ? [...ctx.payload.invalidate_agents] : undefined,
+          // Item 20: journal replay strategy (prefix default in the engine;
+          // only meaningful with resume_of).
+          replay: ctx.payload?.replay,
           // When the HTTP caller supplied a session identity, derive subagent
           // permission inheritance from it (parent-session deny/external_directory
           // rules). The HTTP payload carries no caller-agent, so the agent-level
           // edit denies (Plan Mode) are only inherited on the tool path; without a
           // session id this is the documented fallback (no inherited ruleset).
           caller: ctx.payload?.permissionSessionID ? { sessionID: ctx.payload.permissionSessionID } : undefined,
+          // Item 12: deliberately NO caller_model here — an HTTP start has no
+          // caller-session model context, so default-agent steps keep falling
+          // through to the agent's own model / global default.
           prompt,
         })
         .pipe(Effect.mapError(apiError(ctx.params.name)))
@@ -97,6 +108,20 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       // Same contract as cancel: undefined ⇒ unknown id → 404; a known run returns
       // its snapshot (paused on success) → 200.
       const run = yield* workflow.pause(ctx.params.id)
+      if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return run
+    })
+
+    const skip = Effect.fn("WorkflowHttpApi.skip")(function* (ctx: {
+      params: { id: Workflow.RunID; agentId: string }
+    }) {
+      // Item 15: undefined ⇒ unknown to this workspace → 404; the engine's
+      // InvalidError (run not live / unknown agent / question node / node not
+      // running) ⇒ there is nothing skippable on a known run → 409 (mirroring
+      // the answer handler's known-but-unanswerable mapping).
+      const run = yield* workflow
+        .skipAgent({ id: ctx.params.id, agentId: ctx.params.agentId })
+        .pipe(Effect.mapError((error) => new ConflictError({ message: error.message, resource: ctx.params.id })))
       if (!run) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
       return run
     })
@@ -159,6 +184,14 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
         )
     })
 
+    const exportRun = Effect.fn("WorkflowHttpApi.export")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      // Item 27: the engine returns undefined ONLY for a run unknown to this
+      // workspace (directory-scoped like get) → 404, matching the get handler.
+      const result = yield* workflow.export(ctx.params.id)
+      if (!result) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return result
+    })
+
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
       return yield* workflow.remove(ctx.params.id)
     })
@@ -171,8 +204,10 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("start", start)
       .handle("cancel", cancel)
       .handle("pause", pause)
+      .handle("skip", skip)
       .handle("answer", answer)
       .handle("save", save)
+      .handle("export", exportRun)
       .handle("remove", remove)
   }),
 )

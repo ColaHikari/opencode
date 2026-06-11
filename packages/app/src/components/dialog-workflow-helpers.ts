@@ -15,14 +15,30 @@ export function timestamp(value: unknown) {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-export function statusIcon(status: WorkflowRun["status"]) {
+// Accepts BOTH the run-level and the agent-node status unions (the dialog feeds
+// agent.status through here too). `skipped` (Item 15: a human skipped the step)
+// gets a minimal distinct glyph; the full skipped/label rendering is the
+// detail-view item of the next wave.
+export function statusIcon(status: WorkflowRun["status"] | WorkflowRun["agents"][number]["status"]) {
   if (status === "running") return "●"
   if (status === "completed") return "✔"
   if (status === "failed") return "✖"
   if (status === "cancelled") return "⊗"
   if (status === "interrupted") return "⊘"
   if (status === "paused") return "⏸"
+  if (status === "skipped") return "↷"
   return "◌"
+}
+
+// The single app-side source of truth for "can this run be resumed?". Mirrors
+// the engine's RESUMABLE guard (workflow.ts: paused/interrupted plus — since the
+// failed/completed resume landed — failed and completed, both replaying the
+// journal into a NEW run). The dashboard's Resume button and the per-agent
+// re-run derive from this one list, so an engine change lands in exactly one place.
+const RESUMABLE: ReadonlySet<WorkflowRun["status"]> = new Set(["paused", "interrupted", "failed", "completed"])
+
+export function isResumable(status: WorkflowRun["status"]): boolean {
+  return RESUMABLE.has(status)
 }
 
 // N5: the engine never advances/clears `current_phase` at completion, so a run

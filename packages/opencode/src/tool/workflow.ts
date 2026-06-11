@@ -1,4 +1,5 @@
 import { BackgroundJob } from "@/background/job"
+import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Format } from "@/format"
@@ -7,6 +8,7 @@ import { Session } from "@/session/session"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
 import { createTwoFilesPatch } from "diff"
 import path from "path"
 import { Cause, Effect, Schema, SchemaGetter, Scope } from "effect"
@@ -15,12 +17,19 @@ import * as Tool from "./tool"
 import { trimDiff } from "./edit"
 import { Workflow } from "@/workflow/workflow"
 import { MetaReader } from "@/workflow/meta-reader"
+import { SourceLint } from "@/workflow/source-lint"
+import type { TurnBudget } from "@/session/turn-budget"
 import { Agent } from "@/agent/agent"
+import AUTHORING_GUIDE from "./workflow.txt"
 
 const WORKFLOW_NAME_PATTERN = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT = 60 * 60 * 1000
+// Item 8: how long a DEFAULT start (no explicit background/timeout) stays in the
+// foreground before the run is switched to the background. Overridable via
+// config workflows.foreground_grace_ms.
+const FOREGROUND_GRACE = 45_000
 
-const Action = Schema.Literals(["read", "start", "wait", "inspect", "create"])
+const Action = Schema.Literals(["read", "start", "wait", "inspect", "create", "cancel", "pause"])
 const InspectView = Schema.Literals(["summary", "logs", "agents", "agent", "result", "all"])
 
 // LLMs routinely emit a boolean tool argument as the JSON STRING "true"/"false"
@@ -67,10 +76,11 @@ const LooseNonNegativeFinite = Schema.Union([Schema.Number, NonBlankNumberFromSt
 
 const Parameters = Schema.Struct({
   action: Action.annotate({
-    description: "Workflow operation to perform: read, start, wait, inspect, or create",
+    description: "Workflow operation to perform: read, start, wait, inspect, create, cancel, or pause",
   }),
   name: Schema.optional(Schema.String).annotate({
-    description: "Workflow name for read/start/create. For create, this is the file name without extension.",
+    description:
+      "Workflow name for read/start/create. For create, this is the file name without extension. Omit on read to get the workflow authoring guide.",
   }),
   args: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)).annotate({
     description: "Workflow input arguments as a JSON object",
@@ -82,8 +92,13 @@ const Parameters = Schema.Struct({
     description:
       "Optional cost cap in USD for the whole run. Checked before each agent step; once cumulative cost reaches the cap, the next step fails with a budget error. This is a soft cap — agent steps already running in parallel can push total spend past it. Omit for unlimited.",
   }),
+  budget_tokens: Schema.optional(LooseNonNegativeFinite).annotate({
+    description:
+      "Optional output-token cap for the whole run; soft cap like budget (counts each step's output+reasoning tokens). Combinable with budget — whichever cap exhausts first gates the next step. Omit for unlimited.",
+  }),
   background: Schema.optional(LooseBoolean).annotate({
-    description: "Start the workflow asynchronously and notify this session when it finishes",
+    description:
+      "true starts the workflow asynchronously and notifies this session when it finishes; false opts out of the default grace window and keeps the old long foreground wait",
   }),
   // Non-negative finite, mirroring the budget field above: a plain Schema.Number
   // accepts NaN/±Infinity. timeout:Infinity would override the 1h DEFAULT_TIMEOUT
@@ -91,10 +106,11 @@ const Parameters = Schema.Struct({
   // false) so wait times out at once yet still reports "still running". Rejecting
   // both at the argument boundary keeps the wait bound honest.
   timeout: Schema.optional(LooseNonNegativeFinite).annotate({
-    description: "Maximum milliseconds to wait for foreground start/wait before returning the running state",
+    description:
+      "Maximum milliseconds to wait for foreground start/wait before returning the running state. Setting it on start implies an explicit foreground wait (no background switch).",
   }),
   run_id: Schema.optional(Schema.String).annotate({
-    description: "Workflow run id for wait/inspect",
+    description: "Workflow run id for wait/inspect/cancel/pause",
   }),
   view: Schema.optional(InspectView).annotate({
     description: "Which part of the run to inspect: summary, logs, agents, agent, result, or all",
@@ -105,30 +121,78 @@ const Parameters = Schema.Struct({
   source: Schema.optional(Schema.String).annotate({
     description: "Complete TypeScript workflow source for create",
   }),
+  script_path: Schema.optional(Schema.String).annotate({
+    description:
+      "Absolute or project-relative path to a workflow script file to start directly (alternative to name/source). The file is read fresh at start — edit and re-invoke to iterate; combine with resume_of to replay completed steps.",
+  }),
   overwrite: Schema.optional(LooseBoolean).annotate({ description: "Overwrite an existing workflow file" }),
   resume_of: Schema.optional(Schema.String).annotate({
     description:
-      "Resume a previous (paused/interrupted) workflow run by its run id; the engine replays that run's completed agent journal instead of re-running them.",
+      "Resume a previous (paused, interrupted, failed, or completed) workflow run by its run id; the engine replays that run's completed agent journal instead of re-running them. Works with name, source, and script_path starts.",
   }),
   invalidate_agents: Schema.optional(Schema.Array(Schema.Int)).annotate({
     description:
-      "Agent indices (0-based, in the source run's order) to force live re-execution of during a resume. Only meaningful with resume_of.",
+      "Agent indices (0-based, in the source run's order) to force live re-execution of during a resume. Only meaningful with resume_of. In prefix mode (the default), everything after the first invalidated agent re-runs live.",
+  }),
+  replay: Schema.optional(Schema.Literals(["prefix", "keyed"])).annotate({
+    description:
+      "Journal replay strategy for a resume (only meaningful with resume_of). 'prefix' (default): replay the source run's steps in order and stop permanently at the first changed/invalidated step — everything after re-runs live. 'keyed': match steps by call shape, so unchanged later steps replay even after an earlier change (use for read-only or heavily parallel workflows).",
   }),
 })
 
 type Params = Schema.Schema.Type<typeof Parameters>
 type Metadata = Record<string, unknown>
 
-const DESCRIPTION = [
-  "Manage workflows (project .opencode/workflows, global config workflows, and built-in workflows) through one action-based tool.",
-  "Do not use workflows by default. Use this only when the user explicitly asks for a workflow, asks to create one, or confirms workflow automation.",
-  "Actions:",
-  "- read: return workflow metadata, arguments, phases, and path; use before start if behavior is unclear.",
-  "- start: start an existing workflow (project, global, or built-in). Foreground waits for completion (up to the timeout, default 1 hour) and then returns the running state; background=true returns immediately and injects a completion message later.",
-  "- wait: wait for a running workflow by run_id.",
-  "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
-  "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
+// Item 13: the gate sentence is the ONLY conditional piece of the description.
+// Default sessions keep the anti-default gate; an ultracode session
+// (session.metadata.ultracode === true) swaps it for the standing opt-in below.
+// ToolRegistry.tools() performs the swap per prompt — tool descriptions are
+// baked into InstanceState at Tool.init, so there is no per-execute ctx here.
+export const WORKFLOW_GATE_DEFAULT =
+  "Do not use workflows by default. Use this only when the user explicitly asks for a workflow, asks to create one, or confirms workflow automation."
+
+export const WORKFLOW_GATE_ULTRACODE =
+  "Ultracode session mode is ON for this session: quality over cost. Author and run workflows by default for every substantial task (create + start, chain understand → change → verify runs); skip only trivial or conversational turns."
+
+// Item 13: the systemprompt counterpart of WORKFLOW_GATE_ULTRACODE (single
+// source of truth — session/system.ts imports this instead of duplicating the
+// wording). Appended after the workflow section when the session flag is on.
+export const ULTRACODE_SYSTEM_SECTION = [
+  WORKFLOW_GATE_ULTRACODE,
+  "This is a standing opt-in for the whole session; you do not need a per-message trigger.",
 ].join("\n")
+
+// Item 3: trigger list, offer path (with cost mention), and hybrid-scout
+// recommendation. Shared verbatim between this DESCRIPTION and the workflow
+// section of the system prompt (session/system.ts imports it — single source,
+// no drift). UNCONDITIONAL: present in both gate variants; workflowDescription
+// swaps ONLY the gate sentence, never these.
+export const WORKFLOW_TRIGGER_GUIDANCE: string[] = [
+  "Use a workflow when one of these triggers applies: the user writes the keyword 'ultracode'; ultracode session mode is on; the user literally asks to run, create, or automate a workflow; a skill or AGENTS.md file instructs you to use one; or the user invokes a workflow by name. Otherwise do not start workflows on your own.",
+  "If no trigger applies but a task would clearly benefit from parallel fan-out across many independent items, OFFER a workflow and mention the extra cost (every agent step is a separate subagent session) — do not start one unasked.",
+  "Hybrid scouting: discover the work list inline first (grep/glob/read in this session), then write a workflow that receives that list as args and fans out — do not burn agent steps on discovery a single grep can do.",
+]
+
+export function workflowDescription(ultracode: boolean): string {
+  return [
+    "Manage workflows (project .opencode/workflows, global config workflows, and built-in workflows) through one action-based tool.",
+    ultracode ? WORKFLOW_GATE_ULTRACODE : WORKFLOW_GATE_DEFAULT,
+    ...WORKFLOW_TRIGGER_GUIDANCE,
+    // Item 3: one-line authoring doctrine (the full version lives in the
+    // action=read guide, workflow.txt) so 'pipeline' shows up here too.
+    "Inside workflow source, default to per-item ctx.pipeline chains; insert a parallel barrier only when a step must see all items at once.",
+    "Actions:",
+    "- read: with name, return one workflow's metadata, arguments, phases, and path; WITHOUT name, return the workflow AUTHORING GUIDE (module shape, ctx API, patterns, copyable examples) plus all available workflows. Read the guide before writing or editing any workflow source.",
+    "- start: start a workflow (project, global, or built-in). Waits a short grace window (default 45s); a run still going then continues in the background and notifies this session on completion. background=true returns immediately; background=false or an explicit timeout keeps the old foreground wait. script_path starts a script file directly (edit + re-invoke to iterate).",
+    "- wait: wait for a running workflow by run_id.",
+    "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
+    "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
+    "- cancel: stop a running workflow run by run_id (terminal; already-finished runs are returned as-is).",
+    "- pause: suspend a running run, keeping its completed-agent journal; resume later by starting the same workflow with resume_of=<run_id>.",
+  ].join("\n")
+}
+
+const DESCRIPTION = workflowDescription(false)
 
 function promptOps(ctx: Tool.Context) {
   const ops = ctx.extra?.promptOps
@@ -136,6 +200,17 @@ function promptOps(ctx: Tool.Context) {
     return ops as Workflow.PromptOps
   }
   throw new Error("Workflow tools require prompt operations in the current session")
+}
+
+// Item 24: the shared turn pool, threaded by SessionTools into ctx.extra
+// (exactly the promptOps pattern above). Optional — a turn without a budget
+// directive has none, and the run then keeps its per-run budget only.
+function turnPool(ctx: Tool.Context) {
+  const pool = ctx.extra?.turnBudget
+  if (typeof pool === "object" && pool !== null && typeof Reflect.get(pool, "id") === "string") {
+    return pool as TurnBudget.Pool
+  }
+  return undefined
 }
 
 function workflowError(error: Workflow.InvalidError | Workflow.NotFoundError) {
@@ -162,6 +237,21 @@ function escapeXmlText(value: string) {
 // can never break out of the `="…"` it sits in.
 function escapeXmlAttr(value: string) {
   return escapeXmlText(value).replaceAll('"', "&quot;").replaceAll("'", "&apos;")
+}
+
+// Item 23 (Stufe 2): renders lint findings as a <lint> block for the tool
+// output. The findings' source snippets are untrusted (LLM/attacker-authored
+// script text), so they are escaped like every other interpolated field.
+function formatLintFindings(findings: readonly SourceLint.Finding[]) {
+  if (findings.length === 0) return undefined
+  return [
+    "<lint>",
+    ...findings.map(
+      (finding) =>
+        `  <finding line="${finding.line}" rule="${escapeXmlAttr(finding.rule)}">${escapeXmlText(finding.text)}</finding>`,
+    ),
+    "</lint>",
+  ].join("\n")
 }
 
 // Untrusted structured values (args/result/tokens) are JSON-stringified, then the
@@ -312,13 +402,34 @@ function formatInspect(run: Workflow.Run, view: Schema.Schema.Type<typeof Inspec
   return [formatRunSummary(run), formatAgents(run, false), formatResult(run)].join("\n")
 }
 
-function backgroundStarted(run: Workflow.Run) {
+// Item 18: the editable script location for this run — the durable per-run copy
+// for a temporary (inline/script_path) start, the real on-disk file for a named
+// one. The instruction line teaches the edit + re-invoke iteration loop.
+function scriptPathBlock(scriptPath: string | undefined) {
+  if (!scriptPath) return undefined
+  return [
+    `<script_path>${escapeXmlText(scriptPath)}</script_path>`,
+    '<instructions>Edit this file and re-invoke action="start" with script_path (add resume_of=<run_id> after pausing the original run) to iterate without resending the source.</instructions>',
+  ].join("\n")
+}
+
+// Item 8: rich enough that the model can keep working without an immediate
+// follow-up call — names the run, its definition path, the session executing it,
+// and the inspect/wait affordances (instead of the old bare id + two lines).
+function backgroundStarted(run: Workflow.Run, scriptPath?: string) {
   return [
     `<workflow_run id="${escapeXmlAttr(run.id)}" state="running">`,
-    "<summary>Workflow started in background.</summary>",
-    "<instructions>You will be notified automatically when it finishes; do not poll unless the user asks for progress.</instructions>",
+    `<workflow>${escapeXmlText(run.workflow)}</workflow>`,
+    run.definition ? `<path>${escapeXmlText(run.definition.path)}</path>` : undefined,
+    run.session_id ? `<session_id>${escapeXmlText(run.session_id)}</session_id>` : undefined,
+    run.current_phase ? `<current_phase>${escapeXmlText(run.current_phase)}</current_phase>` : undefined,
+    scriptPathBlock(scriptPath),
+    "<summary>Workflow is running in the background.</summary>",
+    '<instructions>You will be notified automatically when it finishes. Use action="inspect" with this run_id for progress, or action="wait" to block on the result; do not poll unless the user asks.</instructions>',
     "</workflow_run>",
-  ].join("\n")
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n")
 }
 
 // `text` is intentionally NOT escaped: on the completed path it is the already-
@@ -415,12 +526,15 @@ function waitForWorkflowHonoringAbort(
   )
 }
 
-function workflowMetadata(run: Workflow.Run, background: boolean) {
+function workflowMetadata(run: Workflow.Run, background: boolean, scriptPath?: string) {
   return {
     runId: run.id,
     sessionId: run.session_id,
     workflow: run.workflow,
     background,
+    // Item 18: the editable script file for this run (omitted when no script
+    // location is known, e.g. inspect of a foreign run or a failed persist).
+    ...(scriptPath ? { scriptPath } : {}),
   }
 }
 
@@ -428,6 +542,8 @@ function startWorkflow(input: {
   workflow: Workflow.Interface
   background: BackgroundJob.Interface
   sessions: Session.Interface
+  fs: FSUtil.Interface
+  config: Config.Interface
   scope: Scope.Scope
   params: Params
   // The named workflow to start. OMITTED for a P3 inline-source start: the engine
@@ -443,122 +559,192 @@ function startWorkflow(input: {
 }) {
   return Effect.gen(function* () {
     const ops = promptOps(input.ctx)
+    // Item 12: capture the CALLER session's resolved model so default-agent steps
+    // can inherit it. Best-effort — a model-lookup failure must never kill the
+    // start, the run merely loses the inheritance tier.
+    const callerModel = ops.currentModel
+      ? yield* ops.currentModel(input.ctx.sessionID).pipe(
+          Effect.map((model) => ({ providerID: model.providerID, modelID: model.modelID })),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        )
+      : undefined
     const run = yield* input.workflow
       .start({
         name: input.name,
         args: input.params.args,
-        budget: input.params.budget,
+        // Item 17: either cap present ⇒ the struct form; both absent ⇒ unlimited
+        // (the engine also accepts a naked USD number for back-compat).
+        budget:
+          input.params.budget !== undefined || input.params.budget_tokens !== undefined
+            ? { usd: input.params.budget, tokens: input.params.budget_tokens }
+            : undefined,
         prompt: ops,
         permissionSessionID: input.ctx.sessionID,
         // Pass the caller's identity so every subagent the run spawns inherits
         // this session's deny/external_directory rules and this agent's edit-class
         // denies (Plan Mode) — the same ruleset the task tool derives (#26514).
         caller: { sessionID: input.ctx.sessionID, agent: input.ctx.agent },
+        caller_model: callerModel,
         source: input.source,
         temporary: input.temporary,
         resume_of: input.resumeOf,
         invalidate_agents: input.invalidateAgents,
+        // Item 20: replay strategy for the resume journal (prefix default in
+        // the engine; only meaningful with resume_of).
+        replay: input.params.replay,
+        // Item 24: the turn's shared budget pool (when the turn set one) — the
+        // run's agent steps reserve/settle against it, so multiple runs of one
+        // turn share a single cap.
+        pool: turnPool(input.ctx),
       })
       .pipe(Effect.mapError(workflowError))
 
+    // Item 18: every temporary (inline/script_path) start leaves an EDITABLE,
+    // durable copy of its script under the global data dir, keyed by run id —
+    // the engine's loadModule temp copy is deleted right after import, and the
+    // DB row's definition.source is not a file the user can edit + restart.
+    // Named/on-disk workflows need no copy: their real file IS the edit point.
+    // The run directory is deliberately left in place as an iteration artifact
+    // (a future DELETE /workflow/run/:id could sweep it along).
+    let scriptPath = run.definition?.temporary ? undefined : run.definition?.path
+    if (run.definition?.temporary && input.source) {
+      const persisted = path.join(Global.Path.data, "workflow", run.id, "script.ts")
+      // Best-effort: a write failure (full disk, permissions) must never fail
+      // the start — the result merely lacks the iteration path.
+      const wrote = yield* input.fs.writeWithDirs(persisted, input.source).pipe(
+        Effect.as(true),
+        Effect.catch(() => Effect.succeed(false)),
+      )
+      if (wrote) scriptPath = persisted
+    }
+
     yield* input.ctx.metadata({
       title: run.definition?.meta.name ?? run.workflow,
-      metadata: workflowMetadata(run, input.params.background === true),
+      metadata: workflowMetadata(run, input.params.background === true, scriptPath),
+    })
+
+    // Item 8: the background registration is shared by BOTH async paths — the
+    // explicit background=true start (immediate) and the grace-window switch
+    // below (after the foreground grace elapses). Registering exactly once per
+    // run is guaranteed structurally: the two call sites are disjoint branches.
+    const registerBackground = input.background.start({
+      id: run.id,
+      type: "workflow",
+      title: run.workflow,
+      metadata: {
+        ...workflowMetadata(run, true, scriptPath),
+        parentSessionId: input.ctx.sessionID,
+      },
+      run: waitForWorkflow(input.workflow, run).pipe(
+        Effect.flatMap((waited) => {
+          const error = runFailure(waited.run)
+          return error ? Effect.fail(error) : Effect.succeed(terminalOutput(waited.run))
+        }),
+        Effect.tap((output) =>
+          input.sessions.get(input.ctx.sessionID).pipe(
+            Effect.flatMap((session) =>
+              ops.prompt({
+                sessionID: input.ctx.sessionID,
+                agent: session.agent ?? input.ctx.agent,
+                parts: [
+                  {
+                    type: "text",
+                    synthetic: true,
+                    text: backgroundMessage(run, "completed", output),
+                  },
+                ],
+              }),
+            ),
+            Effect.ignore,
+            Effect.forkIn(input.scope, { startImmediately: true }),
+          ),
+        ),
+        Effect.catchCause((cause) =>
+          input.sessions.get(input.ctx.sessionID).pipe(
+            Effect.flatMap((session) =>
+              ops.prompt({
+                sessionID: input.ctx.sessionID,
+                agent: session.agent ?? input.ctx.agent,
+                parts: [
+                  {
+                    type: "text",
+                    synthetic: true,
+                    text: backgroundMessage(run, "error", Cause.pretty(cause)),
+                  },
+                ],
+              }),
+            ),
+            Effect.ignore,
+            Effect.forkIn(input.scope, { startImmediately: true }),
+            Effect.andThen(Effect.failCause(cause)),
+          ),
+        ),
+      ),
     })
 
     if (input.params.background) {
-      const job = yield* input.background.start({
-        id: run.id,
-        type: "workflow",
-        title: run.workflow,
-        metadata: {
-          ...workflowMetadata(run, true),
-          parentSessionId: input.ctx.sessionID,
-        },
-        run: waitForWorkflow(input.workflow, run).pipe(
-          Effect.flatMap((waited) => {
-            const error = runFailure(waited.run)
-            return error ? Effect.fail(error) : Effect.succeed(terminalOutput(waited.run))
-          }),
-          Effect.tap((output) =>
-            input.sessions.get(input.ctx.sessionID).pipe(
-              Effect.flatMap((session) =>
-                ops.prompt({
-                  sessionID: input.ctx.sessionID,
-                  agent: session.agent ?? input.ctx.agent,
-                  parts: [
-                    {
-                      type: "text",
-                      synthetic: true,
-                      text: backgroundMessage(run, "completed", output),
-                    },
-                  ],
-                }),
-              ),
-              Effect.ignore,
-              Effect.forkIn(input.scope, { startImmediately: true }),
-            ),
-          ),
-          Effect.catchCause((cause) =>
-            input.sessions.get(input.ctx.sessionID).pipe(
-              Effect.flatMap((session) =>
-                ops.prompt({
-                  sessionID: input.ctx.sessionID,
-                  agent: session.agent ?? input.ctx.agent,
-                  parts: [
-                    {
-                      type: "text",
-                      synthetic: true,
-                      text: backgroundMessage(run, "error", Cause.pretty(cause)),
-                    },
-                  ],
-                }),
-              ),
-              Effect.ignore,
-              Effect.forkIn(input.scope, { startImmediately: true }),
-              Effect.andThen(Effect.failCause(cause)),
-            ),
-          ),
-        ),
-      })
-
+      const job = yield* registerBackground
       return {
         title: `Workflow started: ${run.workflow}`,
-        metadata: { ...workflowMetadata(run, true), jobId: job.id, timedOut: false },
-        output: backgroundStarted(run),
+        metadata: { ...workflowMetadata(run, true, scriptPath), jobId: job.id, timedOut: false },
+        output: backgroundStarted(run, scriptPath),
       }
     }
 
-    const waited = yield* waitForWorkflowHonoringAbort(
-      input.workflow,
-      run,
-      input.ctx.abort,
-      input.params.timeout ?? DEFAULT_TIMEOUT,
-    )
-    // Fund 30: a TERMINAL non-completed run (failed/cancelled/interrupted) must fail
-    // the tool here too, consistent with the background path — never report
-    // "Workflow finished" for a run that did not succeed. A timed-out run is still
-    // running, so it is reported as such, not failed.
-    //
-    // N10 carve-out: when the PARENT TURN aborted (ctx.abort), the run was cancelled
-    // as the deliberate, graceful response to that abort — not a workflow failure.
-    // Returning the cancelled state as success (rather than failing) keeps the abort
-    // flow clean; failing here would surface a spurious "Workflow cancelled" error
-    // for a user-initiated stop. A run that failed/cancelled/interrupted on its own
-    // (no abort) still fails the tool.
-    if (!waited.timedOut && !input.ctx.abort.aborted) {
-      const failure = runFailure(waited.run)
-      if (failure) return yield* Effect.fail(failure)
+    // Item 8 semantics matrix:
+    // - background=true → immediate background (handled above, unchanged)
+    // - background=false → old long foreground wait (explicit opt-out)
+    // - timeout set → explicit foreground wait with the still-running result
+    //   (back-compat for existing callers)
+    // - all unset (default) → short grace window, then auto-switch to background
+    const explicitForeground = input.params.background === false || input.params.timeout !== undefined
+    const grace = (yield* input.config.get()).workflows?.foreground_grace_ms ?? FOREGROUND_GRACE
+    const bound = explicitForeground ? (input.params.timeout ?? DEFAULT_TIMEOUT) : grace
+    const waited = yield* waitForWorkflowHonoringAbort(input.workflow, run, input.ctx.abort, bound)
+    if (!waited.timedOut) {
+      // Fund 30: a TERMINAL non-completed run (failed/cancelled/interrupted) must fail
+      // the tool here too, consistent with the background path — never report
+      // "Workflow finished" for a run that did not succeed. A timed-out run is still
+      // running, so it is reported as such, not failed.
+      //
+      // N10 carve-out: when the PARENT TURN aborted (ctx.abort), the run was cancelled
+      // as the deliberate, graceful response to that abort — not a workflow failure.
+      // Returning the cancelled state as success (rather than failing) keeps the abort
+      // flow clean; failing here would surface a spurious "Workflow cancelled" error
+      // for a user-initiated stop. A run that failed/cancelled/interrupted on its own
+      // (no abort) still fails the tool.
+      if (!input.ctx.abort.aborted) {
+        const failure = runFailure(waited.run)
+        if (failure) return yield* Effect.fail(failure)
+      }
+      return {
+        title: `Workflow finished: ${run.workflow}`,
+        metadata: { ...workflowMetadata(run, false, scriptPath), jobId: "", timedOut: false },
+        output: [scriptPathBlock(scriptPath), terminalOutput(waited.run)]
+          .filter((line): line is string => line !== undefined)
+          .join("\n"),
+      }
     }
+    if (explicitForeground) {
+      return {
+        title: `Workflow still running: ${run.workflow}`,
+        metadata: { ...workflowMetadata(run, false, scriptPath), jobId: "", timedOut: true },
+        output: [
+          formatRunSummary(waited.run),
+          scriptPathBlock(scriptPath),
+          '<instructions>Use the workflow tool with action="wait" and this run_id to wait for completion.</instructions>',
+        ]
+          .filter((line): line is string => line !== undefined)
+          .join("\n"),
+      }
+    }
+    // Grace elapsed, run still alive → continue in the background and notify
+    // this session on completion, exactly like an explicit background start.
+    const job = yield* registerBackground
     return {
-      title: waited.timedOut ? `Workflow still running: ${run.workflow}` : `Workflow finished: ${run.workflow}`,
-      metadata: { ...workflowMetadata(run, false), jobId: "", timedOut: waited.timedOut },
-      output: waited.timedOut
-        ? [
-            formatRunSummary(waited.run),
-            '<instructions>Use the workflow tool with action="wait" and this run_id to wait for completion.</instructions>',
-          ].join("\n")
-        : terminalOutput(waited.run),
+      title: `Workflow running in background: ${run.workflow}`,
+      metadata: { ...workflowMetadata(run, true, scriptPath), jobId: job.id, timedOut: false },
+      output: backgroundStarted(waited.run, scriptPath),
     }
   })
 }
@@ -571,17 +757,52 @@ export const WorkflowTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const sessions = yield* Session.Service
     const fs = yield* FSUtil.Service
+    const config = yield* Config.Service
     const events = yield* EventV2Bridge.Service
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
     const scope = yield* Scope.Scope
+    // Item 23 (Stufe 2): the configured static source lint. AST-only (never
+    // imports/executes the module), so it is safe BEFORE the permission ask.
+    // 'off' ⇒ no findings; 'deny' ⇒ findings fail the create/start outright;
+    // 'warn' (default) ⇒ findings are surfaced (create output / start ask
+    // metadata) without blocking.
+    const lintSource = (source: string, displayPath: string) =>
+      Effect.gen(function* () {
+        const mode = (yield* config.get()).workflows?.lint ?? "warn"
+        const findings = mode === "off" ? [] : SourceLint.lint(source, displayPath).findings
+        if (mode === "deny" && findings.length > 0) {
+          return yield* Effect.fail(
+            new Error(
+              `Workflow source rejected by lint (workflows.lint="deny"): ` +
+                findings.map((finding) => `line ${finding.line} [${finding.rule}] ${finding.text}`).join("; "),
+            ),
+          )
+        }
+        return findings
+      })
     return {
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Params, ctx: Tool.Context<Metadata>): Effect.Effect<Tool.ExecuteResult<Metadata>> =>
         Effect.gen(function* () {
           if (params.action === "read") {
-            if (!params.name) return yield* Effect.fail(new Error("name is required for action=read"))
+            // Item 1: read WITHOUT a name returns the authoring guide plus the
+            // startable workflows and the dispatchable agent roster. The guide
+            // lives ONLY here (on demand) — the tool DESCRIPTION just points at
+            // it, keeping the always-loaded token cost flat. The guide is static,
+            // trusted text (its code samples legitimately contain < >), so it is
+            // not XML-escaped.
+            if (!params.name)
+              return {
+                title: "Workflow authoring guide",
+                metadata: { guide: true },
+                output: [
+                  AUTHORING_GUIDE,
+                  Workflow.fmt(yield* workflow.list()),
+                  formatAgentRoster(yield* agents.list()),
+                ].join("\n\n"),
+              }
             const workflows = yield* workflow.list()
             const info = workflows.find((item) => item.name === params.name)
             if (!info) return yield* Effect.fail(new Error(`Workflow not found: ${params.name}`))
@@ -598,12 +819,13 @@ export const WorkflowTool = Tool.define(
           }
 
           if (params.action === "start") {
-            // P3: inline source is mutually exclusive with name — exactly one selects
-            // the workflow to start.
-            if (params.source && params.name)
-              return yield* Effect.fail(new Error("Provide either name or source for action=start, not both"))
-            if (!params.name && !params.source)
-              return yield* Effect.fail(new Error("name or source is required for action=start"))
+            // P3/Item 18: name, inline source, and script_path are mutually
+            // exclusive — exactly one selects the workflow to start.
+            const selectors = [params.name, params.source, params.script_path].filter((value) => value !== undefined)
+            if (selectors.length !== 1)
+              return yield* Effect.fail(
+                new Error("Provide exactly one of name, source, or script_path for action=start"),
+              )
             // QW3: a malformed resume_of is surfaced as a clean not-found (using the
             // same prefix guard wait/inspect use) rather than a Schema defect through
             // the trailing orDie.
@@ -611,46 +833,86 @@ export const WorkflowTool = Tool.define(
             if (params.resume_of && !resumeOf)
               return yield* Effect.fail(new Error(`Workflow run not found: ${params.resume_of}`))
 
-            if (params.source) {
-              // P3: inline-source start runs as a TEMPORARY run. Statically validate
-              // the source via MetaReader (AST-only, never executes the module) BEFORE
-              // the permission ask — same gate order as create/named-start: a bad meta
-              // fails here, the module LOAD (which runs code) happens later inside the
-              // engine, after the ask.
-              const validated = MetaReader.read(params.source, "inline.ts")
-              if (validated.valid === false)
-                return yield* Effect.fail(new Error(`Invalid workflow inline.ts: ${validated.error}`))
-              // The meta name keys the permission pattern/`always`, so an illegal name
-              // (glob metacharacter/whitespace) is rejected here with a clean fail —
-              // never sanitizeWorkflowName's synchronous throw (which orDie would turn
-              // into a defect) and never an over-broad `always` rule (N15).
-              if (!WORKFLOW_NAME_PATTERN.test(validated.meta.name))
-                return yield* Effect.fail(
-                  new Error("Workflow names may only contain letters, numbers, underscores, and dashes"),
-                )
-              const safeName = validated.meta.name
-              yield* ctx.ask({
-                permission: "workflow",
-                patterns: [safeName],
-                always: [safeName],
-                metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
+            // P3/Item 18: a source-string start (inline or read from script_path)
+            // runs as a TEMPORARY run. Statically validate the source via MetaReader
+            // (AST-only, never executes the module) BEFORE the permission ask — same
+            // gate order as create/named-start: a bad meta fails here, the module
+            // LOAD (which runs code) happens later inside the engine, after the ask.
+            const startFromSource = (source: string, displayPath: string) =>
+              Effect.gen(function* () {
+                const validated = MetaReader.read(source, displayPath)
+                if (validated.valid === false)
+                  return yield* Effect.fail(
+                    new Error(
+                      `Invalid workflow ${displayPath}: ${validated.error}` +
+                        ' Call the workflow tool with action="read" and no name for the authoring guide (module shape, meta rules, examples).',
+                    ),
+                  )
+                // The meta name keys the permission pattern/`always`, so an illegal name
+                // (glob metacharacter/whitespace) is rejected here with a clean fail —
+                // never sanitizeWorkflowName's synchronous throw (which orDie would turn
+                // into a defect) and never an over-broad `always` rule (N15).
+                if (!WORKFLOW_NAME_PATTERN.test(validated.meta.name))
+                  return yield* Effect.fail(
+                    new Error("Workflow names may only contain letters, numbers, underscores, and dashes"),
+                  )
+                const safeName = validated.meta.name
+                // Item 23 (Stufe 2): static lint of the inline/script source.
+                // 'deny' fails here (before the ask — nothing started); 'warn'
+                // findings ride into the ask metadata so the approval dialog
+                // ('View script') can highlight them.
+                const lintFindings = yield* lintSource(source, displayPath)
+                // Item 9: display_name/description feed the approval UI only —
+                // patterns/`always` stay keyed on the sanitized name (N15).
+                yield* ctx.ask({
+                  permission: "workflow",
+                  patterns: [safeName],
+                  always: [safeName],
+                  metadata: {
+                    name: safeName,
+                    display_name: validated.meta.name,
+                    description: validated.meta.description,
+                    path: displayPath,
+                    action: "start",
+                    args: params.args ?? {},
+                    background: params.background === true,
+                    ...(lintFindings.length > 0 ? { lint: lintFindings } : {}),
+                  },
+                })
+                return yield* startWorkflow({
+                  workflow,
+                  background,
+                  sessions,
+                  fs,
+                  config,
+                  scope,
+                  params,
+                  // Omit name: the engine takes its inline source-string load path when
+                  // name is undefined and source is set, deriving the run's name from
+                  // the source's meta (validated above).
+                  source,
+                  temporary: true,
+                  resumeOf,
+                  invalidateAgents: params.invalidate_agents ? [...params.invalidate_agents] : undefined,
+                  ctx,
+                })
               })
-              return yield* startWorkflow({
-                workflow,
-                background,
-                sessions,
-                scope,
-                params,
-                // Omit name: the engine takes its inline source-string load path when
-                // name is undefined and source is set, deriving the run's name from
-                // the source's meta (validated above).
-                source: params.source,
-                temporary: true,
-                resumeOf,
-                invalidateAgents: params.invalidate_agents ? [...params.invalidate_agents] : undefined,
-                ctx,
-              })
+
+            if (params.script_path) {
+              const resolved = path.isAbsolute(params.script_path)
+                ? params.script_path
+                : path.join(projectRoot(yield* InstanceState.context), params.script_path)
+              if (![".ts", ".js"].includes(path.extname(resolved)))
+                return yield* Effect.fail(new Error(`Workflow scripts must be .ts or .js files: ${resolved}`))
+              // Same gate as create: paths outside the allowed area go through the
+              // external_directory permission before anything is read.
+              yield* assertExternalDirectoryEffect(ctx, resolved)
+              const source = yield* fs.readFileStringSafe(resolved)
+              if (source === undefined) return yield* Effect.fail(new Error(`Workflow script not found: ${resolved}`))
+              return yield* startFromSource(source, resolved)
             }
+
+            if (params.source) return yield* startFromSource(params.source, "inline.ts")
 
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=start"))
             // N15 (security, behavior change): the name reaching the permission
@@ -678,26 +940,42 @@ export const WorkflowTool = Tool.define(
             if (info.valid === false) {
               return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
             }
-            // Permission gate before any module LOAD/execution. The check above is
-            // side-effect-free, so the ask still gates every line of foreign code: an
-            // untrusted workspace can never drive any workflow execution ahead of the
-            // user's consent.
-            yield* ctx.ask({
-              permission: "workflow",
-              patterns: [safeName],
-              always: [safeName],
-              metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
-            })
             // Fund 54: populate definition.source from the workflow file so inspect
             // view="all" renders the real <source> (the engine persists it on the
             // run, and the TUI reads it too). Best-effort: a read failure just leaves
             // source unset, falling back to "No source recorded." rather than failing
-            // the start.
+            // the start. Read BEFORE the ask (Item 23) so the static lint findings
+            // can ride into the approval metadata — a plain file read is as
+            // side-effect-free as the static list pre-check above.
             const source = yield* fs.readFileStringSafe(info.path)
+            // Item 23 (Stufe 2): static lint of the named workflow's source.
+            // 'deny' fails before the ask; 'warn' findings feed the approval UI.
+            const lintFindings = source !== undefined ? yield* lintSource(source, info.path) : []
+            // Permission gate before any module LOAD/execution. The check above is
+            // side-effect-free, so the ask still gates every line of foreign code: an
+            // untrusted workspace can never drive any workflow execution ahead of the
+            // user's consent. Item 9: display_name/description feed the approval UI
+            // only — patterns/`always` stay keyed on the sanitized name (N15).
+            yield* ctx.ask({
+              permission: "workflow",
+              patterns: [safeName],
+              always: [safeName],
+              metadata: {
+                name: safeName,
+                display_name: info.meta.name,
+                description: info.meta.description,
+                action: "start",
+                args: params.args ?? {},
+                background: params.background === true,
+                ...(lintFindings.length > 0 ? { lint: lintFindings } : {}),
+              },
+            })
             return yield* startWorkflow({
               workflow,
               background,
               sessions,
+              fs,
+              config,
               scope,
               params,
               name: params.name,
@@ -759,6 +1037,38 @@ export const WorkflowTool = Tool.define(
             }
           }
 
+          if (params.action === "cancel" || params.action === "pause") {
+            if (!params.run_id) return yield* Effect.fail(new Error(`run_id is required for action=${params.action}`))
+            const runId = decodeRunId(params.run_id)
+            if (!runId) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
+            // No ctx.ask gate here: cancel/pause are DE-escalating (they stop spend),
+            // exactly like the auth-only HTTP cancel/pause handlers — never escalate
+            // a stop behind a permission prompt.
+            //
+            // Agent-initiated stop is INTENTIONAL: cancel the BackgroundJob wait
+            // fiber FIRST (job id === run.id) so the synthetic
+            // backgroundMessage("error") prompt never fires for a deliberate stop.
+            yield* background.cancel(runId).pipe(Effect.ignore)
+            const run = yield* params.action === "cancel" ? workflow.cancel(runId) : workflow.pause(runId)
+            if (!run) return yield* Effect.fail(new Error(`Workflow run not found: ${params.run_id}`))
+            // Idempotency is reported honestly: cancel/pause of an already-terminal
+            // run returns its real snapshot (e.g. "Workflow completed: …") as SUCCESS
+            // — a stopped run is the wanted outcome here, never a runFailure()
+            // (counterpart of the N10 carve-out on the foreground wait).
+            return {
+              title: `Workflow ${run.status}: ${run.workflow}`,
+              metadata: { ...workflowMetadata(run, false), action: params.action },
+              output: [
+                formatRunSummary(run),
+                params.action === "pause" && run.status === "paused"
+                  ? "<instructions>Resume by starting this workflow again with resume_of set to this run_id; use invalidate_agents to force individual steps to re-run.</instructions>"
+                  : undefined,
+              ]
+                .filter((line): line is string => line !== undefined)
+                .join("\n"),
+            }
+          }
+
           if (params.action === "create") {
             if (!params.name) return yield* Effect.fail(new Error("name is required for action=create"))
             if (!params.source) return yield* Effect.fail(new Error("source is required for action=create"))
@@ -782,11 +1092,32 @@ export const WorkflowTool = Tool.define(
             // permission start uses (consistent pattern/`always` shape), in addition to
             // the `edit` gate for the write. The ask comes BEFORE any write, so a denial
             // dies before fs.writeWithDirs and the file is never created.
+            //
+            // Item 9: a tolerant static pre-parse enriches the approval display with
+            // the workflow's display name/description. MetaReader is AST-only and
+            // side-effect-free, so it is safe BEFORE the ask. Display only: an
+            // invalid source still asks (without the display fields) and still runs
+            // the unchanged post-write validation/error path below.
+            const preview = MetaReader.read(params.source, filepath)
+            // Item 23 (Stufe 2): static lint of the source about to be written.
+            // 'deny' fails HERE — before the ask and before any write, so a
+            // denied source never reaches disk; 'warn' findings ride into the
+            // ask metadata and the success output below.
+            const lintFindings = yield* lintSource(params.source, filepath)
             yield* ctx.ask({
               permission: "workflow",
               patterns: [safeName],
               always: [safeName],
-              metadata: { name: safeName, args: params.args ?? {}, background: params.background === true },
+              metadata: {
+                name: safeName,
+                ...(preview.valid !== false
+                  ? { display_name: preview.meta.name, description: preview.meta.description }
+                  : {}),
+                action: "create",
+                args: params.args ?? {},
+                background: params.background === true,
+                ...(lintFindings.length > 0 ? { lint: lintFindings } : {}),
+              },
             })
             const previous = exists ? ((yield* fs.readFileStringSafe(filepath)) ?? "") : ""
             yield* ctx.ask({
@@ -808,16 +1139,32 @@ export const WorkflowTool = Tool.define(
             // load failure instead of claiming the file was "created and validated".
             const validated = MetaReader.read(params.source, filepath)
             if (validated.valid === false) {
-              return yield* Effect.fail(new Error(`Invalid workflow ${filepath}: ${validated.error}`))
+              return yield* Effect.fail(
+                new Error(
+                  `Invalid workflow ${filepath}: ${validated.error}` +
+                    ' Call the workflow tool with action="read" and no name for the authoring guide (module shape, meta rules, examples).',
+                ),
+              )
             }
             return {
               title: `Workflow created: ${params.name}`,
               metadata: { name: params.name, path: filepath, exists },
               output: [
                 "Workflow file created and validated.",
+                // Item 23 (Stufe 2): non-blocking lint findings as a <lint>
+                // block, so the author sees which capabilities the script uses.
+                ...(formatLintFindings(lintFindings) !== undefined
+                  ? ["", formatLintFindings(lintFindings)!]
+                  : []),
                 "",
                 formatWorkflow({ name: params.name, path: filepath, meta: validated.meta, valid: true }),
                 formatAgentRoster(yield* agents.list()),
+                // Item 1: a lean iteration footer (the author just wrote the file
+                // — no need for the full guide here).
+                "",
+                `Next: start it with action="start", name="${params.name}";`,
+                'inspect a run with action="inspect", view="all";',
+                "edit the file and start again to iterate — the module is loaded fresh on every start (no cache).",
               ].join("\n"),
             }
           }

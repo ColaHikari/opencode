@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test"
+import type { TextareaRenderable } from "@opentui/core"
 import type { WorkflowInfo } from "@opencode-ai/sdk/v2"
 import {
+  extractReservedBudget,
   isWorkflowCommandInput,
   isWorkflowNameInput,
   listWorkflowInfos,
   parseWorkflowArgs,
+  reservedSlashNames,
   workflowArgContext,
+  workflowArgOptions,
   workflowAutocompleteTriggerIndex,
   workflowCommandOptions,
 } from "../../../../src/component/prompt/workflow-autocomplete"
@@ -186,5 +190,117 @@ describe("workflowCommandOptions (direct /<name> slash commands)", () => {
 
   test("no infos yields no options", () => {
     expect(workflowCommandOptions([], new Set())).toEqual([])
+  })
+})
+
+describe("reservedSlashNames (Item 30 — Commands > Workflows collision set)", () => {
+  test("palette slash displays are reserved with the leading slash stripped", () => {
+    const names = reservedSlashNames([{ display: "/help" }, { display: "/models" }], [])
+    expect(names.has("help")).toBe(true)
+    expect(names.has("models")).toBe(true)
+  })
+
+  test("palette slash aliases are reserved too (a typed alias is a real command trigger)", () => {
+    const names = reservedSlashNames([{ display: "/quit", aliases: ["/exit", "/q"] }], [])
+    expect(names.has("quit")).toBe(true)
+    expect(names.has("exit")).toBe(true)
+    expect(names.has("q")).toBe(true)
+  })
+
+  test("server command/mcp/skill names are reserved; a :mcp display suffix is stripped defensively", () => {
+    const names = reservedSlashNames(
+      [],
+      [
+        { name: "deploy", source: "command" },
+        { name: "tools:mcp", source: "mcp" },
+        { name: "brainstorm", source: "skill" },
+        { name: "plain" },
+      ],
+    )
+    expect(names.has("deploy")).toBe(true)
+    expect(names.has("tools")).toBe(true)
+    expect(names.has("brainstorm")).toBe(true)
+    expect(names.has("plain")).toBe(true)
+  })
+
+  test("source-'workflow' entries are NOT reserved (discovery mirrors of the workflows themselves)", () => {
+    const names = reservedSlashNames([], [{ name: "review", source: "workflow" }])
+    expect(names.has("review")).toBe(false)
+  })
+
+  test("the /workflow[s] dispatch words are always reserved", () => {
+    const names = reservedSlashNames([], [])
+    expect(names.has("workflow")).toBe(true)
+    expect(names.has("workflows")).toBe(true)
+  })
+
+  test("a name in the set blocks direct routing, an unknown one does not", () => {
+    const names = reservedSlashNames([{ display: "/review" }], [])
+    expect(names.has("review")).toBe(true)
+    expect(names.has("triage")).toBe(false)
+  })
+})
+
+describe("extractReservedBudget (reserved budget= argument)", () => {
+  test("undeclared + valid value sets budget and removes the key", () => {
+    expect(extractReservedBudget({ budget: "5", msg: "hi" })).toEqual({ args: { msg: "hi" }, budget: 5 })
+    expect(extractReservedBudget({ budget: "0.5" })).toEqual({ args: {}, budget: 0.5 })
+  })
+
+  test("a leading $ is tolerated (budget=$5)", () => {
+    expect(extractReservedBudget({ budget: "$5" })).toEqual({ args: {}, budget: 5 })
+  })
+
+  test("budget=0 is valid (the engine allows a zero cap)", () => {
+    expect(extractReservedBudget({ budget: "0" })).toEqual({ args: {}, budget: 0 })
+  })
+
+  test("a workflow-declared budget argument wins — passthrough untouched", () => {
+    const args = { budget: "5" }
+    expect(extractReservedBudget(args, { budget: { type: "number" } })).toEqual({ args: { budget: "5" } })
+  })
+
+  test("invalid values report an error and keep the args", () => {
+    expect(extractReservedBudget({ budget: "abc" })).toEqual({
+      args: { budget: "abc" },
+      error: "Invalid budget value: abc",
+    })
+    expect(extractReservedBudget({ budget: "-1" }).error).toBe("Invalid budget value: -1")
+    expect(extractReservedBudget({ budget: "" }).error).toBe("Invalid budget value: ")
+  })
+
+  test("no budget key passes through unchanged", () => {
+    expect(extractReservedBudget({ msg: "hi" })).toEqual({ args: { msg: "hi" } })
+    expect(extractReservedBudget({})).toEqual({ args: {} })
+  })
+})
+
+describe("workflowArgOptions (synthetic budget= option)", () => {
+  const input = {} as TextareaRenderable
+  const ctx = (used: string[] = []) => ({ workflow: "flow", query: "", used: new Set(used) })
+  const info = (args: Record<string, { type?: string }>) =>
+    ({ name: "flow", valid: true, meta: { name: "flow", arguments: args } }) as unknown as WorkflowInfo
+
+  test("offers budget= when neither declared nor used", () => {
+    const options = workflowArgOptions(input, ctx(), info({ msg: { type: "string" } }))
+    expect(options.map((option) => option.display)).toEqual(["msg=", "budget="])
+    expect(options.at(-1)?.description).toBe("reserved · USD cost cap for this run")
+  })
+
+  test("omits budget= when the workflow declares its own budget argument", () => {
+    const options = workflowArgOptions(input, ctx(), info({ budget: { type: "number" } }))
+    expect(options.map((option) => option.display)).toEqual(["budget="])
+    expect(options[0]?.description).toContain("number")
+    expect(options[0]?.description).not.toContain("reserved")
+  })
+
+  test("omits budget= once it is already used in the input", () => {
+    const options = workflowArgOptions(input, ctx(["budget"]), info({ msg: { type: "string" } }))
+    expect(options.map((option) => option.display)).toEqual(["msg="])
+  })
+
+  test("offers budget= even for a workflow without declared arguments", () => {
+    const options = workflowArgOptions(input, ctx(), info({}))
+    expect(options.map((option) => option.display)).toEqual(["budget="])
   })
 })

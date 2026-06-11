@@ -12,6 +12,7 @@ import {
   type ApprovalStackController,
   type WorkflowApprovalResult,
 } from "./dialog-workflow-approval-helpers"
+import { phaseTitles } from "./dialog-workflow-helpers"
 
 export type { WorkflowApprovalResult }
 
@@ -37,12 +38,17 @@ function formatArgs(args: Record<string, unknown>) {
 export function DialogWorkflowApproval(props: {
   info: WorkflowInfo
   args: Record<string, unknown>
+  // Reserved `budget=` cost cap (USD) extracted from the args; shown so the user
+  // approves the cap together with the start.
+  budget?: number
   controller: ApprovalStackController
 }) {
   const { theme } = useTheme()
   const [active, setActive] = createSignal(0)
 
-  const phases = createMemo(() => props.info.meta.phases ?? [])
+  // Item 9: phases may be structured entries (string | {title, …}); normalize to
+  // the title strings so a structured phase never renders as "[object Object]".
+  const phases = createMemo(() => phaseTitles(props.info.meta.phases))
   const description = createMemo(() => props.info.meta.description)
   const whenToUse = createMemo(() => props.info.meta.whenToUse)
 
@@ -78,13 +84,20 @@ export function DialogWorkflowApproval(props: {
 
   return (
     <box paddingLeft={2} paddingRight={2} gap={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text attributes={TextAttributes.BOLD} fg={theme.text}>
-          Start workflow: {props.info.name}
-        </text>
-        <text fg={theme.textMuted} onMouseUp={() => choose({ id: "cancel", label: "No" })}>
-          esc
-        </text>
+      <box flexDirection="column">
+        <box flexDirection="row" justifyContent="space-between">
+          {/* Item 9: title with the workflow's DISPLAY name (meta.name); the
+              command/file name reads as a muted subtitle when it differs. */}
+          <text attributes={TextAttributes.BOLD} fg={theme.text}>
+            Start workflow: {props.info.meta.name}
+          </text>
+          <text fg={theme.textMuted} onMouseUp={() => choose({ id: "cancel", label: "No" })}>
+            esc
+          </text>
+        </box>
+        <Show when={props.info.meta.name !== props.info.name}>
+          <text fg={theme.textMuted}>{`/${props.info.name} — ${props.info.path}`}</text>
+        </Show>
       </box>
 
       <Show when={description()}>
@@ -108,6 +121,10 @@ export function DialogWorkflowApproval(props: {
         <text fg={theme.text}>Arguments:</text>
         <text fg={theme.textMuted}>{`  ${formatArgs(props.args)}`}</text>
       </box>
+
+      <Show when={props.budget !== undefined}>
+        <text fg={theme.textMuted}>{`Budget: $${props.budget} (cost cap for this run)`}</text>
+      </Show>
 
       <box flexDirection="column" paddingBottom={1}>
         <For each={OPTIONS}>
@@ -200,13 +217,16 @@ function DialogWorkflowSource(props: { info: WorkflowInfo; onBack: () => void })
 // dismissal resolves "cancel" so the start is always abort-safe. The stack
 // choreography (swap to source pager and back without prematurely resolving) lives
 // in createApprovalStack so it can be unit-tested against a fake dialog.
-DialogWorkflowApproval.show = (dialog: DialogContext, input: { info: WorkflowInfo; args: Record<string, unknown> }) => {
+DialogWorkflowApproval.show = (
+  dialog: DialogContext,
+  input: { info: WorkflowInfo; args: Record<string, unknown>; budget?: number },
+) => {
   return new Promise<WorkflowApprovalResult>((resolve) => {
     const controller = createApprovalStack({
       dialog,
       resolve,
       renderApproval: (controller) => () => (
-        <DialogWorkflowApproval info={input.info} args={input.args} controller={controller} />
+        <DialogWorkflowApproval info={input.info} args={input.args} budget={input.budget} controller={controller} />
       ),
       renderSource: (controller) => () => <DialogWorkflowSource info={input.info} onBack={() => controller.back()} />,
     })

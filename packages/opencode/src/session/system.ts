@@ -16,6 +16,9 @@ import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
+// Cycle-free: tool/workflow.ts never imports session/system.ts (only prompt.ts
+// does), so the gate/trigger wording can live with the tool as single source of truth.
+import { ULTRACODE_SYSTEM_SECTION, WORKFLOW_TRIGGER_GUIDANCE } from "@/tool/workflow"
 import { Workflow } from "@/workflow/workflow"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Location } from "@opencode-ai/core/location"
@@ -41,7 +44,12 @@ export function provider(model: Provider.Model) {
 
 export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
-  readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
+  /**
+   * Item 13: `opts.ultracode` (session.metadata.ultracode === true) appends the
+   * standing "quality over cost" opt-in section after the workflow section, so
+   * an ultracode session needs no per-message directive.
+   */
+  readonly skills: (agent: Agent.Info, opts?: { ultracode?: boolean }) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -93,7 +101,7 @@ export const layer = Layer.effect(
         ].filter((part): part is string => part !== undefined)
       }),
 
-      skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
+      skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info, opts?: { ultracode?: boolean }) {
         const disabled = Permission.disabled(["skill", "workflow"], agent.permission)
 
         const skillList = disabled.has("skill") ? [] : yield* skill.available(agent)
@@ -114,11 +122,18 @@ export const layer = Layer.effect(
           workflowList.length
             ? [
                 "Workflows are project-local multi-step automations that can run agents, phases, and structured processes.",
-                "Do not use workflows by default. Use the workflow tool only when the user asks for a workflow, asks to create one, or clearly confirms workflow automation.",
+                // Item 3: trigger list, offer path, and hybrid scouting —
+                // shared verbatim with the workflow tool DESCRIPTION (one
+                // exported constant, no drift).
+                ...WORKFLOW_TRIGGER_GUIDANCE,
                 'Use the workflow tool with action="read" for details before starting a workflow if the arguments or behavior are unclear.',
                 Workflow.fmt(workflowList),
               ].join("\n")
             : undefined,
+          // Item 13: the standing ultracode opt-in (session.metadata.ultracode).
+          // Appended AFTER the workflow section; suppressed when the agent's
+          // permission ruleset denies the workflow tool outright.
+          opts?.ultracode && !disabled.has("workflow") ? ULTRACODE_SYSTEM_SECTION : undefined,
         ]
           .filter((section): section is string => section !== undefined)
           .join("\n\n")

@@ -6443,6 +6443,24 @@
                   "variant": {
                     "type": "string"
                   },
+                  "turnBudget": {
+                    "type": "object",
+                    "properties": {
+                      "usd": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "tokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mcp": {
+                    "type": "string",
+                    "enum": ["eager", "lazy"]
+                  },
                   "parts": {
                     "type": "array",
                     "items": {
@@ -7328,6 +7346,24 @@
                   },
                   "variant": {
                     "type": "string"
+                  },
+                  "turnBudget": {
+                    "type": "object",
+                    "properties": {
+                      "usd": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "tokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mcp": {
+                    "type": "string",
+                    "enum": ["eager", "lazy"]
                   },
                   "parts": {
                     "type": "array",
@@ -10568,6 +10604,104 @@
         ]
       }
     },
+    "/workflow/run/{id}/agent/{agentId}/skip": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.skip",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "agentId",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run after requesting the skip",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Skip one in-flight agent step of a live workflow run; the step's ctx.agent call resolves null and the run continues.",
+        "summary": "Skip workflow agent step",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.skip({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/workflow/run/{id}/answer": {
       "post": {
         "tags": ["workflow"],
@@ -10666,6 +10800,86 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.answer({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}/export": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.export",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run transcripts exported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowExportResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Export a run's transcripts as JSONL files; returns the directory path.",
+        "summary": "Export workflow run transcripts",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.export({\n  ...\n})"
           }
         ]
       }
@@ -19613,6 +19827,23 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "foreground_grace_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "budget_directive": {
+                "type": "boolean"
+              },
+              "shell_permission": {
+                "type": "boolean"
+              },
+              "lint": {
+                "type": "string",
+                "enum": ["off", "warn", "deny"]
+              },
+              "lazy_mcp": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -21757,7 +21988,7 @@
           },
           "status": {
             "type": "string",
-            "enum": ["running", "completed", "failed"]
+            "enum": ["running", "completed", "failed", "skipped"]
           },
           "started_at": {
             "type": "number"
@@ -21771,6 +22002,9 @@
           "agent": {
             "type": "string"
           },
+          "label": {
+            "type": "string"
+          },
           "model": {
             "type": "string"
           },
@@ -21778,6 +22012,9 @@
             "type": "string"
           },
           "message_id": {
+            "type": "string"
+          },
+          "worktree": {
             "type": "string"
           },
           "prompt": {
@@ -22069,6 +22306,10 @@
             "type": "number",
             "minimum": 0
           },
+          "budget_tokens": {
+            "type": "number",
+            "minimum": 0
+          },
           "permissionSessionID": {
             "type": "string",
             "pattern": "^ses"
@@ -22082,6 +22323,10 @@
             "items": {
               "type": "integer"
             }
+          },
+          "replay": {
+            "type": "string",
+            "enum": ["prefix", "keyed"]
           }
         },
         "additionalProperties": false
@@ -22099,6 +22344,22 @@
           }
         },
         "required": ["answer"],
+        "additionalProperties": false
+      },
+      "WorkflowExportResult": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["path", "files"],
         "additionalProperties": false
       },
       "UnauthorizedError": {

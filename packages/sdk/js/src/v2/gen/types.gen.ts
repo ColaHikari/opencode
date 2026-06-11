@@ -2085,6 +2085,11 @@ export type Config = {
     ultracode_keyword?: boolean
     approval?: "always" | "first-run" | "never"
     approved?: Array<string>
+    foreground_grace_ms?: number
+    budget_directive?: boolean
+    shell_permission?: boolean
+    lint?: "off" | "warn" | "deny"
+    lazy_mcp?: boolean
   }
   experimental?: {
     disable_paste_summary?: boolean
@@ -2809,14 +2814,16 @@ export type WorkflowLogEntry = {
 
 export type WorkflowAgentRun = {
   id: string
-  status: "running" | "completed" | "failed"
+  status: "running" | "completed" | "failed" | "skipped"
   started_at: number
   completed_at?: number
   phase?: string
   agent?: string
+  label?: string
   model?: string
   session_id?: string
   message_id?: string
+  worktree?: string
   prompt: string
   output?: string
   cost?: number
@@ -2901,9 +2908,11 @@ export type WorkflowStartPayload = {
     [key: string]: unknown
   }
   budget?: number
+  budget_tokens?: number
   permissionSessionID?: string
   resume_of?: string
   invalidate_agents?: Array<number>
+  replay?: "prefix" | "keyed"
 }
 
 export type WorkflowAnswerPayload = {
@@ -2912,6 +2921,11 @@ export type WorkflowAnswerPayload = {
    */
   answer: string
   permissionSessionID?: string
+}
+
+export type WorkflowExportResult = {
+  path: string
+  files: Array<string>
 }
 
 export type UnauthorizedError = {
@@ -8226,6 +8240,11 @@ export type SessionPromptData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    turnBudget?: {
+      usd?: number
+      tokens?: number
+    }
+    mcp?: "eager" | "lazy"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -8574,6 +8593,11 @@ export type SessionPromptAsyncData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    turnBudget?: {
+      usd?: number
+      tokens?: number
+    }
+    mcp?: "eager" | "lazy"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -9939,6 +9963,45 @@ export type WorkflowPauseResponses = {
 
 export type WorkflowPauseResponse = WorkflowPauseResponses[keyof WorkflowPauseResponses]
 
+export type WorkflowSkipData = {
+  body?: never
+  path: {
+    id: string
+    agentId: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/agent/{agentId}/skip"
+}
+
+export type WorkflowSkipErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type WorkflowSkipError = WorkflowSkipErrors[keyof WorkflowSkipErrors]
+
+export type WorkflowSkipResponses = {
+  /**
+   * Workflow run after requesting the skip
+   */
+  200: WorkflowRun
+}
+
+export type WorkflowSkipResponse = WorkflowSkipResponses[keyof WorkflowSkipResponses]
+
 export type WorkflowAnswerData = {
   body?: WorkflowAnswerPayload
   path: {
@@ -9976,6 +10039,40 @@ export type WorkflowAnswerResponses = {
 }
 
 export type WorkflowAnswerResponse = WorkflowAnswerResponses[keyof WorkflowAnswerResponses]
+
+export type WorkflowExportData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/export"
+}
+
+export type WorkflowExportErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowExportError = WorkflowExportErrors[keyof WorkflowExportErrors]
+
+export type WorkflowExportResponses = {
+  /**
+   * Workflow run transcripts exported
+   */
+  200: WorkflowExportResult
+}
+
+export type WorkflowExportResponse = WorkflowExportResponses[keyof WorkflowExportResponses]
 
 export type V2HealthGetData = {
   body?: never
