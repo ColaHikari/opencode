@@ -75,6 +75,7 @@ const it = testEffect(
           skipAgent: () => Effect.succeed(undefined),
           answer: () => Effect.succeed(undefined),
           save: () => Effect.succeed({ path: "/tmp/test.ts" }),
+          export: () => Effect.succeed(undefined),
           remove: () => Effect.succeed(false),
           sweep: () => Effect.void,
         }),

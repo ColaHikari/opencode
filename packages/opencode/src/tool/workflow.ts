@@ -17,6 +17,8 @@ import * as Tool from "./tool"
 import { trimDiff } from "./edit"
 import { Workflow } from "@/workflow/workflow"
 import { MetaReader } from "@/workflow/meta-reader"
+import { SourceLint } from "@/workflow/source-lint"
+import type { TurnBudget } from "@/session/turn-budget"
 import { Agent } from "@/agent/agent"
 import AUTHORING_GUIDE from "./workflow.txt"
 
@@ -130,7 +132,11 @@ const Parameters = Schema.Struct({
   }),
   invalidate_agents: Schema.optional(Schema.Array(Schema.Int)).annotate({
     description:
-      "Agent indices (0-based, in the source run's order) to force live re-execution of during a resume. Only meaningful with resume_of.",
+      "Agent indices (0-based, in the source run's order) to force live re-execution of during a resume. Only meaningful with resume_of. In prefix mode (the default), everything after the first invalidated agent re-runs live.",
+  }),
+  replay: Schema.optional(Schema.Literals(["prefix", "keyed"])).annotate({
+    description:
+      "Journal replay strategy for a resume (only meaningful with resume_of). 'prefix' (default): replay the source run's steps in order and stop permanently at the first changed/invalidated step — everything after re-runs live. 'keyed': match steps by call shape, so unchanged later steps replay even after an earlier change (use for read-only or heavily parallel workflows).",
   }),
 })
 
@@ -158,6 +164,17 @@ function promptOps(ctx: Tool.Context) {
   throw new Error("Workflow tools require prompt operations in the current session")
 }
 
+// Item 24: the shared turn pool, threaded by SessionTools into ctx.extra
+// (exactly the promptOps pattern above). Optional — a turn without a budget
+// directive has none, and the run then keeps its per-run budget only.
+function turnPool(ctx: Tool.Context) {
+  const pool = ctx.extra?.turnBudget
+  if (typeof pool === "object" && pool !== null && typeof Reflect.get(pool, "id") === "string") {
+    return pool as TurnBudget.Pool
+  }
+  return undefined
+}
+
 function workflowError(error: Workflow.InvalidError | Workflow.NotFoundError) {
   if (error._tag === "WorkflowInvalidError") return new Error(`Invalid workflow ${error.path}: ${error.message}`)
   return new Error(`Workflow not found: ${error.name}`)
@@ -182,6 +199,21 @@ function escapeXmlText(value: string) {
 // can never break out of the `="…"` it sits in.
 function escapeXmlAttr(value: string) {
   return escapeXmlText(value).replaceAll('"', "&quot;").replaceAll("'", "&apos;")
+}
+
+// Item 23 (Stufe 2): renders lint findings as a <lint> block for the tool
+// output. The findings' source snippets are untrusted (LLM/attacker-authored
+// script text), so they are escaped like every other interpolated field.
+function formatLintFindings(findings: readonly SourceLint.Finding[]) {
+  if (findings.length === 0) return undefined
+  return [
+    "<lint>",
+    ...findings.map(
+      (finding) =>
+        `  <finding line="${finding.line}" rule="${escapeXmlAttr(finding.rule)}">${escapeXmlText(finding.text)}</finding>`,
+    ),
+    "</lint>",
+  ].join("\n")
 }
 
 // Untrusted structured values (args/result/tokens) are JSON-stringified, then the
@@ -519,6 +551,13 @@ function startWorkflow(input: {
         temporary: input.temporary,
         resume_of: input.resumeOf,
         invalidate_agents: input.invalidateAgents,
+        // Item 20: replay strategy for the resume journal (prefix default in
+        // the engine; only meaningful with resume_of).
+        replay: input.params.replay,
+        // Item 24: the turn's shared budget pool (when the turn set one) — the
+        // run's agent steps reserve/settle against it, so multiple runs of one
+        // turn share a single cap.
+        pool: turnPool(input.ctx),
       })
       .pipe(Effect.mapError(workflowError))
 
@@ -685,6 +724,25 @@ export const WorkflowTool = Tool.define(
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
     const scope = yield* Scope.Scope
+    // Item 23 (Stufe 2): the configured static source lint. AST-only (never
+    // imports/executes the module), so it is safe BEFORE the permission ask.
+    // 'off' ⇒ no findings; 'deny' ⇒ findings fail the create/start outright;
+    // 'warn' (default) ⇒ findings are surfaced (create output / start ask
+    // metadata) without blocking.
+    const lintSource = (source: string, displayPath: string) =>
+      Effect.gen(function* () {
+        const mode = (yield* config.get()).workflows?.lint ?? "warn"
+        const findings = mode === "off" ? [] : SourceLint.lint(source, displayPath).findings
+        if (mode === "deny" && findings.length > 0) {
+          return yield* Effect.fail(
+            new Error(
+              `Workflow source rejected by lint (workflows.lint="deny"): ` +
+                findings.map((finding) => `line ${finding.line} [${finding.rule}] ${finding.text}`).join("; "),
+            ),
+          )
+        }
+        return findings
+      })
     return {
       description: DESCRIPTION,
       parameters: Parameters,
@@ -761,6 +819,11 @@ export const WorkflowTool = Tool.define(
                     new Error("Workflow names may only contain letters, numbers, underscores, and dashes"),
                   )
                 const safeName = validated.meta.name
+                // Item 23 (Stufe 2): static lint of the inline/script source.
+                // 'deny' fails here (before the ask — nothing started); 'warn'
+                // findings ride into the ask metadata so the approval dialog
+                // ('View script') can highlight them.
+                const lintFindings = yield* lintSource(source, displayPath)
                 // Item 9: display_name/description feed the approval UI only —
                 // patterns/`always` stay keyed on the sanitized name (N15).
                 yield* ctx.ask({
@@ -775,6 +838,7 @@ export const WorkflowTool = Tool.define(
                     action: "start",
                     args: params.args ?? {},
                     background: params.background === true,
+                    ...(lintFindings.length > 0 ? { lint: lintFindings } : {}),
                   },
                 })
                 return yield* startWorkflow({
@@ -838,6 +902,17 @@ export const WorkflowTool = Tool.define(
             if (info.valid === false) {
               return yield* Effect.fail(new Error(`Invalid workflow ${info.path}: ${info.error ?? "invalid workflow"}`))
             }
+            // Fund 54: populate definition.source from the workflow file so inspect
+            // view="all" renders the real <source> (the engine persists it on the
+            // run, and the TUI reads it too). Best-effort: a read failure just leaves
+            // source unset, falling back to "No source recorded." rather than failing
+            // the start. Read BEFORE the ask (Item 23) so the static lint findings
+            // can ride into the approval metadata — a plain file read is as
+            // side-effect-free as the static list pre-check above.
+            const source = yield* fs.readFileStringSafe(info.path)
+            // Item 23 (Stufe 2): static lint of the named workflow's source.
+            // 'deny' fails before the ask; 'warn' findings feed the approval UI.
+            const lintFindings = source !== undefined ? yield* lintSource(source, info.path) : []
             // Permission gate before any module LOAD/execution. The check above is
             // side-effect-free, so the ask still gates every line of foreign code: an
             // untrusted workspace can never drive any workflow execution ahead of the
@@ -854,14 +929,9 @@ export const WorkflowTool = Tool.define(
                 action: "start",
                 args: params.args ?? {},
                 background: params.background === true,
+                ...(lintFindings.length > 0 ? { lint: lintFindings } : {}),
               },
             })
-            // Fund 54: populate definition.source from the workflow file so inspect
-            // view="all" renders the real <source> (the engine persists it on the
-            // run, and the TUI reads it too). Best-effort: a read failure just leaves
-            // source unset, falling back to "No source recorded." rather than failing
-            // the start.
-            const source = yield* fs.readFileStringSafe(info.path)
             return yield* startWorkflow({
               workflow,
               background,
@@ -991,6 +1061,11 @@ export const WorkflowTool = Tool.define(
             // invalid source still asks (without the display fields) and still runs
             // the unchanged post-write validation/error path below.
             const preview = MetaReader.read(params.source, filepath)
+            // Item 23 (Stufe 2): static lint of the source about to be written.
+            // 'deny' fails HERE — before the ask and before any write, so a
+            // denied source never reaches disk; 'warn' findings ride into the
+            // ask metadata and the success output below.
+            const lintFindings = yield* lintSource(params.source, filepath)
             yield* ctx.ask({
               permission: "workflow",
               patterns: [safeName],
@@ -1003,6 +1078,7 @@ export const WorkflowTool = Tool.define(
                 action: "create",
                 args: params.args ?? {},
                 background: params.background === true,
+                ...(lintFindings.length > 0 ? { lint: lintFindings } : {}),
               },
             })
             const previous = exists ? ((yield* fs.readFileStringSafe(filepath)) ?? "") : ""
@@ -1037,6 +1113,11 @@ export const WorkflowTool = Tool.define(
               metadata: { name: params.name, path: filepath, exists },
               output: [
                 "Workflow file created and validated.",
+                // Item 23 (Stufe 2): non-blocking lint findings as a <lint>
+                // block, so the author sees which capabilities the script uses.
+                ...(formatLintFindings(lintFindings) !== undefined
+                  ? ["", formatLintFindings(lintFindings)!]
+                  : []),
                 "",
                 formatWorkflow({ name: params.name, path: filepath, meta: validated.meta, valid: true }),
                 formatAgentRoster(yield* agents.list()),

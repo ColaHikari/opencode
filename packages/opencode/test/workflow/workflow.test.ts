@@ -7,6 +7,7 @@ import { Permission } from "@/permission"
 import { Agent } from "@/agent/agent"
 import { SessionID } from "@/session/schema"
 import type { SessionPrompt } from "@/session/prompt"
+import { TurnBudget } from "@/session/turn-budget"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { WorkflowRunTable } from "@opencode-ai/core/workflow/sql"
@@ -42,6 +43,10 @@ const it = testEffect(
     // exported const reference the Workflow layer provides internally, so Effect's
     // layer memoisation resolves both to ONE instance (exactly as for Database).
     EventV2Bridge.defaultLayer,
+    // Item 23: Permission.defaultLayer is merged so the ctx.shell gate tests can
+    // observe/reply to the SAME permission instance the engine asks through
+    // (identical const reference ⇒ one memoised instance, as above).
+    Permission.defaultLayer,
   ),
 )
 
@@ -558,6 +563,19 @@ export async function run(args, ctx) {
   // No timeout: only a scope-close interrupt (cancel/pause) can stop this.
   await ctx.shell("touch '" + args.running + "'; sleep 3; touch '" + args.leaked + "'")
   return { ok: true }
+}
+`
+
+// Item 23 (Stufe 1): ctx.shell under the permission gate. The command (`rm
+// <target>`) targets a RELATIVE path inside the workspace so no
+// external_directory ask fires — only the bash permission, evaluated against
+// the caller session's ruleset.
+const SHELL_GATE_FIXTURE = "shell-gate"
+const SHELL_GATE_WORKFLOW = `export const meta = { name: "${SHELL_GATE_FIXTURE}", phases: ["run"], arguments: { command: { type: "string" } } }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.shell(args.command)
+  return { code: r.exitCode, out: r.output.trim() }
 }
 `
 
@@ -1493,6 +1511,35 @@ export async function run(args, ctx) {
 }
 `
 
+// Item 24 (Turn-Pool): zwei PARALLELE Steps gegen einen Pool mit Headroom für
+// genau einen (gepreiste Reservierung via vorab gesettletem Step). Die
+// synchrone Check-and-Set-Reservierung lässt exakt EINEN passieren — der
+// andere wird VOR der Node-Erzeugung refused (kein Soft-Cap-Overspend mehr).
+const POOL_PARALLEL_FIXTURE = "pool-parallel"
+const POOL_PARALLEL_WORKFLOW = `export const meta = { name: "${POOL_PARALLEL_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  await ctx.parallel([
+    () => ctx.agent({ prompt: "pool A" }),
+    () => ctx.agent({ prompt: "pool B" }),
+  ])
+  return { ok: true }
+}
+`
+
+// Item 24: macht die ctx.budget-Pool-Sicht beobachtbar (total/spent vor und
+// nach einem Step plus remaining) — ohne Run-Budget leitet sie aus dem Pool ab.
+const POOL_SPENT_FIXTURE = "pool-spent"
+const POOL_SPENT_WORKFLOW = `export const meta = { name: "${POOL_SPENT_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const before = ctx.budget.spent()
+  const total = ctx.budget.total
+  await ctx.agent({ prompt: "spend" })
+  return { before, total, after: ctx.budget.spent(), remaining: ctx.budget.remaining() }
+}
+`
+
 // Schreibt ctx.budgetRemaining vor und nach einem Agent-Step ins Resultat,
 // damit der Test die Live-Dekrementierung beobachten kann.
 const BUDGET_REMAINING_FIXTURE = "budget-remaining"
@@ -1731,6 +1778,44 @@ export async function run(args, ctx) {
   const first = await ctx.agent({ prompt: "same prompt" })
   const second = await ctx.agent({ prompt: "same prompt" })
   return { first: first.text, second: second.text }
+}
+`
+
+// Item 20 (prefix-Replay): drei sequentielle Agenten. Mit invalidate_agents:[0]
+// bricht der Präfix im Default-Modus ab Index 0 DAUERHAFT — B und C laufen
+// ebenfalls live, obwohl sie unverändert sind (Original-Semantik). Im keyed-
+// Modus cachen B/C trotz des Invalidates (Shape-Match).
+const PREFIX_FIXTURE = "prefix-three-agents"
+const PREFIX_WORKFLOW = `export const meta = { name: "${PREFIX_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const a = await ctx.agent({ prompt: "agent A" })
+  const b = await ctx.agent({ prompt: "agent B" })
+  const c = await ctx.agent({ prompt: "agent C" })
+  return { a: a.text, b: b.text, c: c.text }
+}
+`
+
+// Item 20 (Schema-Drift bricht den Präfix dauerhaft): V1 hat einen Plaintext-
+// Agenten plus einen unveränderten zweiten Agenten; V2 fordert für Call 1 ein
+// Schema an. Der Parse-Fehler am Plaintext-Journal-Node bricht im prefix-Modus
+// den Präfix — der UNVERÄNDERTE Call 2 läuft ebenfalls live. Im keyed-Modus
+// bleibt Call 2 gecacht (Shape-Match, per-Call-MISS für den Drift).
+const DRIFT2_FIXTURE = "resume-schema-drift-two"
+const DRIFT2_WORKFLOW_PLAINTEXT = `export const meta = { name: "${DRIFT2_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.agent({ prompt: "drift agent" })
+  const s = await ctx.agent({ prompt: "stable agent" })
+  return { value: r.text, stable: s.text }
+}
+`
+const DRIFT2_WORKFLOW_SCHEMA = `export const meta = { name: "${DRIFT2_FIXTURE}", phases: ["run"] }
+export async function run(args, ctx) {
+  ctx.setPhase("run")
+  const r = await ctx.agent({ prompt: "drift agent", schema: { type: "object" } })
+  const s = await ctx.agent({ prompt: "stable agent" })
+  return { value: r.data, stable: s.text }
 }
 `
 
@@ -3774,6 +3859,188 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       }),
   )
 
+  // Item 24 Test (1): two runs share ONE turn pool. Run A's two steps charge
+  // the whole pool; Run B (same pool) is refused at its FIRST ctx.agent with
+  // 'Turn budget exhausted' — the cross-run gate the per-run budget never had.
+  it.instance("two runs share one turn pool: the second run fails with 'Turn budget exhausted'", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_FIXTURE, BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const pool = TurnBudget.make({ usd: 1 })
+
+      // Run A: 2 steps à 0.6 — passes (reserve sees headroom before each) but
+      // commits 1.2, exhausting the pool past its 1.0 cap.
+      const first = yield* workflow.start({ name: BUDGET_FIXTURE, args: {}, prompt: costPromptOps(db, 0.6), pool })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("run A did not settle")))
+      expect(firstDone.status).toBe("completed")
+      expect(pool.usd!.committed).toBeCloseTo(1.2, 10)
+
+      // Run B on the SAME pool: its first agent is refused before any node is
+      // recorded — no spend, run failed with the pool verdict.
+      const second = yield* workflow.start({ name: BUDGET_FIXTURE, args: {}, prompt: costPromptOps(db, 0.6), pool })
+      const secondDone =
+        (yield* workflow.wait({ id: second.id })).run ?? (yield* Effect.fail(new Error("run B did not settle")))
+      expect(secondDone.status).toBe("failed")
+      expect(secondDone.error ?? "").toMatch(/Turn budget exhausted/)
+      expect(secondDone.agents).toHaveLength(0)
+      // Nothing further charged, nothing left reserved.
+      expect(pool.usd!.committed).toBeCloseTo(1.2, 10)
+      expect(pool.usd!.reserved).toBe(0)
+    }),
+  )
+
+  // Item 24 Test (2): the reservation closes the documented soft-cap race.
+  // After ONE settled step the pool prices reservations at its rolling average
+  // (1.0); with 0.5 headroom left, of two PARALLEL steps exactly one passes —
+  // the other is refused synchronously, before any node exists (contrast the
+  // per-run 'budget-race audit' above, where both passed and overspent).
+  it.instance("a priced pool reservation lets exactly one of two parallel steps pass", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_REMAINING_FIXTURE, BUDGET_REMAINING_WORKFLOW))
+      yield* Effect.promise(() => writeWorkflow(test.directory, POOL_PARALLEL_FIXTURE, POOL_PARALLEL_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const pool = TurnBudget.make({ usd: 1.5 })
+
+      // Prime: one settled step à 1.0 sets avgStepUsd = 1.0, committed = 1.0.
+      const prime = yield* workflow.start({
+        name: BUDGET_REMAINING_FIXTURE,
+        args: {},
+        prompt: costPromptOps(db, 1),
+        pool,
+      })
+      const primed =
+        (yield* workflow.wait({ id: prime.id })).run ?? (yield* Effect.fail(new Error("prime run did not settle")))
+      expect(primed.status).toBe("completed")
+      expect(pool.avgStepUsd).toBeCloseTo(1, 10)
+
+      // Two parallel steps, 0.5 headroom, 1.0 reservations: exactly ONE passes.
+      // The refused one resolves to null at its position (the P1 parallel drop
+      // semantics), so the run COMPLETES — but only one node was ever created
+      // (the refusal precedes node recording) and the drop log carries the
+      // pool verdict.
+      const race = yield* workflow.start({
+        name: POOL_PARALLEL_FIXTURE,
+        args: {},
+        prompt: costPromptOps(db, 0.1),
+        pool,
+      })
+      const raced =
+        (yield* workflow.wait({ id: race.id })).run ?? (yield* Effect.fail(new Error("race run did not settle")))
+      expect(raced.status).toBe("completed")
+      expect(raced.agents.length).toBe(1)
+      expect(raced.logs.some((l) => l.message.includes("dropped") && l.message.includes("Turn budget exhausted"))).toBe(
+        true,
+      )
+      // The passed step's reservation settled (committed its 0.1), the refused
+      // one never reserved: nothing leaks.
+      expect(pool.usd!.committed).toBeCloseTo(1.1, 10)
+      expect(pool.usd!.reserved).toBe(0)
+    }),
+  )
+
+  // Item 24 Test (3): a FAILED step releases its reservation — committed stays
+  // untouched, reserved returns to 0 (the ensuring settles on every outcome).
+  it.instance("a failed step releases its pool reservation without committing spend", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_REMAINING_FIXTURE, BUDGET_REMAINING_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const pool = TurnBudget.make({ usd: 2 })
+
+      // Prime a settled step so the next reservation is non-zero (0.5).
+      const prime = yield* workflow.start({
+        name: BUDGET_REMAINING_FIXTURE,
+        args: {},
+        prompt: costPromptOps(db, 0.5),
+        pool,
+      })
+      yield* workflow.wait({ id: prime.id })
+      expect(pool.usd!.committed).toBeCloseTo(0.5, 10)
+
+      // Failing run: the step reserves 0.5, the prompt fails — the ensuring
+      // settles with 0: committed unchanged, reserved back to 0.
+      const failingOps: Workflow.PromptOps = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            return yield* Effect.fail(new Error("agent exploded"))
+          }),
+        cancel: () => Effect.void,
+      }
+      const failed = yield* workflow.start({ name: BUDGET_REMAINING_FIXTURE, args: {}, prompt: failingOps, pool })
+      const failedDone =
+        (yield* workflow.wait({ id: failed.id })).run ?? (yield* Effect.fail(new Error("failing run did not settle")))
+      expect(failedDone.status).toBe("failed")
+      expect(pool.usd!.committed).toBeCloseTo(0.5, 10)
+      expect(pool.usd!.reserved).toBe(0)
+    }),
+  )
+
+  // Item 24 Test (4): the ctx.budget pool view. Without a run budget, total/
+  // spent()/remaining() derive from the pool — spent() includes the main
+  // loop's chargeDirect share (Claude-Code semantics: the TURN's spend).
+  it.instance("ctx.budget reflects the pool including chargeDirect spend when no run budget is set", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, POOL_SPENT_FIXTURE, POOL_SPENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+      const pool = TurnBudget.make({ usd: 10 })
+      // Simulate the main loop's direct charge before the run starts.
+      TurnBudget.chargeDirect(pool, { usd: 0.3 })
+
+      const run = yield* workflow.start({ name: POOL_SPENT_FIXTURE, args: {}, prompt: costPromptOps(db, 0.25), pool })
+      const done = (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("run did not settle")))
+      expect(done.status).toBe("completed")
+      const result = done.result as { before: number; total: number; after: number; remaining: number }
+      expect(result.total).toBe(10)
+      expect(result.before).toBeCloseTo(0.3, 10)
+      expect(result.after).toBeCloseTo(0.55, 10)
+      expect(result.remaining).toBeCloseTo(10 - 0.55, 10)
+    }),
+  )
+
+  // Item 24 Test (5): journal REPLAYS charge the pool too (parity with the
+  // run-budget charge — node.cost is copied on the cache hit and settled).
+  it.instance("a journal replay charges the shared turn pool", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, BUDGET_FIXTURE, BUDGET_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      // Source run (NO pool): two steps à 0.5 complete.
+      const first = yield* workflow.start({ name: BUDGET_FIXTURE, args: {}, prompt: costPromptOps(db, 0.5) })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("source run did not settle")))
+      expect(firstDone.status).toBe("completed")
+
+      // Resume with a pool: full cache hit, yet the pool is charged 1.0.
+      const pool = TurnBudget.make({ usd: 10 })
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: BUDGET_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        pool,
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not settle")))
+      expect(done.status).toBe("completed")
+      expect(prompted).toHaveLength(0)
+      expect(done.agents.every((a) => a.cached === true)).toBe(true)
+      expect(pool.usd!.committed).toBeCloseTo(1, 10)
+      expect(pool.usd!.reserved).toBe(0)
+    }),
+  )
+
   it.instance("budgetRemaining reflects real spend during the run", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -3861,6 +4128,41 @@ export async function run(args, ctx) { ctx.setPhase("run"); return { value: args
       // The whole tokens shape, including the summed-but-single `total`, is carried.
       expect(node.tokens).toEqual({ total: 60, input: 10, output: 20, reasoning: 30, cache: { read: 5, write: 7 } })
     }),
+  )
+
+  // Item 28: subagent sessions load MCP lazily by default — the engine stamps
+  // mcp:"lazy" on the subagent PromptInput (observed via the capture seam).
+  it.instance("a subagent PromptInput carries mcp:'lazy' by default", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { ops, inputs } = capturingPromptOps()
+      const run = yield* workflow.start({ name: SINGLE_AGENT_FIXTURE, args: {}, prompt: ops })
+      const done = yield* workflow.wait({ id: run.id })
+      expect(done.run?.status).toBe("completed")
+      expect(inputs).toHaveLength(1)
+      expect(inputs[0].mcp).toBe("lazy")
+    }),
+  )
+
+  // Item 28: config workflows.lazy_mcp=false restores eager subagents (no mcp
+  // field on the PromptInput ⇒ the loop's eager default).
+  it.instance(
+    "workflows.lazy_mcp=false keeps subagent PromptInputs eager",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, SINGLE_AGENT_FIXTURE, SINGLE_AGENT_WORKFLOW))
+        const workflow = yield* Workflow.Service
+        const { ops, inputs } = capturingPromptOps()
+        const run = yield* workflow.start({ name: SINGLE_AGENT_FIXTURE, args: {}, prompt: ops })
+        const done = yield* workflow.wait({ id: run.id })
+        expect(done.run?.status).toBe("completed")
+        expect(inputs).toHaveLength(1)
+        expect(inputs[0].mcp).toBeUndefined()
+      }),
+    { config: { workflows: { lazy_mcp: false } } },
   )
 
   it.instance("no budget set means unlimited (Infinity) — unchanged default", () =>
@@ -5349,8 +5651,10 @@ export async function run() { return { from: "global" } }
   // Spec §5.4 (Occurrence-Index): zwei identische Prompts müssen beim Resume
   // getrennt aus dem Journal aufgelöst werden (je nach Aufruf-Reihenfolge), nicht
   // beide auf denselben Eintrag. Beide A-Agenten kommen aus dem Journal, also wird
-  // KEIN Prompt erneut gefeuert.
-  it.instance("resume caches two identical prompts separately by occurrence", () =>
+  // KEIN Prompt erneut gefeuert. Item 20: das pinnt die KEYED-Occurrence-Semantik
+  // (Map + Cursor pro Key) — seit dem prefix-Default explizit mit replay:"keyed";
+  // der prefix-Zwilling (Sequenz-Cursor löst Duplikate genauso) steht darunter.
+  it.instance("resume caches two identical prompts separately by occurrence (keyed)", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_DUP_FIXTURE, RESUME_DUP_WORKFLOW))
@@ -5409,6 +5713,7 @@ export async function run() { return { from: "global" } }
         args: {},
         prompt: resumeOps,
         resume_of: first.id,
+        replay: "keyed",
       })
       const done =
         (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume dup did not finish")))
@@ -5420,9 +5725,59 @@ export async function run() { return { from: "global" } }
     }),
   )
 
+  // Item 20 (prefix-Zwilling des Occurrence-Tests): im Default-Modus 'prefix'
+  // löst der Sequenz-Cursor zwei identische Prompts genauso getrennt auf — der
+  // erste Call trifft Eintrag 0, der zweite Eintrag 1, in Original-Reihenfolge.
+  it.instance("prefix replay resolves two identical prompts separately in order", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_DUP_FIXTURE, RESUME_DUP_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      let counter = 0
+      const firstOps: { prompt: SessionPrompt.Interface["prompt"]; cancel: SessionPrompt.Interface["cancel"] } = {
+        prompt: (input) =>
+          Effect.gen(function* () {
+            if (input.noReply) return assistantReply()
+            const idx = counter++
+            const last = yield* persistTurns(db, input.sessionID, [
+              { cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+            ])
+            return { info: last.info, parts: [{ type: "text", text: "out:" + idx }] } as unknown as SessionV1.WithParts
+          }),
+        cancel: () => Effect.void,
+      }
+      const first = yield* workflow.start({ name: RESUME_DUP_FIXTURE, args: {}, prompt: firstOps })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first dup run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      expect(firstDone.result).toEqual({ first: "out:0", second: "out:1" })
+
+      // completed ist seit Item 2 direkt resumebar; explizites replay:"prefix"
+      // pinnt das Options-Feld (Default wäre identisch).
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: RESUME_DUP_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        replay: "prefix",
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume dup did not finish")))
+      expect(done.status).toBe("completed")
+      expect(prompted).toHaveLength(0)
+      expect(done.result).toEqual({ first: "out:0", second: "out:1" })
+    }),
+  )
+
   // Spec §5.4 (invalidate_agents): mit invalidate_agents:[0] läuft Agent #0 live
-  // neu, alle anderen cachen.
-  it.instance("resume with invalidate_agents reruns the named index live and caches the rest", () =>
+  // neu, alle anderen cachen. Item 20: das ist KEYED-Semantik (Shape-Match
+  // bedient spätere unveränderte Calls trotz früherem Invalidate) — seit dem
+  // prefix-Default deshalb explizit mit replay:"keyed" gepinnt; das prefix-
+  // Gegenstück ("alles nach dem Invalidate läuft live") steht unten.
+  it.instance("resume with invalidate_agents reruns the named index live and caches the rest (keyed)", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
@@ -5454,7 +5809,8 @@ export async function run() { return { from: "global" } }
         "source run never became paused",
       )
 
-      // Resume mit invalidate_agents:[0] → Agent #0 (A) läuft live neu, B cacht.
+      // Resume mit invalidate_agents:[0] → Agent #0 (A) läuft live neu, B cacht
+      // (keyed: der Shape-Match bedient B trotz des früheren Invalidates).
       const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
       const resumed = yield* workflow.start({
         name: RESUME_FIXTURE,
@@ -5462,6 +5818,7 @@ export async function run() { return { from: "global" } }
         prompt: resumeOps,
         resume_of: first.id,
         invalidate_agents: [0],
+        replay: "keyed",
       })
       const done =
         (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
@@ -5528,6 +5885,230 @@ export async function run() { return { from: "global" } }
       const agentB = done.agents.find((a) => a.prompt === "agent B")
       expect(agentB?.cached).not.toBe(true)
     }),
+  )
+
+  // Item 20 Test (1): 'prefix replay stops at the first changed call'. Quelllauf
+  // A,B,C sequenziell completed; Resume (Default 'prefix') mit
+  // invalidate_agents:[0] ⇒ der Präfix bricht ab Index 0 DAUERHAFT — A, B UND C
+  // laufen live, obwohl B/C unverändert sind. Das ist die Original-Semantik:
+  // nach dem ersten Mismatch wird nichts mehr aus dem Journal bedient, weil die
+  // Workspace-Seiteneffekte späterer Steps stale sein können.
+  it.instance("prefix replay stops at the first changed call: invalidate_agents:[0] reruns everything live", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PREFIX_FIXTURE, PREFIX_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: PREFIX_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      // completed ist seit Item 2 direkt resumebar; kein replay gesetzt ⇒ der
+      // DEFAULT ist prefix (genau das pinnt dieser Test mit).
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: PREFIX_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        invalidate_agents: [0],
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // ALLES lief live: A (invalidiert) und die unveränderten B/C dahinter.
+      expect(prompted).toEqual(["agent A", "agent B", "agent C"])
+      expect(done.agents.every((a) => a.cached !== true)).toBe(true)
+    }),
+  )
+
+  // Item 20 keyed-Gegentest zur 3-Agenten-Fixture: replay:"keyed" stellt das
+  // alte Verhalten exakt wieder her — nur A (invalidiert) läuft live, B und C
+  // werden trotz des früheren Invalidates aus dem Journal bedient.
+  it.instance("keyed replay after invalidate_agents:[0] serves the unchanged later calls from the journal", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PREFIX_FIXTURE, PREFIX_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: PREFIX_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: PREFIX_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        invalidate_agents: [0],
+        replay: "keyed",
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // Nur A lief live; B/C kamen aus dem Journal (keyed-Shape-Match).
+      expect(prompted).toEqual(["agent A"])
+      const agentB = done.agents.find((a) => a.prompt === "agent B")
+      expect(agentB?.cached).toBe(true)
+      const agentC = done.agents.find((a) => a.prompt === "agent C")
+      expect(agentC?.cached).toBe(true)
+    }),
+  )
+
+  // Item 20 Test (2): 'prefix replay serves an unchanged full prefix'. Ein
+  // identisches Script (kein Invalidate, kein Drift) ist unter explizitem
+  // replay:"prefix" ein voller Cache-Hit — kein Prompt, alle Nodes cached.
+  it.instance("prefix replay serves an unchanged full prefix as a complete cache hit", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, PREFIX_FIXTURE, PREFIX_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: PREFIX_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      const { ops: resumeOps, prompted } = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: PREFIX_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        replay: "prefix",
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      expect(prompted).toHaveLength(0)
+      expect(done.agents).toHaveLength(3)
+      expect(done.agents.every((a) => a.cached === true)).toBe(true)
+      expect(done.result).toEqual(firstDone.result)
+    }),
+  )
+
+  // Item 27 (Transcript-Export): export(id) schreibt run.json plus eine
+  // <agent-id>.jsonl pro Agent-Node unter <data>/workflow/<runId>/transcripts.
+  // Live-Nodes (mit Session) exportieren eine {info,parts}-Zeile pro Message;
+  // ein gecachter (session-loser) Node erzeugt GENAU die Fallback-Zeile {node}
+  // — der Export ist immer vollständig über alle Nodes, jede Zeile valides JSON.
+  it.instance("export writes run.json plus one parseable JSONL per agent node (incl. cached fallback)", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, RESUME_FIXTURE, RESUME_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const firstOps = recordingPromptOps(db, 0)
+      const first = yield* workflow.start({ name: RESUME_FIXTURE, args: {}, prompt: firstOps.ops })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      const exported = yield* workflow.export(first.id)
+      expect(exported).toBeDefined()
+      expect(exported!.path).toBe(path.join(Global.Path.data, "workflow", first.id, "transcripts"))
+      expect(exported!.files).toContain("run.json")
+      // run.json ist parsebar und trägt die Run-ID.
+      const runJson = JSON.parse(
+        yield* Effect.promise(() => fs.readFile(path.join(exported!.path, "run.json"), "utf8")),
+      ) as { id: string }
+      expect(runJson.id).toBe(first.id)
+      // Je Agent-Node eine .jsonl; jede Zeile besteht JSON.parse. Live-Nodes
+      // tragen Session-Messages ({info,parts}).
+      expect(firstDone.agents).toHaveLength(2)
+      for (const node of firstDone.agents) {
+        const file = `${node.id}.jsonl`
+        expect(exported!.files).toContain(file)
+        const lines = (yield* Effect.promise(() => fs.readFile(path.join(exported!.path, file), "utf8")))
+          .split("\n")
+          .filter((line) => line.length > 0)
+        expect(lines.length).toBeGreaterThanOrEqual(1)
+        for (const line of lines) {
+          const parsed = JSON.parse(line) as Record<string, unknown>
+          expect("info" in parsed || "node" in parsed).toBe(true)
+        }
+      }
+
+      // Resume der completed-Quelle: voller Cache-Hit ⇒ session-lose cached-
+      // Nodes. Deren Export ist die einzelne Fallback-Zeile {node}.
+      const resumeOps = recordingPromptOps(db, 0)
+      const resumed = yield* workflow.start({
+        name: RESUME_FIXTURE,
+        args: {},
+        prompt: resumeOps.ops,
+        resume_of: first.id,
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      const exported2 = yield* workflow.export(resumed.id)
+      expect(exported2).toBeDefined()
+      const cached = done.agents.find((a) => a.cached === true)
+      expect(cached).toBeDefined()
+      const fallbackLines = (yield* Effect.promise(() =>
+        fs.readFile(path.join(exported2!.path, `${cached!.id}.jsonl`), "utf8"),
+      ))
+        .split("\n")
+        .filter((line) => line.length > 0)
+      expect(fallbackLines).toHaveLength(1)
+      const parsedFallback = JSON.parse(fallbackLines[0]) as { node?: { id?: string; cached?: boolean } }
+      expect(parsedFallback.node?.id).toBe(cached!.id)
+      expect(parsedFallback.node?.cached).toBe(true)
+
+      // Re-Export überschreibt deterministisch (gleiche Namen, kein Fehler).
+      const again = yield* workflow.export(first.id)
+      expect(again!.files.toSorted()).toEqual(exported!.files.toSorted())
+
+      // Aufräumen: die Export-Verzeichnisse beider Runs entfernen (das Test-
+      // Datadir wird zwar am Prozessende gelöscht; lokal trotzdem nichts liegen
+      // lassen).
+      yield* Effect.promise(() =>
+        fs.rm(path.join(Global.Path.data, "workflow", first.id), { recursive: true, force: true }),
+      )
+      yield* Effect.promise(() =>
+        fs.rm(path.join(Global.Path.data, "workflow", resumed.id), { recursive: true, force: true }),
+      )
+    }),
+  )
+
+  // Item 27: export() ist directory-scoped wie get() — eine dem Workspace
+  // fremde Run-ID liefert undefined (HTTP → 404) und schreibt nichts; eine
+  // völlig unbekannte ID ebenso.
+  it.instance(
+    "export of an unknown or foreign-directory run returns undefined",
+    () =>
+      Effect.gen(function* () {
+        const b = yield* tmpdirScoped({ git: true })
+        const workflow = yield* Workflow.Service
+        const idA = Workflow.RunID.make("job_export_foreign_A")
+        // As Run direkt als Row seeden, mit As (Test-)directory.
+        yield* seedCompletedRow(idA, (yield* TestInstance).directory)
+        // B sieht ihn nicht — kein Export, kein Verzeichnis.
+        expect(yield* workflow.export(idA).pipe(provideInstance(b))).toBeUndefined()
+        const foreignDir = path.join(Global.Path.data, "workflow", idA, "transcripts")
+        expect(yield* Effect.promise(() => fs.stat(foreignDir).then(() => true).catch(() => false))).toBe(false)
+        // Unbekannte ID ⇒ undefined.
+        expect(yield* workflow.export(Workflow.RunID.make("job_export_unknown"))).toBeUndefined()
+        // A selbst kann exportieren (der geseedete Node hat keine Session ⇒
+        // Fallback-Zeile), danach aufräumen.
+        const exported = yield* workflow.export(idA)
+        expect(exported).toBeDefined()
+        expect(exported!.files.toSorted()).toEqual(["1.jsonl", "run.json"])
+        yield* Effect.promise(() =>
+          fs.rm(path.join(Global.Path.data, "workflow", idA), { recursive: true, force: true }),
+        )
+      }),
+    { git: true },
   )
 
   // T5 gap (mixed journal: agent cached, question re-asked on an ORDINARY resume).
@@ -6060,7 +6641,10 @@ export async function run(args, ctx) {
   // driftet (gleicher Name/Prompt/Phase, jetzt mit schema im agent-Call). Statt am
   // JSON.parse des Plaintext-Outputs zu defecten, MUSS der Resume das als Cache-MISS
   // behandeln und den Agenten LIVE laufen lassen (PromptOps-Zähler +1, Run completed).
-  it.instance("a schema call matching a plaintext journal node runs live instead of defecting", () =>
+  // Item 20: der Per-Call-MISS-ohne-Konsum ist KEYED-Semantik — seit dem
+  // prefix-Default explizit mit replay:"keyed" gepinnt; der prefix-Zwilling
+  // (Drift bricht den Präfix DAUERHAFT) steht darunter.
+  it.instance("a schema call matching a plaintext journal node runs live instead of defecting (keyed)", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       // V1: Plaintext-Agent (kein Schema) → Journal-Node mit nicht-JSON-Output.
@@ -6105,6 +6689,7 @@ export async function run(args, ctx) {
         args: {},
         prompt: resumeOps,
         resume_of: first.id,
+        replay: "keyed",
       })
       const done =
         (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
@@ -6117,6 +6702,83 @@ export async function run(args, ctx) {
       // Der Agent-Node ist NICHT als cached markiert (Cache-MISS → Live-Lauf).
       const node = done.agents.find((a) => a.prompt === "drift agent")
       expect(node?.cached).not.toBe(true)
+    }),
+  )
+
+  // Item 20 Test (4): 'schema drift breaks the prefix permanently'. Wie der
+  // Drift-Test, aber mit einem UNVERÄNDERTEN zweiten Agenten: im Default-Modus
+  // 'prefix' bricht der Parse-Fehler an Call 1 den Präfix dauerhaft — auch der
+  // unveränderte Call 2 läuft live (Zähler 2, kein cached-Node).
+  it.instance("schema drift breaks the prefix permanently: the unchanged second call runs live too", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, DRIFT2_FIXTURE, DRIFT2_WORKFLOW_PLAINTEXT))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const { ops: firstOps, state: firstState } = driftPromptOps(db)
+      const first = yield* workflow.start({ name: DRIFT2_FIXTURE, args: {}, prompt: firstOps })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+      expect(firstState.count).toBe(2)
+
+      // Drift: dieselbe Datei wird zu V2 überschrieben (Call 1 fordert jetzt ein
+      // Schema an, Call 2 bleibt unverändert). completed ist direkt resumebar.
+      yield* Effect.promise(() => writeWorkflow(test.directory, DRIFT2_FIXTURE, DRIFT2_WORKFLOW_SCHEMA))
+
+      const { ops: resumeOps, state: resumeState } = driftPromptOps(db)
+      const resumed = yield* workflow.start({
+        name: DRIFT2_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // BEIDE Calls liefen live: der Drift brach den Präfix, der unveränderte
+      // zweite Call wurde NICHT mehr aus dem Journal bedient.
+      expect(resumeState.count).toBe(2)
+      expect(done.agents.every((a) => a.cached !== true)).toBe(true)
+      const stable = done.agents.find((a) => a.prompt === "stable agent")
+      expect(stable?.cached).not.toBe(true)
+    }),
+  )
+
+  // Item 20 keyed-Gegentest zum Drift-Zwilling: unter replay:"keyed" bleibt der
+  // Drift ein Per-Call-MISS — Call 1 läuft live, der unveränderte Call 2 wird
+  // weiterhin aus dem Journal bedient (Zähler 1, stable-Node cached).
+  it.instance("schema drift under keyed replay misses only the drifted call and keeps the second cached", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, DRIFT2_FIXTURE, DRIFT2_WORKFLOW_PLAINTEXT))
+      const workflow = yield* Workflow.Service
+      const { db } = yield* Database.Service
+
+      const { ops: firstOps } = driftPromptOps(db)
+      const first = yield* workflow.start({ name: DRIFT2_FIXTURE, args: {}, prompt: firstOps })
+      const firstDone =
+        (yield* workflow.wait({ id: first.id })).run ?? (yield* Effect.fail(new Error("first run did not finish")))
+      expect(firstDone.status).toBe("completed")
+
+      yield* Effect.promise(() => writeWorkflow(test.directory, DRIFT2_FIXTURE, DRIFT2_WORKFLOW_SCHEMA))
+
+      const { ops: resumeOps, state: resumeState } = driftPromptOps(db)
+      const resumed = yield* workflow.start({
+        name: DRIFT2_FIXTURE,
+        args: {},
+        prompt: resumeOps,
+        resume_of: first.id,
+        replay: "keyed",
+      })
+      const done =
+        (yield* workflow.wait({ id: resumed.id })).run ?? (yield* Effect.fail(new Error("resume did not finish")))
+      expect(done.status).toBe("completed")
+      // Nur der Drift-Call lief live; der unveränderte zweite kam aus dem Journal.
+      expect(resumeState.count).toBe(1)
+      const stable = done.agents.find((a) => a.prompt === "stable agent")
+      expect(stable?.cached).toBe(true)
     }),
   )
 
@@ -6846,25 +7508,32 @@ export async function run(args, ctx) {
   // { output, exitCode } without an LLM turn. A successful command reports
   // exitCode 0 and its stdout; a non-zero exit is returned (failCode === 3), never
   // thrown; and ctx.budget.spent() is 0 because shell never touches the budget.
-  it.instance("ctx.shell runs a deterministic non-LLM step returning output + exitCode without touching budget", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_FIXTURE, SHELL_WORKFLOW))
-      const workflow = yield* Workflow.Service
+  // Item 23: runs with the kill-switch (workflows.shell_permission=false) so
+  // this test keeps pinning the UNGATED behavior — a headless run with no
+  // ruleset would otherwise park on the interactive ask. The kill-switch path
+  // is itself the documented regression guard for the pre-gate semantics.
+  it.instance(
+    "ctx.shell runs a deterministic non-LLM step returning output + exitCode without touching budget",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_FIXTURE, SHELL_WORKFLOW))
+        const workflow = yield* Workflow.Service
 
-      const started = yield* workflow.start({ name: SHELL_FIXTURE, args: {} })
-      const waited = yield* workflow.wait({ id: started.id })
-      const done = waited.run ?? (yield* Effect.fail(new Error("shell workflow did not finish")))
+        const started = yield* workflow.start({ name: SHELL_FIXTURE, args: {} })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("shell workflow did not finish")))
 
-      expect(done.status).toBe("completed")
-      const result = done.result as { out: string; okCode: number; failCode: number; spent: number }
-      expect(result.out).toBe("hello-workflow")
-      expect(result.okCode).toBe(0)
-      // A non-zero exit is mapped to the return value, NOT a throw.
-      expect(result.failCode).toBe(3)
-      // Shell does not touch the budget — spend stays at 0.
-      expect(result.spent).toBe(0)
-    }),
+        expect(done.status).toBe("completed")
+        const result = done.result as { out: string; okCode: number; failCode: number; spent: number }
+        expect(result.out).toBe("hello-workflow")
+        expect(result.okCode).toBe(0)
+        // A non-zero exit is mapped to the return value, NOT a throw.
+        expect(result.failCode).toBe(3)
+        // Shell does not touch the budget — spend stays at 0.
+        expect(result.spent).toBe(0)
+      }),
+    { config: { workflows: { shell_permission: false } } },
   )
 
   // Task 11b (a): a parent runs a DISCOVERED child inline via ctx.workflow under
@@ -6957,23 +7626,27 @@ export async function run(args, ctx) {
   // hung command and resolve PROMPTLY with a non-zero exitCode — never hang for the
   // full 5s and never throw. The fixture records elapsed wall-clock so we can prove
   // the timeout actually fired (well under the command's 5s natural duration).
-  it.instance("ctx.shell enforces a real wall-clock timeout: a hung command resolves promptly with non-zero exit", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_TIMEOUT_FIXTURE, SHELL_TIMEOUT_WORKFLOW))
-      const workflow = yield* Workflow.Service
+  it.instance(
+    "ctx.shell enforces a real wall-clock timeout: a hung command resolves promptly with non-zero exit",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_TIMEOUT_FIXTURE, SHELL_TIMEOUT_WORKFLOW))
+        const workflow = yield* Workflow.Service
 
-      const started = yield* workflow.start({ name: SHELL_TIMEOUT_FIXTURE, args: {} })
-      const waited = yield* workflow.wait({ id: started.id })
-      const done = waited.run ?? (yield* Effect.fail(new Error("shell-timeout workflow did not finish")))
+        const started = yield* workflow.start({ name: SHELL_TIMEOUT_FIXTURE, args: {} })
+        const waited = yield* workflow.wait({ id: started.id })
+        const done = waited.run ?? (yield* Effect.fail(new Error("shell-timeout workflow did not finish")))
 
-      expect(done.status).toBe("completed")
-      const result = done.result as { exitCode: number; elapsed: number }
-      // A timed-out command is killed -> non-zero exit (mapped, not thrown).
-      expect(result.exitCode).not.toBe(0)
-      // It resolved promptly: well before the command's natural 5s duration.
-      expect(result.elapsed).toBeLessThan(3000)
-    }),
+        expect(done.status).toBe("completed")
+        const result = done.result as { exitCode: number; elapsed: number }
+        // A timed-out command is killed -> non-zero exit (mapped, not thrown).
+        expect(result.exitCode).not.toBe(0)
+        // It resolved promptly: well before the command's natural 5s duration.
+        expect(result.elapsed).toBeLessThan(3000)
+      }),
+    // Item 23: kill-switch — see the budget shell test above.
+    { config: { workflows: { shell_permission: false } } },
   )
 
   // Finding 5: a ctx.shell with NO timeout must have its OS child reaped on
@@ -6984,7 +7657,9 @@ export async function run(args, ctx) {
   // the running marker exists and assert: the run is cancelled AND the leaked
   // marker is NEVER written within a window comfortably past the 3s sleep — i.e.
   // the orphaned child did not survive the cancel and fire the second touch.
-  it.instance("ctx.shell with no timeout has its OS child killed on cancel (no process leak)", () =>
+  it.instance(
+    "ctx.shell with no timeout has its OS child killed on cancel (no process leak)",
+    () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_LEAK_FIXTURE, SHELL_LEAK_WORKFLOW))
@@ -7018,6 +7693,120 @@ export async function run(args, ctx) {
       const leakedExists = yield* Effect.promise(() =>
         fs
           .stat(leaked)
+          .then(() => true)
+          .catch(() => false),
+      )
+      expect(leakedExists).toBe(false)
+    }),
+    // Item 23: kill-switch — see the budget shell test above.
+    { config: { workflows: { shell_permission: false } } },
+  )
+
+  // Item 23 (Stufe 1, deny): a caller session carrying a bash DENY rule gates
+  // ctx.shell — the run fails with the denial (the error names the command) and
+  // the process is NEVER spawned (the target file survives).
+  it.instance("ctx.shell honors a caller bash deny rule: run fails, process never spawned", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_GATE_FIXTURE, SHELL_GATE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sessions = yield* Session.Service
+
+      // The file the denied `rm` would delete — must still exist afterwards.
+      const target = "shell-deny.marker"
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, target), "keep me"))
+
+      const caller = yield* sessions.create({
+        permission: [{ permission: "bash", action: "deny", pattern: "rm *" }],
+      })
+      const run = yield* workflow.start({
+        name: SHELL_GATE_FIXTURE,
+        args: { command: `rm ${target}` },
+        caller: { sessionID: caller.id },
+      })
+      const done =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("gate run did not settle")))
+      expect(done.status).toBe("failed")
+      // The error names the command, so the failure is self-explanatory.
+      expect(done.error ?? "").toContain("rm shell-deny.marker")
+      expect(done.error ?? "").toMatch(/denied|rule/i)
+      // The process never spawned: the target file is untouched.
+      const survived = yield* Effect.promise(() =>
+        fs
+          .stat(path.join(test.directory, target))
+          .then(() => true)
+          .catch(() => false),
+      )
+      expect(survived).toBe(true)
+    }),
+  )
+
+  // Item 23 (Stufe 1, allow): a caller ALLOW rule lets ctx.shell run with no
+  // interactive ask — the run completing at all is the proof (an open ask would
+  // park it), and no pending permission request is left behind.
+  it.instance("ctx.shell with a caller bash allow rule runs through without an interactive ask", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_GATE_FIXTURE, SHELL_GATE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+
+      const caller = yield* sessions.create({
+        permission: [{ permission: "bash", action: "allow", pattern: "*" }],
+      })
+      const run = yield* workflow.start({
+        name: SHELL_GATE_FIXTURE,
+        args: { command: "echo gated-ok" },
+        caller: { sessionID: caller.id },
+      })
+      const done =
+        (yield* workflow.wait({ id: run.id })).run ?? (yield* Effect.fail(new Error("gate run did not settle")))
+      expect(done.status).toBe("completed")
+      expect((done.result as { out: string }).out).toBe("gated-ok")
+      // No interactive ask was raised (the allow rule short-circuited it).
+      expect(yield* permission.list()).toHaveLength(0)
+    }),
+  )
+
+  // Item 23 (Stufe 1, cancel during an open ask): a headless run (no caller
+  // ruleset) parks on the interactive bash ask. Cancelling the run interrupts
+  // the open ask cleanly — the run finishes `cancelled`, the pending request is
+  // cleaned up (no leak), and the command never ran.
+  it.instance("cancel during an open ctx.shell ask unwinds the run as cancelled without leaking the request", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => writeWorkflow(test.directory, SHELL_GATE_FIXTURE, SHELL_GATE_WORKFLOW))
+      const workflow = yield* Workflow.Service
+      const permission = yield* Permission.Service
+
+      const leaked = "shell-ask-leak.marker"
+      const run = yield* workflow.start({
+        name: SHELL_GATE_FIXTURE,
+        args: { command: `touch ${leaked}` },
+      })
+      // Wait until the gate's interactive ask is pending.
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const pending = yield* permission.list()
+          return pending.length > 0 ? pending : undefined
+        }),
+        "ctx.shell ask never became pending",
+      )
+      const cancelled = yield* workflow.cancel(run.id)
+      expect(cancelled?.status).toBe("cancelled")
+      // The pending request was cleaned up (ask's ensuring removed it).
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const pending = yield* permission.list()
+          return pending.length === 0 ? true : undefined
+        }),
+        "pending ask was never cleaned up",
+      )
+      // The gated command never executed.
+      const leakedExists = yield* Effect.promise(() =>
+        fs
+          .stat(path.join(test.directory, leaked))
           .then(() => true)
           .catch(() => false),
       )

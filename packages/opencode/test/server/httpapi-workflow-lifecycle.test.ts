@@ -333,6 +333,73 @@ export async function run(args, ctx) { return { ok: true } }
     }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
   )
 
+  // Item 27: the export route. POST /workflow/run/:id/export materializes the
+  // run's transcripts (run.json + one JSONL per agent node) and returns the
+  // directory + file names; an unknown id is a 404.
+  it.live("export route returns 200 with path+files for a known run and 404 for unknown", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      yield* Effect.promise(() => writeWorkflow(directory, "http-live-q", LIVE_Q))
+
+      // Unknown run id → 404.
+      const missing = yield* requestInDirectory("/workflow/run/job_does_not_exist/export", directory, {
+        method: "POST",
+      })
+      expect(missing.status).toBe(404)
+
+      // Run the question workflow to completion (no agents needed).
+      const startRes = yield* requestInDirectory("/workflow/http-live-q/start", directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      const started = yield* bodyJson(startRes)
+      const id = started["id"] as string
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const res = yield* requestInDirectory(`/workflow/run/${id}`, directory)
+          const run = yield* bodyJson(res)
+          return run?.["pending_question"]?.question === "deploy?" ? run : undefined
+        }),
+        "pending question via GET",
+      )
+      yield* requestInDirectory(`/workflow/run/${id}/answer`, directory, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answer: "yes" }),
+      })
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const res = yield* requestInDirectory(`/workflow/run/${id}`, directory)
+          const run = yield* bodyJson(res)
+          return run?.["status"] === "completed" ? run : undefined
+        }),
+        "run completed via GET",
+      )
+
+      // Export → 200 with the transcripts directory + the written files
+      // (run.json plus the question node's fallback JSONL).
+      const exportRes = yield* requestInDirectory(`/workflow/run/${id}/export`, directory, { method: "POST" })
+      expect(exportRes.status).toBe(200)
+      const exported = yield* bodyJson(exportRes)
+      expect(typeof exported["path"]).toBe("string")
+      expect(exported["path"]).toContain(path.join("workflow", id, "transcripts"))
+      expect(exported["files"]).toContain("run.json")
+      expect(exported["files"]).toContain("1.jsonl")
+      // The files really exist and parse.
+      const runJson = JSON.parse(
+        yield* Effect.promise(() => fs.readFile(path.join(exported["path"] as string, "run.json"), "utf8")),
+      ) as { id: string }
+      expect(runJson.id).toBe(id)
+
+      // Cleanup the per-run export dir (the data dir is test-scoped, but leave
+      // nothing behind locally).
+      yield* Effect.promise(() =>
+        fs.rm(path.dirname(exported["path"] as string), { recursive: true, force: true }),
+      )
+    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+  )
+
   it.live("start -> cancel (live-waiting question) transitions to cancelled through the httpapi", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true })

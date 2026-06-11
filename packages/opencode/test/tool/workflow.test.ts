@@ -12,6 +12,7 @@ import { WorkflowTool } from "@/tool/workflow"
 import AUTHORING_GUIDE from "@/tool/workflow.txt"
 import { Workflow } from "@/workflow/workflow"
 import { Session } from "@/session/session"
+import { TurnBudget } from "@/session/turn-budget"
 import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "@/session/schema"
@@ -318,7 +319,7 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
     ),
   )
 
-  it.live("start forwards resume_of + invalidate_agents to workflow.start", () =>
+  it.live("start forwards resume_of + invalidate_agents + replay to workflow.start", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
         // The workflow hangs when args.hang is set so we can deterministically catch
@@ -352,16 +353,62 @@ export async function run(args, ctx) { if (args.hang) await new Promise(() => {}
         )
         expect(paused.status).toBe("paused")
 
-        // Resume start: pass resume_of + invalidate_agents. The engine replays the
-        // (directory-scoped) source journal; what we assert is the parameters reached
-        // workflow.start (the new run carries resume_of) and the run still completes.
+        // Resume start: pass resume_of + invalidate_agents + replay (Item 20).
+        // The engine replays the (directory-scoped) source journal; what we assert
+        // is the parameters reached workflow.start (the new run carries resume_of,
+        // the replay literal decodes through the tool schema) and the run still
+        // completes.
         const resumed = yield* tool.execute(
-          { action: "start", name: "echo", args: { value: 1 }, resume_of: sourceId, invalidate_agents: [0] },
+          {
+            action: "start",
+            name: "echo",
+            args: { value: 1 },
+            resume_of: sourceId,
+            invalidate_agents: [0],
+            replay: "keyed",
+          },
           recorder.ctx,
         )
         const run = yield* workflow.get(Workflow.RunID.make(resumed.metadata.runId as string))
         expect(run?.resume_of as string | undefined).toBe(sourceId)
         expect(resumed.output).toContain(`state="completed"`)
+      }),
+    ),
+  )
+
+  // Item 24: the shared turn pool rides ctx.extra.turnBudget (SessionTools) and
+  // must reach workflow.start as StartOptions.pool. Proven end-to-end: the
+  // engine settles the run's one agent step against THIS pool object, and an
+  // exhausted pool refuses the next run's first step.
+  it.live("start threads ctx.extra.turnBudget into the engine as the run's pool", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "agentic",
+            `export const meta = { name: "Agentic", description: "One step." }
+export async function run(args, ctx) { const r = await ctx.agent({ prompt: "do it" }); return { out: r.text } }
+`,
+          ),
+        )
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const pool = TurnBudget.make({ usd: 1 })
+        const ctx: Tool.Context = { ...recorder.ctx, extra: { ...recorder.ctx.extra, turnBudget: pool } }
+
+        const result = yield* tool.execute({ action: "start", name: "agentic" }, ctx)
+        expect(result.output).toContain(`state="completed"`)
+        // The engine settled the step against THIS pool object.
+        expect(pool.steps).toBe(1)
+        expect(pool.usd!.reserved).toBe(0)
+
+        // Exhaust the pool: the next run's FIRST agent step is refused — the
+        // pool reference demonstrably reached workflow.start.
+        TurnBudget.chargeDirect(pool, { usd: 5 })
+        const exit = yield* Effect.exit(tool.execute({ action: "start", name: "agentic" }, ctx))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("Turn budget exhausted")
       }),
     ),
   )
@@ -762,6 +809,84 @@ export async function run(args, ctx) { return "ok" }
         expect(result.output).toContain(`<agent name="general"`)
       }),
     ),
+  )
+
+  // Item 23 (Stufe 2): a suspicious source (node builtin import + fetch) yields
+  // a <lint> block in the create output and the findings ride the workflow ask
+  // metadata; the default mode ('warn') is non-blocking, so the create succeeds.
+  it.live("create surfaces lint findings as a <lint> block without blocking (warn default)", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        const recorder = requestRecorder()
+        const source = `import fs from "node:fs"
+export const meta = { name: "Suspicious", description: "Uses capabilities." }
+export async function run(args, ctx) {
+  await fetch("https://example.com")
+  return "ok"
+}
+`
+        const result = yield* tool.execute({ action: "create", name: "sus", source }, recorder.ctx)
+        expect(result.output).toContain("Workflow file created and validated.")
+        expect(result.output).toContain("<lint>")
+        expect(result.output).toContain('rule="node-builtin-import"')
+        expect(result.output).toContain('rule="fetch"')
+        const workflowAsk = recorder.requests.find((req) => req.permission === "workflow")
+        expect(workflowAsk).toBeDefined()
+        expect(Array.isArray(workflowAsk!.metadata?.lint)).toBe(true)
+      }),
+    ),
+  )
+
+  // Item 23 (Stufe 2): workflows.lint='deny' fails create on findings — BEFORE
+  // any write, so the file never reaches disk.
+  it.live(
+    "create with workflows.lint=deny fails on findings and writes nothing",
+    () =>
+      provideTmpdirInstance(
+        (dir) =>
+          Effect.gen(function* () {
+            const tool = yield* workflowTool()
+            const recorder = requestRecorder()
+            const source = `import { spawn } from "child_process"
+export const meta = { name: "Spawny", description: "Spawns." }
+export async function run(args, ctx) { return "ok" }
+`
+            const exit = yield* Effect.exit(tool.execute({ action: "create", name: "spawny", source }, recorder.ctx))
+            expect(Exit.isFailure(exit)).toBe(true)
+            expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("rejected by lint")
+            // Nothing was written (the deny fires before the ask/write).
+            const written = yield* Effect.promise(() =>
+              fs
+                .stat(path.join(dir, ".opencode", "workflows", "spawny.ts"))
+                .then(() => true)
+                .catch(() => false),
+            )
+            expect(written).toBe(false)
+          }),
+        { config: { workflows: { lint: "deny" } } },
+      ),
+  )
+
+  // Item 23 (Stufe 2): a clean source under 'deny' still creates fine, and a
+  // clean create's output carries NO <lint> block (zero findings ⇒ no noise).
+  it.live(
+    "create with workflows.lint=deny passes a clean source and emits no lint block",
+    () =>
+      provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const tool = yield* workflowTool()
+            const recorder = requestRecorder()
+            const source = `export const meta = { name: "Clean", description: "No capabilities." }
+export async function run(args, ctx) { return "ok" }
+`
+            const result = yield* tool.execute({ action: "create", name: "clean", source }, recorder.ctx)
+            expect(result.output).toContain("Workflow file created and validated.")
+            expect(result.output).not.toContain("<lint>")
+          }),
+        { config: { workflows: { lint: "deny" } } },
+      ),
   )
 
   it.live("inspects a finished run: summary carries args, result, and logs view works", () =>

@@ -6443,6 +6443,24 @@
                   "variant": {
                     "type": "string"
                   },
+                  "turnBudget": {
+                    "type": "object",
+                    "properties": {
+                      "usd": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "tokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mcp": {
+                    "type": "string",
+                    "enum": ["eager", "lazy"]
+                  },
                   "parts": {
                     "type": "array",
                     "items": {
@@ -7328,6 +7346,24 @@
                   },
                   "variant": {
                     "type": "string"
+                  },
+                  "turnBudget": {
+                    "type": "object",
+                    "properties": {
+                      "usd": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "tokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mcp": {
+                    "type": "string",
+                    "enum": ["eager", "lazy"]
                   },
                   "parts": {
                     "type": "array",
@@ -10764,6 +10800,86 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.answer({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}/export": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.export",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run transcripts exported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowExportResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Export a run's transcripts as JSONL files; returns the directory path.",
+        "summary": "Export workflow run transcripts",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.export({\n  ...\n})"
           }
         ]
       }
@@ -19718,6 +19834,16 @@
               },
               "budget_directive": {
                 "type": "boolean"
+              },
+              "shell_permission": {
+                "type": "boolean"
+              },
+              "lint": {
+                "type": "string",
+                "enum": ["off", "warn", "deny"]
+              },
+              "lazy_mcp": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -22197,6 +22323,10 @@
             "items": {
               "type": "integer"
             }
+          },
+          "replay": {
+            "type": "string",
+            "enum": ["prefix", "keyed"]
           }
         },
         "additionalProperties": false
@@ -22214,6 +22344,22 @@
           }
         },
         "required": ["answer"],
+        "additionalProperties": false
+      },
+      "WorkflowExportResult": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["path", "files"],
         "additionalProperties": false
       },
       "UnauthorizedError": {

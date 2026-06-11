@@ -59,6 +59,8 @@ import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { TurnBudget } from "./turn-budget"
+import { McpLazyActivation } from "./mcp-lazy"
 import { LLMEvent } from "@opencode-ai/llm"
 
 // @ts-ignore
@@ -86,7 +88,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
-  readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
+  readonly loop: (input: LoopOptions) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
@@ -112,6 +114,8 @@ export const layer = Layer.effect(
     const lsp = yield* LSP.Service
     const registry = yield* ToolRegistry.Service
     const truncate = yield* Truncate.Service
+    // Item 28: per-session MCP activation state for the lazy loading mode.
+    const mcpLazy = yield* McpLazyActivation.Service
     const image = yield* Image.Service
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
@@ -1125,7 +1129,18 @@ export const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID, permissionSessionID: input.permissionSessionID })
+      // Item 24: ONE pool per turn. Created here (not in the loop) so re-entrant
+      // loop steps share it; threaded by reference into the processor (main-loop
+      // charging) and the tool context (workflow runs reserve against it).
+      const turnBudget = input.turnBudget !== undefined ? TurnBudget.make(input.turnBudget) : undefined
+      return yield* loop({
+        sessionID: input.sessionID,
+        permissionSessionID: input.permissionSessionID,
+        turnBudget,
+        // Item 28: the MCP loading mode rides into every loop step's tool
+        // resolution (default eager).
+        mcp: input.mcp,
+      })
     })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1136,9 +1151,8 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(function* (
-      input: LoopInput,
-    ) {
+    const runLoop: (input: LoopOptions) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (input: LoopOptions) {
       const sessionID = input.sessionID
       const ctx = yield* InstanceState.context
       let structured: unknown
@@ -1275,6 +1289,9 @@ export const layer = Layer.effect(
             assistantMessage: msg,
             sessionID,
             model,
+            // Item 24: the shared turn pool — the processor charges each
+            // step-finish's cost directly (never gated).
+            turnBudget: input.turnBudget,
           })
           .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1292,12 +1309,19 @@ export const layer = Layer.effect(
             bypassAgentCheck,
             messages: msgs,
             promptOps,
+            // Item 24: the shared turn pool rides into the tool context
+            // (ctx.extra.turnBudget) so the workflow tool can hand it to every
+            // run this turn starts.
+            turnBudget: input.turnBudget,
+            // Item 28: MCP loading mode (default eager; workflow subagents lazy).
+            mcpMode: input.mcp,
           }).pipe(
             Effect.provideService(Plugin.Service, plugin),
             Effect.provideService(Permission.Service, permission),
             Effect.provideService(ToolRegistry.Service, registry),
             Effect.provideService(MCP.Service, mcp),
             Effect.provideService(Truncate.Service, truncate),
+            Effect.provideService(McpLazyActivation.Service, mcpLazy),
           )
 
           if (lastUser.format?.type === "json_schema") {
@@ -1396,11 +1420,11 @@ export const layer = Layer.effect(
       return yield* lastAssistant(sessionID)
     })
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input))
-    })
+    const loop: (input: LoopOptions) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(
+      function* (input: LoopOptions) {
+        return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input))
+      },
+    )
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
@@ -1571,6 +1595,10 @@ export const defaultLayer = Layer.suspend(() =>
         CrossSpawnSpawner.defaultLayer,
         RuntimeFlags.defaultLayer,
         EventV2Bridge.defaultLayer,
+        // Item 28: lazy-MCP activation state. Lives in this mergeAll (not as
+        // another pipe step) — the surrounding pipe is at the overload limit,
+        // one more argument collapses its inference to Layer<unknown, …>.
+        McpLazyActivation.defaultLayer,
       ),
     ),
   ),
@@ -1594,6 +1622,22 @@ export const PromptInput = Schema.Struct({
   format: Schema.optional(SessionV1.Format),
   system: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
+  // Item 24: optional shared TURN budget. When set, the prompt creates ONE
+  // TurnBudget.Pool for this turn: the main loop charges it directly (never
+  // gated) and every workflow run started by this turn reserves/settles
+  // against it — so multiple runs of one turn share a single cap. Non-negative
+  // finite, mirroring the workflow budget validation.
+  turnBudget: Schema.optional(
+    Schema.Struct({
+      usd: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+      tokens: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+    }),
+  ),
+  // Item 28: MCP tool loading mode for this session's loop. 'eager' (default)
+  // registers every MCP tool schema as before; 'lazy' starts with only the
+  // tool_search meta-tool and registers MCP tools on activation. Workflow
+  // subagent sessions are started lazy (config workflows.lazy_mcp).
+  mcp: Schema.optional(Schema.Literals(["eager", "lazy"])),
   parts: Schema.Array(
     Schema.Union([
       SessionV1.TextPartInput,
@@ -1609,6 +1653,12 @@ export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput"
   sessionID: SessionID,
   permissionSessionID: Schema.optional(SessionID),
 }) {}
+
+// Item 24: the loop's full options — the schema'd LoopInput plus the
+// NON-serializable turn pool (a live, shared mutable object; it must never
+// ride a schema, so it travels as a plain intersection field). Item 28 adds
+// the MCP loading mode the loop forwards into each step's tool resolution.
+export type LoopOptions = LoopInput & { turnBudget?: TurnBudget.Pool; mcp?: "eager" | "lazy" }
 
 export const ShellInput = Schema.Struct({
   sessionID: SessionID,
@@ -1697,6 +1747,8 @@ export const node = LayerNode.make(layer, [
   LSP.node,
   ToolRegistry.node,
   Truncate.node,
+  // Item 28: lazy-MCP activation state.
+  McpLazyActivation.node,
   Image.node,
   CrossSpawnSpawner.node,
   Instruction.node,

@@ -14,6 +14,14 @@ import type { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { Global } from "@opencode-ai/core/global"
+import { Permission } from "@/permission"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { scanCommand } from "@/tool/shell"
+import { ShellID } from "@/tool/shell/id"
+import { TurnBudget } from "@/session/turn-budget"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -366,6 +374,16 @@ export type StartOptions = StartInput & {
    */
   caller?: { sessionID: SessionID; agent?: string }
   /**
+   * Item 24: the caller TURN's shared budget pool — a live, shared mutable
+   * object (NOT a schema field; it is not serializable and binds to exactly
+   * one prompt turn). When set, every `ctx.agent` step must pass BOTH the
+   * per-run budget gate AND an atomic pool reservation; the main loop charges
+   * the same pool directly, so two runs of one turn compete for one cap.
+   * Absent on HTTP/programmatic starts and on resumes (a resume turn brings
+   * its own pool).
+   */
+  pool?: TurnBudget.Pool
+  /**
    * The caller session's RESOLVED model at start time (Item 12), already parsed
    * into `{ providerID, modelID }` — never re-parsed via Provider.parseModel.
    * A `ctx.agent` step that uses the DEFAULT agent (no `agent:` override) and
@@ -390,10 +408,30 @@ export type StartOptions = StartInput & {
    */
   resume_of?: RunID
   /**
+   * Replay strategy for the resume journal (Item 20). Only meaningful together
+   * with `resume_of`:
+   * - `"prefix"` (DEFAULT, the safe mode): the journal is the source run's
+   *   agents in ORIGINAL ORDER and replay stops PERMANENTLY at the first
+   *   mismatch (a changed call, a non-completed source node, or an
+   *   `invalidate_agents` index) — every later call runs live, even if its
+   *   shape is unchanged. Rationale: shape-matching would serve a LATER
+   *   unchanged call from the journal although its workspace side effects may
+   *   be stale after an earlier step changed.
+   * - `"keyed"`: the previous shape-matching behavior, kept 1:1 for read-only
+   *   workflows (and recommended for heavily parallel ones, where dispatch
+   *   order within a parallel batch is not deterministic and could spuriously
+   *   break a prefix — prefix then degrades safely to live: more expensive,
+   *   never wrong).
+   * The default flip from keyed to prefix is a deliberate behavior change.
+   */
+  replay?: "prefix" | "keyed"
+  /**
    * Source-journal agent indices (0-based, in the source run's `agents[]` order)
    * to FORCE live re-execution of during a resume, even if they completed. Only
    * meaningful together with `resume_of`. An index here is excluded from journal
-   * replay, so its `ctx.agent` call runs live and re-prompts.
+   * replay, so its `ctx.agent` call runs live and re-prompts. In `prefix` replay
+   * mode (the default), everything AFTER the first invalidated agent re-runs
+   * live too — the invalidated index breaks the prefix permanently.
    */
   invalidate_agents?: number[]
   /**
@@ -826,6 +864,35 @@ type Active = {
   journal?: Map<string, AgentRun[]>
   /** Per-key consumption cursor into `journal`, advanced as each occurrence is replayed. */
   journalCursor?: Map<string, number>
+  /**
+   * Replay strategy of this resume (Item 20): `"prefix"` (default) walks
+   * `journalSeq` in order and breaks permanently at the first mismatch;
+   * `"keyed"` is the previous shape-matching behavior over `journal`/
+   * `journalCursor`. Absent on a non-resume run.
+   */
+  journalMode?: "prefix" | "keyed"
+  /**
+   * Prefix-mode journal (Item 20): the source run's agents in ORIGINAL order
+   * (questions filtered out — question replay stays on `questionJournal`),
+   * INCLUDING non-completed nodes, which BREAK the prefix instead of being
+   * invisibly absent. `index` is the node's position in the source `agents[]`
+   * so `invalidate_agents` can be checked at replay time. Absent in keyed mode.
+   */
+  journalSeq?: { node: AgentRun; index: number }[]
+  /** Consumption cursor into `journalSeq`, advanced on each prefix replay hit. */
+  journalSeqCursor: number
+  /**
+   * Set once a prefix replay missed (changed call, non-completed source node,
+   * invalidated index, or a schema parse failure). From then on EVERY
+   * `ctx.agent` call runs live — the prefix is broken permanently (Item 20).
+   */
+  replayBroken: boolean
+  /**
+   * Prefix-mode view of `invalidate_agents` (source `agents[]` indices forced
+   * live). Checked at replay time against `journalSeq[cursor].index`; a hit
+   * breaks the prefix. Keyed mode filters these out at seed time instead.
+   */
+  invalidateSet?: Set<number>
   /** Id of the source run this run resumed from; mirrored onto `run.resume_of` and the row. */
   resumeOf?: RunID
   /**
@@ -871,6 +938,22 @@ type Active = {
    * step's ctx.agent call resolves `null` and the node finishes `skipped`.
    */
   skipRequests: Set<string>
+  /**
+   * Item 23 (Stufe 1): the bash permission ruleset every `ctx.shell` ask of
+   * this run is evaluated against — the CALLER session's rules (deny/allow/
+   * external_directory), inherited with the same logic as the subagent asks.
+   * Computed once in start(); `[]` when there is no caller identity (HTTP/
+   * headless start) — asks then fall through to the interactive default.
+   */
+  shellRuleset: PermissionV1.Rule[]
+  /**
+   * Item 24: the caller turn's shared budget pool (StartOptions.pool).
+   * ctx.workflow children share `active`, so the pool is automatically shared;
+   * a background run holds the reference past the turn's end. Per-step
+   * reservations live in the step closure (not a map) — the step's `ensuring`
+   * always settles them, so a reservation can never leak.
+   */
+  pool?: TurnBudget.Pool
 }
 
 type State = {
@@ -946,6 +1029,21 @@ export interface Interface {
    * middleware; the engine method is the shared write seam for both surfaces).
    */
   readonly save: (input: SaveInput) => Effect.Effect<{ path: string }, InvalidError | SaveConflictError>
+  /**
+   * Exports a run's transcripts as hand-readable files under
+   * `<data>/workflow/<runId>/transcripts/` (Item 27): `run.json` (the run
+   * snapshot, 2-space) plus one `<agent-id>.jsonl` per agent node — each line
+   * `{ info, parts }` for a message of the node's session, or a single
+   * fallback line `{ node }` when the node has no readable session (a
+   * replayed/cached node, a question node, or a deleted session), so the
+   * export is always COMPLETE across all nodes. Idempotently overwrites on
+   * re-export. Returns the directory and the written file names, or
+   * `undefined` for a run unknown to this workspace (directory-scoped like
+   * `get()`; the HTTP handler maps that to 404). A still-running run exports
+   * its current snapshot. The JSONL line shape is a debug/hand format, NOT an
+   * API contract — no schema is exported for it.
+   */
+  readonly export: (id: RunID) => Effect.Effect<{ path: string; files: string[] } | undefined>
   readonly remove: (id: RunID) => Effect.Effect<boolean>
   /**
    * Marks every `running` DB row that has no live registry entry as
@@ -1914,13 +2012,31 @@ function createContext(input: {
     // workflow sees them change across agent steps, mirroring `budgetRemaining`.
     budget: {
       get total() {
+        // Item 24: with a shared turn pool and NO run budget, the pool's cap
+        // is the reported total (Claude-Code semantics — the turn's budget).
+        // A run budget keeps the run-scoped view.
+        if (input.active.budgetTotal === undefined && input.active.pool?.usd) return input.active.pool.usd.total
         return input.active.budgetTotal ?? null
       },
-      spent: () => input.active.costSpent,
-      remaining: () =>
-        input.active.budgetTotal === undefined
-          ? Infinity
-          : Math.max(0, input.active.budgetTotal - input.active.costSpent),
+      spent: () => {
+        // Item 24: pool view = the TURN's total committed spend, INCLUDING the
+        // main loop's chargeDirect share — only when no run budget keeps the
+        // run-scoped view.
+        if (input.active.budgetTotal === undefined && input.active.pool?.usd) return input.active.pool.usd.committed
+        return input.active.costSpent
+      },
+      remaining: () => {
+        // Item 24: the tighter of run headroom and pool headroom wins; either
+        // absent contributes Infinity, so the prior single-budget behavior is
+        // preserved exactly.
+        const pool = input.active.pool?.usd
+        const poolRemaining = pool ? Math.max(0, pool.total - pool.committed - pool.reserved) : Infinity
+        const runRemaining =
+          input.active.budgetTotal === undefined
+            ? Infinity
+            : Math.max(0, input.active.budgetTotal - input.active.costSpent)
+        return Math.min(runRemaining, poolRemaining)
+      },
       // Item 17: the token trio, mirroring the USD trio above 1:1 (live reads,
       // null/Infinity for an unset cap).
       get tokensTotal() {
@@ -2131,6 +2247,12 @@ export const layer = Layer.effect(
     const sessions = yield* Session.Service
     const { db } = yield* Database.Service
     const events = yield* EventV2Bridge.Service
+    // Item 23 (Stufe 1): the permission service gates ctx.shell; FSUtil and the
+    // spawner feed the bash tool's scanCommand (path/pattern derivation), which
+    // is provided these explicitly at the call site inside ctx.shell.
+    const permission = yield* Permission.Service
+    const fsUtil = yield* FSUtil.Service
+    const spawner = yield* ChildProcessSpawner
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* (ctx) {
         const runs = yield* SynchronizedRef.make(new Map<string, Active>())
@@ -2493,6 +2615,15 @@ export const layer = Layer.effect(
       // call then runs live), so a stale resume id degrades to a normal run rather
       // than failing the start.
       const journal = new Map<string, AgentRun[]>()
+      // Item 20: the replay strategy. Default `prefix` (the safe mode): replay
+      // stops permanently at the first mismatch instead of shape-matching later
+      // calls whose workspace side effects may be stale. `keyed` keeps the
+      // previous occurrence-cursor behavior 1:1 for read-only workflows.
+      const replayMode: "prefix" | "keyed" = input.replay ?? "prefix"
+      // Prefix-mode journal: the source agents in ORIGINAL order (questions
+      // filtered out), INCLUDING non-completed nodes so they BREAK the prefix
+      // rather than being invisibly absent.
+      const journalSeq: { node: AgentRun; index: number }[] = []
       // Question replay journal (Tasks 12/13): when this resume seeds answers
       // (answer() on a paused run), map the source run's `kind:"question"` nodes to
       // their provided answer keyed by [question, phase] — the SAME shape the live
@@ -2555,6 +2686,15 @@ export const layer = Layer.effect(
               }
               return
             }
+            // Item 20 (prefix mode): keep the source agents as an ORDERED
+            // sequence instead of the keyed map. Non-completed nodes are
+            // INCLUDED — they break the prefix at their position rather than
+            // being invisibly absent; `invalidate_agents` is checked at replay
+            // time against the carried index (a hit breaks the prefix too).
+            if (replayMode === "prefix") {
+              journalSeq.push({ node: { ...node }, index })
+              return
+            }
             if (node.status !== "completed") return
             if (invalidate.has(index)) return
             const key = journalKey({ prompt: node.prompt, agent: node.agent, phase: node.phase })
@@ -2566,6 +2706,15 @@ export const layer = Layer.effect(
       }
       const id = RunID.ascending()
       const started_at = yield* Clock.currentTimeMillis
+      // Item 23 (Stufe 1): the ctx.shell asks of this run are evaluated against
+      // the CALLER session's permission rules — the same inheritance the
+      // subagent asks derive from. No caller identity (HTTP/headless) ⇒ empty
+      // ruleset ⇒ asks fall through to the interactive default, exactly like a
+      // subagent tool ask today.
+      const shellCallerSession = input.caller
+        ? yield* sessions.get(input.caller.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      const shellRuleset = Permission.merge(shellCallerSession?.permission ?? [], [])
       const session = yield* sessions.create({ title: `Workflow: ${module.meta.name}` })
       const done = yield* Deferred.make<Run>()
       // Per-run scope forked from the instance scope. ALL agent/parallel/pipeline
@@ -2623,8 +2772,18 @@ export const layer = Layer.effect(
         agentSemaphore,
         agentStarted: 0,
         agentLimit: agentLimitOverride ?? DEFAULT_AGENT_LIMIT,
-        journal: input.resume_of ? journal : undefined,
-        journalCursor: input.resume_of ? new Map<string, number>() : undefined,
+        journal: input.resume_of && replayMode === "keyed" ? journal : undefined,
+        journalCursor: input.resume_of && replayMode === "keyed" ? new Map<string, number>() : undefined,
+        // Item 20: prefix-mode replay state. journalSeq is the ordered source
+        // sequence; the cursor advances on each hit; replayBroken flips
+        // permanently on the first mismatch; invalidateSet carries the
+        // invalidate_agents indices for the at-replay-time check.
+        journalMode: input.resume_of ? replayMode : undefined,
+        journalSeq: input.resume_of && replayMode === "prefix" ? journalSeq : undefined,
+        journalSeqCursor: 0,
+        replayBroken: false,
+        invalidateSet:
+          input.resume_of && replayMode === "prefix" ? new Set(input.invalidate_agents ?? []) : undefined,
         resumeOf: input.resume_of,
         questionJournal: input.resume_of && questionJournal.size > 0 ? questionJournal : undefined,
         // Item 12: the caller session's resolved model — default-agent steps
@@ -2632,6 +2791,10 @@ export const layer = Layer.effect(
         callerModel: input.caller_model,
         // Item 15: node ids a human asked to skip.
         skipRequests: new Set<string>(),
+        // Item 23 (Stufe 1): the caller-inherited bash ruleset for ctx.shell.
+        shellRuleset,
+        // Item 24: the caller turn's shared budget pool (absent ⇒ no pool gate).
+        pool: input.pool,
       }
       yield* SynchronizedRef.update(inst.runs, (runs) => new Map(runs).set(id, active))
       yield* persistRun(db, events, active)
@@ -2728,6 +2891,34 @@ export const layer = Layer.effect(
             started: active.agentStarted,
           })
         }
+        // Moved ABOVE the pool reservation (Item 24): every throw-point between
+        // the reservation and the dispatched effect's `ensuring` would leak the
+        // reserved headroom, so the only remaining code on that path must be
+        // non-throwing straight-line work.
+        const prompt = input.prompt
+        if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
+        // Item 24: shared turn-pool gate, AFTER every other gate (so a refusal
+        // can never leak a reservation past an abort/budget/limit throw) and
+        // BEFORE the node is recorded. `TurnBudget.reserve` is a SYNCHRONOUS
+        // check-and-set — no await separates the headroom check from the
+        // reservation, which closes the audited per-run soft-cap race (T5) for
+        // the pool: of N parallel steps with priced reservations, only the ones
+        // the pool can still cover pass. Per-run budget AND pool must BOTH
+        // pass. The reservation is priced at the pool's rolling per-step
+        // average (0 before the first settlement — the documented residual
+        // soft cap for the first parallel wave). Journal replays reserve and
+        // settle like live steps, mirroring the run-budget parity. The
+        // matching settle lives in the step's `ensuring` below and runs on
+        // EVERY outcome, so a reservation can never leak.
+        const poolReservation = active.pool ? TurnBudget.reserve(active.pool, active.pool.avgStepUsd) : undefined
+        if (active.pool && !poolReservation) {
+          throw new BudgetExceededError({
+            message: `Turn budget exhausted: spent ${active.pool.usd?.committed ?? 0} of ${active.pool.usd?.total ?? 0} (USD) shared turn pool; refusing to start another agent step`,
+            budget: active.pool.usd?.total ?? 0,
+            spent: active.pool.usd?.committed ?? 0,
+            unit: "usd",
+          })
+        }
         active.agentStarted += 1
         // Task 15: snapshot the active per-phase default model SYNCHRONOUSLY here
         // (alongside `node.phase`), not inside the dispatched gen — concurrent
@@ -2753,8 +2944,6 @@ export const layer = Layer.effect(
         }
         active.run.agents.push(node)
         persistInScope(active, bridge, db, events)
-        const prompt = input.prompt
-        if (!prompt) throw new Error("Workflow agent execution requires prompt operations")
         // Finding 2: an externally-aborted subagent (a session abort/timeout that is
         // NOT a run-level cancel/pause) RESOLVES with an abort-marked assistant
         // message that carries the abort-artifact cost. That cost must NOT be charged
@@ -2891,51 +3080,95 @@ export const layer = Layer.effect(
             // identical to a live structured step. A miss falls through to the
             // live path below. The agent name is resolved (`selected.name`)
             // exactly like the seed side, so a default-agent call still matches.
-            if (active.journal && active.journalCursor) {
+            // Item 20: both replay modes resolve a CANDIDATE here and share the
+            // verbatim-replay block below; `commitReplay` advances the mode's
+            // own cursor only once the hit is final (the schema parse guard may
+            // still veto it).
+            // - prefix (default): the next entry of the ORDERED source sequence
+            //   must match this call — entry exists, source node completed, its
+            //   index not invalidated, and the journal key equal. ANY mismatch
+            //   breaks the prefix PERMANENTLY (replayBroken): every later call
+            //   runs live, even an unchanged one, because its workspace side
+            //   effects may be stale after the changed step.
+            // - keyed: the previous shape-matching behavior 1:1 (occurrence
+            //   cursor per key; a miss falls through to live without breaking
+            //   anything).
+            let replayCached: AgentRun | undefined
+            let commitReplay: (() => void) | undefined
+            if (active.journalMode === "prefix" && active.journalSeq && !active.replayBroken) {
+              const entry = active.journalSeq[active.journalSeqCursor]
+              const liveKey = journalKey({ prompt: agentInput.prompt, agent: selected.name, phase: node.phase })
+              const matches =
+                entry !== undefined &&
+                entry.node.status === "completed" &&
+                !(active.invalidateSet?.has(entry.index) ?? false) &&
+                journalKey({ prompt: entry.node.prompt, agent: entry.node.agent, phase: entry.node.phase }) === liveKey
+              if (matches) {
+                replayCached = entry.node
+                commitReplay = () => {
+                  active.journalSeqCursor += 1
+                }
+              } else {
+                active.replayBroken = true
+              }
+            } else if (active.journal && active.journalCursor) {
               const key = journalKey({ prompt: agentInput.prompt, agent: selected.name, phase: node.phase })
               const bucket = active.journal.get(key)
               const cursor = active.journalCursor.get(key) ?? 0
               const cached = bucket?.[cursor]
               if (cached) {
-                // A schema was requested ⇒ the replayed output must parse as JSON
-                // to satisfy `result.data`. The source node may be a PLAINTEXT
-                // agent whose journal key happens to match this schema call (the
-                // workflow FILE drifted between the original run and the resume:
-                // same prompt/agent/phase, but the agent now asks for a schema).
-                // `JSON.parse` on that plaintext would throw SYNCHRONOUSLY and
-                // turn into a defect. Guard it with `Effect.try` captured as an
-                // `Effect.exit` (engine style; no try/catch). On a parse FAILURE
-                // we treat the lookup as a cache MISS — semantically correct: the
-                // cache cannot serve this schema, so we DON'T consume the journal
-                // entry, fall through, and let the agent run live (which yields a
-                // real structured result). Only commit the cache hit once we know
-                // the parse succeeded.
-                const parsedExit =
-                  agentInput.schema && cached.output !== undefined
-                    ? yield* Effect.try({
-                        try: () => JSON.parse(cached.output!) as unknown,
-                        catch: (error) => (error instanceof Error ? error.message : String(error)),
-                      }).pipe(Effect.exit)
-                    : undefined
-                const parseFailed = parsedExit !== undefined && Exit.isFailure(parsedExit)
-                if (!parseFailed) {
-                  active.journalCursor.set(key, cursor + 1)
-                  node.agent = selected.name
-                  node.status = "completed"
-                  node.completed_at = Date.now()
-                  node.output = cached.output
-                  node.cost = cached.cost
-                  node.tokens = cached.tokens
-                  node.model = cached.model
-                  node.cached = true
-                  // The budget decrement is left to the shared `ensuring` below
-                  // (node.cost is set), so a cache hit is charged exactly once.
-                  yield* persistRun(db, events, active)
-                  const structured = parsedExit !== undefined ? parsedExit.value : undefined
-                  return {
-                    data: structured !== undefined ? structured : (cached.output ?? ""),
-                    text: cached.output ?? "",
-                  }
+                replayCached = cached
+                commitReplay = () => {
+                  active.journalCursor!.set(key, cursor + 1)
+                }
+              }
+            }
+            if (replayCached !== undefined && commitReplay !== undefined) {
+              const cached = replayCached
+              // A schema was requested ⇒ the replayed output must parse as JSON
+              // to satisfy `result.data`. The source node may be a PLAINTEXT
+              // agent whose journal key happens to match this schema call (the
+              // workflow FILE drifted between the original run and the resume:
+              // same prompt/agent/phase, but the agent now asks for a schema).
+              // `JSON.parse` on that plaintext would throw SYNCHRONOUSLY and
+              // turn into a defect. Guard it with `Effect.try` captured as an
+              // `Effect.exit` (engine style; no try/catch). On a parse FAILURE
+              // we treat the lookup as a cache MISS — semantically correct: the
+              // cache cannot serve this schema, so we DON'T consume the journal
+              // entry, fall through, and let the agent run live (which yields a
+              // real structured result). Only commit the cache hit once we know
+              // the parse succeeded. Item 20: in PREFIX mode a parse failure
+              // additionally breaks the prefix permanently (the cache no longer
+              // fits this call semantically — the script drifted), instead of a
+              // silent per-call fall-through.
+              const parsedExit =
+                agentInput.schema && cached.output !== undefined
+                  ? yield* Effect.try({
+                      try: () => JSON.parse(cached.output!) as unknown,
+                      catch: (error) => (error instanceof Error ? error.message : String(error)),
+                    }).pipe(Effect.exit)
+                  : undefined
+              const parseFailed = parsedExit !== undefined && Exit.isFailure(parsedExit)
+              if (parseFailed && active.journalMode === "prefix") {
+                active.replayBroken = true
+              }
+              if (!parseFailed) {
+                commitReplay()
+                node.agent = selected.name
+                node.status = "completed"
+                node.completed_at = Date.now()
+                node.output = cached.output
+                node.cost = cached.cost
+                node.tokens = cached.tokens
+                node.model = cached.model
+                node.cached = true
+                // The budget decrement is left to the shared `ensuring` below
+                // (node.cost is set), so a cache hit is charged exactly once.
+                yield* persistRun(db, events, active)
+                const structured = parsedExit !== undefined ? parsedExit.value : undefined
+                return {
+                  data: structured !== undefined ? structured : (cached.output ?? ""),
+                  text: cached.output ?? "",
                 }
               }
             }
@@ -3132,6 +3365,12 @@ export const layer = Layer.effect(
               yield* persistRun(db, events, active)
               return SKIPPED
             }
+            // Item 28: subagent sessions load MCP tools LAZILY by default —
+            // they start with only the tool_search meta-tool instead of every
+            // MCP schema, the context-economy win for short-lived workflow
+            // steps. Configurable off via workflows.lazy_mcp=false; the main
+            // session loop stays eager (no `mcp` field there).
+            const lazyMcp = (yield* config.get()).workflows?.lazy_mcp !== false
             const message = yield* prompt
               .prompt({
                 sessionID: session.id,
@@ -3139,6 +3378,7 @@ export const layer = Layer.effect(
                 agent: selected.name,
                 model: modelInfo,
                 variant,
+                mcp: lazyMcp ? ("lazy" as const) : undefined,
                 // Per-step tool scoping: opencode's `Record<string, boolean>`
                 // whitelist/blacklist (glob-able keys, e.g. `{ webfetch: false }`)
                 // lives on PromptInput.tools (NOT sessions.create — that only takes a
@@ -3278,6 +3518,22 @@ export const layer = Layer.effect(
             Effect.ensuring(
               Effect.sync(() => {
                 if (node.session_id) active.sessions.delete(node.session_id)
+                // Item 24: settle the pool reservation FIRST — before the
+                // cancelled/paused early-return below — because settle must run
+                // on EVERY outcome (ensuring semantics): it releases the
+                // reserved headroom even when the charge is skipped, so a
+                // reservation can never leak. An aborted/cancelled/paused step
+                // settles with 0 (its cost is the abort artifact, not real
+                // spend — same rule as the run-budget charge below); any other
+                // outcome commits the step's actual cost/tokens and advances
+                // the rolling per-step estimate.
+                if (poolReservation && active.pool) {
+                  const skipCharge = active.cancelling || active.removed || active.pausing || aborted
+                  TurnBudget.settle(active.pool, poolReservation, {
+                    usd: skipCharge ? 0 : (node.cost ?? 0),
+                    tokens: skipCharge ? 0 : node.tokens ? node.tokens.output + node.tokens.reasoning : 0,
+                  })
+                }
                 // Decrement the live budget by whatever this step ACTUALLY cost
                 // — the SAME `cost` (USD) the dashboard shows, set on the node
                 // from the assistant message above. Done in `ensuring` (not the
@@ -3409,6 +3665,72 @@ export const layer = Layer.effect(
           Effect.gen(function* () {
             const cfg = yield* config.get()
             const sh = Shell.preferred(cfg.shell)
+            // Item 23 (Stufe 1): permission gate, the FIRST step inside the
+            // dispatched effect (so a cancel/pause that closes the run scope
+            // interrupts an OPEN ask cleanly — same unwind as a hung agent).
+            // The scan reuses the bash tool's exact pattern derivation
+            // (scanCommand), so the user's `bash` allow/deny rules (e.g.
+            // 'git status*') apply identically; out-of-workspace paths get the
+            // same external_directory ask the bash tool raises. The asks are
+            // evaluated against the run's caller-inherited ruleset and surface
+            // on permissionSessionID (or the run's own session for headless
+            // starts, identical to subagent tool asks). Kill-switch: config
+            // workflows.shell_permission=false restores the ungated behavior.
+            // A deny/reject propagates like a step failure — mapped to a clear
+            // error naming the command, so the run's error is self-explanatory.
+            // ctx.shell is not journaled, so the gate fires again on every
+            // resume.
+            if (cfg.workflows?.shell_permission !== false) {
+              const instanceCtx = yield* InstanceState.context
+              const scan = yield* scanCommand(command, cwd, instanceCtx, sh).pipe(
+                Effect.provideService(ChildProcessSpawner, spawner),
+                Effect.provideService(FSUtil.Service, fsUtil),
+                Effect.provideService(Config.Service, config),
+              )
+              // The run's own session is always set at start; the fallback
+              // mirrors the subagent parentID branding (SessionID.make).
+              const askSessionID = input.permissionSessionID ?? SessionID.make(active.run.session_id!)
+              const denied = (error: PermissionV1.Error) =>
+                new InvalidError({
+                  path: active.run.workflow,
+                  message: `ctx.shell permission denied for command: ${command} (${error.message})`,
+                })
+              if (scan.dirs.size > 0) {
+                const directories = Array.from(scan.dirs)
+                const globs = directories.map((dir) =>
+                  process.platform === "win32" ? FSUtil.normalizePathPattern(path.join(dir, "*")) : path.join(dir, "*"),
+                )
+                yield* permission
+                  .ask({
+                    permission: "external_directory",
+                    patterns: globs,
+                    always: globs,
+                    sessionID: askSessionID,
+                    ruleset: active.shellRuleset,
+                    metadata: {
+                      command,
+                      cwd,
+                      workflow: active.run.workflow,
+                      source: "workflow.shell",
+                      directories,
+                      patterns: globs,
+                    },
+                  })
+                  .pipe(Effect.mapError(denied))
+              }
+              if (scan.patterns.size > 0) {
+                yield* permission
+                  .ask({
+                    permission: ShellID.ToolID,
+                    patterns: Array.from(scan.patterns),
+                    always: Array.from(scan.always),
+                    sessionID: askSessionID,
+                    ruleset: active.shellRuleset,
+                    metadata: { command, cwd, workflow: active.run.workflow, source: "workflow.shell" },
+                  })
+                  .pipe(Effect.mapError(denied))
+              }
+            }
             // Finding 5: Process.run only kills the child when its `abort` signal
             // fires. Closing the run scope (cancel/pause/remove) INTERRUPTS this
             // Effect fiber, but `Effect.tryPromise` does NOT abort the underlying
@@ -4062,6 +4384,49 @@ export const layer = Layer.effect(
       return { path: filepath }
     })
 
+    // Item 27: transcript export. Writes the run snapshot + one JSONL per agent
+    // node under `<data>/workflow/<runId>/transcripts/` (the same per-run data
+    // dir Item 18 uses for the persisted script.ts), so a human (or a manual
+    // continuation script) can read the whole run off disk. All data already
+    // exists in the DB row + the session store; this only materializes it.
+    // The JSONL line shape ({ info, parts } per message / { node } fallback) is
+    // a hand/debug format, deliberately NOT a schema-backed API contract.
+    const exportRun: Interface["export"] = Effect.fn("Workflow.export")(function* (id) {
+      // Directory-scoped exactly like get(): a run from another workspace (or
+      // an unknown id) yields undefined → the HTTP handler maps it to 404.
+      const run = yield* get(id)
+      if (!run) return undefined
+      const dir = path.join(Global.Path.data, "workflow", id, "transcripts")
+      yield* Effect.promise(() => fs.mkdir(dir, { recursive: true }))
+      const files: string[] = []
+      const write = (name: string, content: string) =>
+        Effect.promise(() => fs.writeFile(path.join(dir, name), content)).pipe(
+          Effect.tap(() => Effect.sync(() => files.push(name))),
+        )
+      // (a) run.json: the full run snapshot (a still-running run exports its
+      // current state). Re-export overwrites deterministically (same names).
+      yield* write("run.json", JSON.stringify(run, null, 2))
+      // (b) one <agent-id>.jsonl per node. Agent ids are engine-generated
+      // counters ("1", "2", …) but are encodeURIComponent-ed anyway so a node
+      // id can never traverse the directory. A node with a readable session
+      // exports one line per message; a session-less or unreadable node
+      // (replayed/cached, question, deleted session) exports a single fallback
+      // line carrying the journal node — the export is always COMPLETE across
+      // all nodes, never holey.
+      for (const node of run.agents) {
+        const name = `${encodeURIComponent(node.id)}.jsonl`
+        const msgs = node.session_id
+          ? yield* sessions
+              .messages({ sessionID: SessionID.make(node.session_id) })
+              .pipe(Effect.catchCause(() => Effect.succeed([] as SessionV1.WithParts[])))
+          : []
+        const lines =
+          msgs.length > 0 ? msgs.map((m) => JSON.stringify({ info: m.info, parts: m.parts })) : [JSON.stringify({ node })]
+        yield* write(name, lines.join("\n") + "\n")
+      }
+      return { path: dir, files }
+    })
+
     const remove: Interface["remove"] = Effect.fn("Workflow.remove")(function* (id) {
       const inst = yield* InstanceState.get(state)
       const active = (yield* SynchronizedRef.get(inst.runs)).get(id)
@@ -4101,7 +4466,22 @@ export const layer = Layer.effect(
       yield* sweepOrphans(db, new Set(live.keys()), yield* Clock.currentTimeMillis, yield* InstanceState.directory)
     })
 
-    return Service.of({ list, read, runs, get, start, wait, cancel, pause, skipAgent, answer, save, remove, sweep })
+    return Service.of({
+      list,
+      read,
+      runs,
+      get,
+      start,
+      wait,
+      cancel,
+      pause,
+      skipAgent,
+      answer,
+      save,
+      export: exportRun,
+      remove,
+      sweep,
+    })
   }),
 )
 
@@ -4112,6 +4492,11 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
   Layer.provide(EventV2Bridge.defaultLayer),
+  // Item 23 (Stufe 1): Permission gates ctx.shell; FSUtil + the spawner feed
+  // the bash tool's scanCommand the gate reuses.
+  Layer.provide(Permission.defaultLayer),
+  Layer.provide(FSUtil.defaultLayer),
+  Layer.provide(CrossSpawnSpawner.defaultLayer),
 )
 
 export const node = LayerNode.make(layer, [
@@ -4121,6 +4506,10 @@ export const node = LayerNode.make(layer, [
   Provider.node,
   Config.node,
   EventV2Bridge.node,
+  // Item 23 (Stufe 1): see defaultLayer.
+  Permission.node,
+  FSUtil.node,
+  CrossSpawnSpawner.node,
 ])
 
 export * as Workflow from "./workflow"

@@ -34,8 +34,15 @@ export const StartPayload = Schema.Struct({
   // Source-journal agent indices (0-based) to force live re-execution of during a
   // resume, even if they completed. Only meaningful together with `resume_of`.
   // Lets the dashboard re-run a single agent while replaying the rest (the `r`
-  // key on a selected agent).
+  // key on a selected agent). In prefix replay mode (the default), everything
+  // after the first invalidated agent re-runs live too.
   invalidate_agents: Schema.optional(Schema.Array(Schema.Int)),
+  // Item 20: journal replay strategy for a resume (only meaningful with
+  // `resume_of`). 'prefix' (engine default) replays the source run's steps in
+  // order and stops permanently at the first changed/invalidated step; 'keyed'
+  // keeps the previous shape-matching behavior (unchanged later steps replay
+  // even after an earlier change — for read-only/heavily parallel workflows).
+  replay: Schema.optional(Schema.Literals(["prefix", "keyed"])),
 }).annotate({ identifier: "WorkflowStartPayload" })
 export type StartPayload = Schema.Schema.Type<typeof StartPayload>
 
@@ -104,8 +111,20 @@ export const WorkflowPaths = {
   // Skip one in-flight agent step of a live run (Item 15).
   skip: `${root}/run/:id/agent/:agentId/skip`,
   answer: `${root}/run/:id/answer`,
+  // Export a run's transcripts as JSONL files under the global data dir
+  // (Item 27). POST (not GET) because it writes files.
+  export: `${root}/run/:id/export`,
   remove: `${root}/run/:id`,
 } as const
+
+// Item 27: result of a transcript export — the directory the files were
+// written to plus the written file names (run.json + one <agent-id>.jsonl per
+// agent node).
+export const ExportResult = Schema.Struct({
+  path: Schema.String,
+  files: Schema.Array(Schema.String),
+}).annotate({ identifier: "WorkflowExportResult" })
+export type ExportResult = Schema.Schema.Type<typeof ExportResult>
 
 export const WorkflowApi = HttpApi.make("workflow")
   .add(
@@ -282,6 +301,23 @@ export const WorkflowApi = HttpApi.make("workflow")
             summary: "Answer workflow question",
             description:
               "Answer a run's open human-in-the-loop question. A live run resolves in place; a parked run is resumed.",
+          }),
+        ),
+        HttpApiEndpoint.post("export", WorkflowPaths.export, {
+          // Branded at the schema boundary like get/cancel: a malformed id is a
+          // 400 at decode time, never a defect inside the handler.
+          params: { id: Workflow.RunID },
+          query: WorkspaceRoutingQuery,
+          // 200 + the written directory and file names. A run not known to this
+          // workspace is a 404 (directory-scoped like get). POST, not GET — the
+          // export writes files (run.json + one JSONL per agent) idempotently.
+          success: described(ExportResult, "Workflow run transcripts exported"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "workflow.export",
+            summary: "Export workflow run transcripts",
+            description: "Export a run's transcripts as JSONL files; returns the directory path.",
           }),
         ),
         HttpApiEndpoint.delete("remove", WorkflowPaths.remove, {

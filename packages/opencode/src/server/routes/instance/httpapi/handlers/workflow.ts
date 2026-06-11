@@ -78,6 +78,9 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
           // Copy to a mutable array: the engine's StartOptions takes `number[]`
           // while the decoded schema yields a `readonly number[]`.
           invalidate_agents: ctx.payload?.invalidate_agents ? [...ctx.payload.invalidate_agents] : undefined,
+          // Item 20: journal replay strategy (prefix default in the engine;
+          // only meaningful with resume_of).
+          replay: ctx.payload?.replay,
           // When the HTTP caller supplied a session identity, derive subagent
           // permission inheritance from it (parent-session deny/external_directory
           // rules). The HTTP payload carries no caller-agent, so the agent-level
@@ -181,6 +184,14 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
         )
     })
 
+    const exportRun = Effect.fn("WorkflowHttpApi.export")(function* (ctx: { params: { id: Workflow.RunID } }) {
+      // Item 27: the engine returns undefined ONLY for a run unknown to this
+      // workspace (directory-scoped like get) → 404, matching the get handler.
+      const result = yield* workflow.export(ctx.params.id)
+      if (!result) return yield* notFound(`Workflow run not found: ${ctx.params.id}`)
+      return result
+    })
+
     const remove = Effect.fn("WorkflowHttpApi.remove")(function* (ctx: { params: { id: Workflow.RunID } }) {
       return yield* workflow.remove(ctx.params.id)
     })
@@ -196,6 +207,7 @@ export const workflowHandlers = HttpApiBuilder.group(InstanceHttpApi, "workflow"
       .handle("skip", skip)
       .handle("answer", answer)
       .handle("save", save)
+      .handle("export", exportRun)
       .handle("remove", remove)
   }),
 )

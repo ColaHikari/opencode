@@ -184,6 +184,18 @@ export const Info = Schema.Struct({
         description:
           "Detect the `+$N` budget directive in the prompt and highlight it; on submit it reserves that budget for workflow orchestration in the turn (default: true)",
       }),
+      shell_permission: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Gate workflow ctx.shell commands through the caller's bash permission ruleset, exactly like the bash tool (default: true). Set to false to restore the ungated behavior.",
+      }),
+      lint: Schema.optional(Schema.Literals(["off", "warn", "deny"])).annotate({
+        description:
+          "Static source lint for workflow scripts on create/inline start (node builtins, Bun.spawn, process.env, fetch, dynamic import). 'warn' (default) surfaces findings non-blocking, 'deny' fails create/start on findings, 'off' disables the lint.",
+      }),
+      lazy_mcp: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Load MCP tools lazily in workflow subagent sessions via the tool_search meta-tool instead of registering every MCP schema eagerly (default: true).",
+      }),
     }),
   ).annotate({ description: "Workflow orchestration options" }),
   experimental: Schema.optional(

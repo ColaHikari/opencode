@@ -329,6 +329,8 @@ import type {
   WorkflowCancelResponses,
   WorkflowDeleteErrors,
   WorkflowDeleteResponses,
+  WorkflowExportErrors,
+  WorkflowExportResponses,
   WorkflowGetErrors,
   WorkflowGetResponses,
   WorkflowListErrors,
@@ -3761,6 +3763,11 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      turnBudget?: {
+        usd?: number
+        tokens?: number
+      }
+      mcp?: "eager" | "lazy"
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -3782,6 +3789,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "turnBudget" },
+            { in: "body", key: "mcp" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4116,6 +4125,11 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      turnBudget?: {
+        usd?: number
+        tokens?: number
+      }
+      mcp?: "eager" | "lazy"
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -4137,6 +4151,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "turnBudget" },
+            { in: "body", key: "mcp" },
             { in: "body", key: "parts" },
           ],
         },
@@ -5395,6 +5411,38 @@ export class Workflow extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Export workflow run transcripts
+   *
+   * Export a run's transcripts as JSONL files; returns the directory path.
+   */
+  public export<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowExportResponses, WorkflowExportErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/export",
+      ...options,
+      ...params,
     })
   }
 }

@@ -2087,6 +2087,9 @@ export type Config = {
     approved?: Array<string>
     foreground_grace_ms?: number
     budget_directive?: boolean
+    shell_permission?: boolean
+    lint?: "off" | "warn" | "deny"
+    lazy_mcp?: boolean
   }
   experimental?: {
     disable_paste_summary?: boolean
@@ -2909,6 +2912,7 @@ export type WorkflowStartPayload = {
   permissionSessionID?: string
   resume_of?: string
   invalidate_agents?: Array<number>
+  replay?: "prefix" | "keyed"
 }
 
 export type WorkflowAnswerPayload = {
@@ -2917,6 +2921,11 @@ export type WorkflowAnswerPayload = {
    */
   answer: string
   permissionSessionID?: string
+}
+
+export type WorkflowExportResult = {
+  path: string
+  files: Array<string>
 }
 
 export type UnauthorizedError = {
@@ -8231,6 +8240,11 @@ export type SessionPromptData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    turnBudget?: {
+      usd?: number
+      tokens?: number
+    }
+    mcp?: "eager" | "lazy"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -8579,6 +8593,11 @@ export type SessionPromptAsyncData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    turnBudget?: {
+      usd?: number
+      tokens?: number
+    }
+    mcp?: "eager" | "lazy"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -10020,6 +10039,40 @@ export type WorkflowAnswerResponses = {
 }
 
 export type WorkflowAnswerResponse = WorkflowAnswerResponses[keyof WorkflowAnswerResponses]
+
+export type WorkflowExportData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/workflow/run/{id}/export"
+}
+
+export type WorkflowExportErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type WorkflowExportError = WorkflowExportErrors[keyof WorkflowExportErrors]
+
+export type WorkflowExportResponses = {
+  /**
+   * Workflow run transcripts exported
+   */
+  200: WorkflowExportResult
+}
+
+export type WorkflowExportResponse = WorkflowExportResponses[keyof WorkflowExportResponses]
 
 export type V2HealthGetData = {
   body?: never
