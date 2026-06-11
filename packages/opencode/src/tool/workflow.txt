@@ -1,9 +1,9 @@
 <!-- AUTHORING GUIDE for the workflow tool. Keep in sync with:
      - packages/plugin/src/workflow.ts (WorkflowContext — the public ctx API)
-     - packages/opencode/src/workflow/workflow.ts (engine semantics: resume/cancel/pause #2/#5,
-       caps, model routing #11, pipeline stage signature #21)
-     - packages/opencode/src/tool/workflow.ts (actions, script_path #18)
-     - pending roadmap items 8/15/16/17/20 may extend this text when they land. -->
+     - packages/opencode/src/workflow/workflow.ts (engine semantics: resume/replay/cancel/pause,
+       caps, model routing, pipeline stage signature, onError/skip null results, budget {usd,tokens})
+     - packages/opencode/src/tool/workflow.ts (actions, script_path, replay, budget_tokens)
+     - packages/web/src/content/docs/workflows.mdx (user-facing docs of the same semantics) -->
 WORKFLOW AUTHORING GUIDE
 
 A workflow is a TypeScript (or JavaScript) module that orchestrates a fleet of subagents
@@ -41,13 +41,19 @@ active), arguments ({name: {type: "string"|"number"|"boolean", default?, descrip
 
 ctx API (the only orchestration surface)
 
-- ctx.agent({prompt, agent?, model?, variant?, tools?, skills?, files?, schema?, isolation?})
-  -> Promise<{data, text}>. Dispatches one subagent. `data` is populated ONLY when you pass
-  `schema` (a JSON schema; the engine forces a StructuredOutput tool call). `model: "small"`
-  routes to the configured small_model (fails if none is configured). `isolation: "worktree"`
-  runs the step in a fresh git worktree (parallel file mutations don't collide).
-  IMPORTANT: a bare ctx.agent error THROWS and fails the run — it never resolves to null.
-  Error tolerance comes from parallel/pipeline (null-drop) or your own try/catch.
+- ctx.agent({prompt, agent?, model?, variant?, tools?, skills?, files?, schema?, isolation?,
+  phase?, label?, onError?}) -> Promise<{data, text} | null>. Dispatches one subagent. `data`
+  is populated ONLY when you pass `schema` (a JSON schema; the engine forces a
+  StructuredOutput tool call). `model: "small"` routes to the configured small_model (fails if
+  none is configured). `isolation: "worktree"` runs the step in a fresh git worktree (parallel
+  file mutations don't collide; a dirty worktree is preserved on finish, never deleted).
+  `phase` pins the step to a named phase under concurrency (no setPhase side effect); `label`
+  names the step in run views.
+  IMPORTANT: a bare ctx.agent error THROWS and fails the run by default. It resolves null in
+  exactly two cases: a human skipped the step, or you passed onError: "null" (the error is
+  recorded, the body branches). Budget/lifetime errors and aborts always throw. Guard results
+  (`if (!r) ...`). Error tolerance otherwise comes from parallel/pipeline (null-drop) or your
+  own try/catch.
 - ctx.parallel([...thunks], {concurrencyLimit?}) -> Promise<(T | null)[]>. Concurrent batch
   with a BARRIER: resolves when all thunks settle. A throwing thunk becomes null at its
   position (logged), the rest keep running.
@@ -57,7 +63,8 @@ ctx API (the only orchestration surface)
   stage's `prev` is the item itself. A throwing stage nulls ONLY that item.
   Null-drop idiom (mandatory after parallel/pipeline): `.filter((x) => x !== null)`.
 - ctx.shell(cmd, {timeout?, cwd?}) -> Promise<{output, exitCode}>. Deterministic non-LLM
-  step. A non-zero exit is RETURNED, never thrown. Costs no budget.
+  step. A non-zero exit is RETURNED, never thrown. Costs no budget. Commands run through
+  the caller's bash permission rules (a denied command fails the step).
 - ctx.question({question, options?, timeout?}) -> Promise<{answer}>. Ask the human and
   wait. On timeout (default 10 min) the run PARKS as paused; a later answer resumes it.
 - ctx.setPhase(title) / ctx.log(message). Progress + audit trail; log every decision that
@@ -65,11 +72,16 @@ ctx API (the only orchestration surface)
 - ctx.workflow(name, args?) -> Promise<unknown>. Run another discovered workflow inline
   under the same run (shared budget/concurrency). Max nesting depth 1.
 - ctx.budget.total (USD or null), ctx.budget.spent(), ctx.budget.remaining() (Infinity
-  when unlimited). The engine refuses the NEXT agent call once the budget is exhausted —
-  a soft cap; steps already in flight finish.
+  when unlimited); ctx.budget.tokensTotal/tokensSpent()/tokensRemaining() is the same trio
+  for the independent output-token cap. Set caps at start via budget (USD) and/or
+  budget_tokens — whichever is exhausted first wins. The engine refuses the NEXT agent call
+  once a budget is exhausted — a soft cap; steps already in flight finish.
 
-Caps: at most min(16, CPU-2) concurrent agent dispatches per run, and a lifetime total of
-1000 agent dispatches per run.
+Caps: at most min(16, CPU-2) concurrent agent dispatches per run, a lifetime total of
+1000 agent dispatches per run, and at most 4096 items per parallel/pipeline call.
+
+Subagents load MCP tools lazily: a step starts with a tool_search meta-tool instead of
+every MCP schema and activates matching tools on demand (config workflows.lazy_mcp).
 
 PIPELINE-FIRST DOCTRINE
 
@@ -192,13 +204,22 @@ ITERATE ON A RUN
   (works after paused, interrupted, FAILED — fix the script, completed prefix is replayed
   free — and completed runs). invalidate_agents=[indices] forces chosen steps live.
   Keep the order/shape of agent calls stable so the journal matches.
+- replay="prefix" (default) replays the journal in order and stops permanently at the first
+  changed/invalidated step (everything after re-runs live — safe). replay="keyed" matches by
+  call shape, so unchanged later steps still replay after an earlier edit (best for read-only
+  or heavily parallel workflows).
 - action="cancel" stops a running run terminally; action="pause" parks it resumable.
 
 PORTING CLAUDE-CODE SCRIPTS
 
-- The `args` global becomes the `run(args, ctx)` parameter.
+- The `args` global becomes the `run(args, ctx)` parameter (declared args are type-coerced,
+  undeclared ones pass through verbatim).
+- Global helpers become ctx members: agent(p, opts) -> ctx.agent({prompt, ...}),
+  phase() -> ctx.setPhase(), log() -> ctx.log(), budget -> ctx.budget.
 - No determinism guards needed: Date.now()/Math.random() are fine — resume matches by
   call shape, so just keep the sequence of ctx.agent calls stable across edits.
-- agent() never resolves null on failure here — it throws; use pipeline/parallel
-  null-drops or try/catch where the original relied on null results.
-- Budget is USD, not tokens.
+- agent() THROWS on failure here instead of resolving null; where the original checked
+  `if (result === null)`, pass onError: "null" on the call (or use pipeline/parallel
+  null-drops / try/catch).
+- Budget is USD-first (budget), with an optional output-token cap (budget_tokens) —
+  not token-only.
