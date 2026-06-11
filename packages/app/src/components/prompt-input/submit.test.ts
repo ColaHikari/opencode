@@ -2,8 +2,10 @@ import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import type { Prompt } from "@/context/prompt"
 import type { FollowupDraft } from "./submit"
 import { ULTRACODE_PROMPT_DIRECTIVE, ULTRACODE_SESSION_DIRECTIVE } from "./ultracode"
+import { resetSessionApprovalForTest } from "@/components/dialog-workflow-approval-helpers"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
+let sendFollowupDraft: typeof import("./submit").sendFollowupDraft
 
 const createdClients: string[] = []
 const createdSessions: string[] = []
@@ -31,6 +33,12 @@ const workflowStarts: Array<{
 }> = []
 const toasts: Array<{ title?: string; description?: string }> = []
 const promptParts: Array<Array<{ type: string; text?: string; synthetic?: boolean }>> = []
+// Recorder for session.command: Bonus A asserts a workflow-sourced /<name> is
+// NEVER executed as a session command (the empty-template bug).
+const sessionCommands: Array<{ directory: string; command: string; arguments?: string }> = []
+// The server-registered command list surfaced via sync.data.command; entries
+// with source:'workflow' are the discovery-only rows (empty template).
+let commandList: Array<{ name: string; description?: string; source?: string }> = []
 let dashboardOpened = 0
 let workflowListData: Array<{ name: string; valid?: boolean; meta: { name: string; arguments?: any } }> = []
 let workflowStartSessionId: string | undefined
@@ -74,7 +82,10 @@ const clientFor = (directory: string) => {
         promptParts.push(input.parts)
         return { data: undefined }
       },
-      command: async () => ({ data: undefined }),
+      command: async (input: { command: string; arguments?: string }) => {
+        sessionCommands.push({ directory, command: input.command, arguments: input.arguments })
+        return { data: undefined }
+      },
       abort: async () => ({ data: undefined }),
     },
     workflow: {
@@ -208,7 +219,7 @@ beforeAll(async () => {
   mock.module("@/context/sync", () => ({
     useSync: () => ({
       data: {
-        command: [],
+        command: commandList,
         config: {
           workflows: {
             ultracode_keyword: keywordEnabled,
@@ -292,6 +303,7 @@ beforeAll(async () => {
 
   const mod = await import("./submit")
   createPromptSubmit = mod.createPromptSubmit
+  sendFollowupDraft = mod.sendFollowupDraft
 })
 
 beforeEach(() => {
@@ -307,6 +319,8 @@ beforeEach(() => {
   workflowStarts.length = 0
   toasts.length = 0
   promptParts.length = 0
+  sessionCommands.length = 0
+  commandList = []
   dashboardOpened = 0
   workflowListData = []
   workflowStartSessionId = undefined
@@ -316,6 +330,9 @@ beforeEach(() => {
   workflowApprovedList = []
   workflowApprovalReply = "once"
   workflowApprovalShown = 0
+  // The "Yes, always" reply writes the module-level session cache — reset it so
+  // one test's consent never leaks into another (the seam exists for this).
+  resetSessionApprovalForTest()
   configUpdates.length = 0
   selected = "/repo/worktree-a"
   variant = undefined
@@ -783,5 +800,113 @@ describe("ultracode injection on submit", () => {
     expect(queued).toHaveLength(1)
     expect(queued[0]?.directives).toEqual([ULTRACODE_SESSION_DIRECTIVE, ULTRACODE_PROMPT_DIRECTIVE])
     expect(queued[0]?.prompt).toEqual([{ type: "text", content: "fix the bug", start: 0, end: 0 }])
+  })
+})
+
+describe("direct /<name> workflow routing (Bonus A)", () => {
+  test("a workflow-sourced /<name> starts a real run with parsed args and never calls session.command", async () => {
+    params = { id: "session-1" }
+    commandList = [{ name: "review", source: "workflow" }]
+    workflowListData = [
+      { name: "review", valid: true, meta: { name: "review", arguments: { count: { type: "number" } } } },
+    ]
+    promptValue = [{ type: "text", content: "/review count=2 tag=v1.0", start: 0, end: 24 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowStarts).toHaveLength(1)
+    expect(workflowStarts[0]).toMatchObject({
+      name: "review",
+      directory: "/repo/main",
+      args: { count: 2, tag: "v1.0" },
+      permission: "session-1",
+    })
+    // The empty-template bug: session.command must never fire for a workflow.
+    expect(sessionCommands).toEqual([])
+    expect(promptParts).toEqual([])
+    // approval:"never" (the test default) never opens the dialog.
+    expect(workflowApprovalShown).toBe(0)
+  })
+
+  test("the approval gate applies to a direct /<name> start (cancel aborts)", async () => {
+    params = { id: "session-1" }
+    workflowApprovalMode = "first-run"
+    workflowApprovalReply = "cancel"
+    commandList = [{ name: "review", source: "workflow" }]
+    workflowListData = [{ name: "review", valid: true, meta: { name: "review" } }]
+    promptValue = [{ type: "text", content: "/review", start: 0, end: 7 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(workflowApprovalShown).toBe(1)
+    expect(workflowStarts).toEqual([])
+    expect(sessionCommands).toEqual([])
+  })
+
+  test("a command-sourced /<name> still executes session.command (commands win)", async () => {
+    params = { id: "session-1" }
+    commandList = [{ name: "review", source: "command" }]
+    promptValue = [{ type: "text", content: "/review now", start: 0, end: 11 }]
+    const submit = createPromptSubmit(workflowInput())
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(sessionCommands).toEqual([{ directory: "/repo/main", command: "review", arguments: "now" }])
+    expect(workflowStarts).toEqual([])
+  })
+
+  test("queued backstop: a workflow-sourced /<name> draft falls back to the plain prompt", async () => {
+    commandList = [{ name: "review", source: "workflow" }]
+    const sent = await sendFollowupDraft({
+      client: clientFor("/repo/main") as any,
+      serverSync: { child: () => [{}, () => undefined] } as any,
+      sync: {
+        data: { command: commandList },
+        session: { optimistic: { add: () => undefined, remove: () => undefined } },
+      } as any,
+      draft: {
+        sessionID: "session-1",
+        sessionDirectory: "/repo/main",
+        prompt: [{ type: "text", content: "/review k=v", start: 0, end: 11 }],
+        context: [],
+        agent: "agent",
+        model: { providerID: "provider", modelID: "model" },
+      },
+    })
+
+    // The draft is sent as a plain prompt (promptAsync), never as the
+    // empty-template session.command.
+    expect(sent).toBe(true)
+    expect(sessionCommands).toEqual([])
+    expect(promptParts).toHaveLength(1)
+  })
+
+  test("queued command-sourced drafts keep executing session.command", async () => {
+    commandList = [{ name: "review", source: "command" }]
+    const sent = await sendFollowupDraft({
+      client: clientFor("/repo/main") as any,
+      serverSync: { child: () => [{}, () => undefined] } as any,
+      sync: {
+        data: { command: commandList },
+        session: { optimistic: { add: () => undefined, remove: () => undefined } },
+      } as any,
+      draft: {
+        sessionID: "session-1",
+        sessionDirectory: "/repo/main",
+        prompt: [{ type: "text", content: "/review k=v", start: 0, end: 11 }],
+        context: [],
+        agent: "agent",
+        model: { providerID: "provider", modelID: "model" },
+      },
+    })
+
+    expect(sent).toBe(true)
+    expect(sessionCommands).toEqual([{ directory: "/repo/main", command: "review", arguments: "k=v" }])
+    expect(promptParts).toEqual([])
   })
 })

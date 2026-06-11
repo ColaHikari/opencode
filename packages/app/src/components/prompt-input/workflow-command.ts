@@ -141,6 +141,29 @@ export function extractReservedBudget(
   return { args: rest, budget: numeric }
 }
 
+// Bonus A: resolves a direct `/<name>` input to a workflow start when — and
+// only when — the server registered <name> as a workflow-sourced command
+// (source:'workflow', the discovery-only rows with an empty template). The
+// caller checks parseWorkflowCommand FIRST, so `/workflow`/`/workflows` keep
+// their dispatch and commands keep precedence over workflows; this function
+// itself only matches the name. Like parseWorkflowCommand, only the first line
+// determines the command, and the args are the RAW remainder of that line
+// (multiple spaces preserved — Fund 60).
+export function resolveDirectWorkflowCommand(
+  input: string,
+  commands: ReadonlyArray<{ name: string; source?: string }>,
+): Extract<WorkflowCommand, { type: "start" }> | undefined {
+  const firstLine = input.split("\n")[0].trimStart()
+  if (!firstLine.startsWith("/")) return undefined
+  const head = firstLine.split(/\s/)[0]
+  const name = head.slice(1)
+  if (!name) return undefined
+  const command = commands.find((candidate) => candidate.name === name)
+  if (command?.source !== "workflow") return undefined
+  const rest = firstLine.slice(head.length)
+  return { type: "start", name, args: rest === "" ? "" : rest.slice(1) }
+}
+
 export type WorkflowCommandOption = { name: string; description?: string }
 
 // Direct `/<name>` slash commands for every DISCOVERED workflow (Claude-Code

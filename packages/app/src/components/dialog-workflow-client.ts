@@ -195,3 +195,19 @@ export function selectedAnswer(options: QuestionOption[], index: number, freetex
 export function isResumeAnswer(sourceID: string, returnedRun: WorkflowRun): boolean {
   return returnedRun.id !== sourceID
 }
+
+// Pure derivation of the run-finished notice (TUI parity: notifications.ts —
+// `done = status === 'completed'`, everything else is the error flavour with
+// `run.error || run.status` as the detail, so a cancelled/interrupted/paused
+// terminal event reads its status text). Consumed by the notification context's
+// workflow.run.finished handler; kept here so it is unit-testable without the
+// Solid runtime.
+export function workflowFinishedNotice(run: {
+  workflow: string
+  status: WorkflowRunEventData["status"]
+  error?: string
+}): { done: boolean; variant: "success" | "error"; detail?: string } {
+  const done = run.status === "completed"
+  if (done) return { done, variant: "success" }
+  return { done, variant: "error", detail: run.error || run.status }
+}

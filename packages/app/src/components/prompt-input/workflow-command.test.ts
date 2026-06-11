@@ -3,6 +3,7 @@ import {
   extractReservedBudget,
   parseWorkflowArgs,
   parseWorkflowCommand,
+  resolveDirectWorkflowCommand,
   sanitizeWorkflowFilename,
   workflowCommandOptions,
 } from "./workflow-command"
@@ -26,6 +27,48 @@ describe("parseWorkflowCommand", () => {
       args: 'msg="a  b"',
     }))
   test("non-workflow input returns undefined", () => expect(parseWorkflowCommand("/share")).toBeUndefined())
+})
+
+describe("resolveDirectWorkflowCommand (Bonus A)", () => {
+  const commands = [
+    { name: "review", source: "workflow" },
+    { name: "share", source: "command" },
+    { name: "tools", source: "mcp" },
+    { name: "legacy" },
+  ]
+
+  test("resolves a workflow-sourced /<name> with the RAW args remainder", () => {
+    expect(resolveDirectWorkflowCommand('/review msg="a  b"  k=v', commands)).toEqual({
+      type: "start",
+      name: "review",
+      args: 'msg="a  b"  k=v',
+    })
+    expect(resolveDirectWorkflowCommand("/review", commands)).toEqual({ type: "start", name: "review", args: "" })
+  })
+  test("non-workflow sources never match (command/mcp/undefined)", () => {
+    expect(resolveDirectWorkflowCommand("/share x", commands)).toBeUndefined()
+    expect(resolveDirectWorkflowCommand("/tools x", commands)).toBeUndefined()
+    expect(resolveDirectWorkflowCommand("/legacy x", commands)).toBeUndefined()
+    expect(resolveDirectWorkflowCommand("/unknown x", commands)).toBeUndefined()
+  })
+  test("requires a leading slash and a non-empty name", () => {
+    expect(resolveDirectWorkflowCommand("review x", commands)).toBeUndefined()
+    expect(resolveDirectWorkflowCommand("/", commands)).toBeUndefined()
+    expect(resolveDirectWorkflowCommand("", commands)).toBeUndefined()
+  })
+  test("only the first line determines the command (parseWorkflowCommand parity)", () => {
+    expect(resolveDirectWorkflowCommand("/review k=v\nsecond line", commands)).toEqual({
+      type: "start",
+      name: "review",
+      args: "k=v",
+    })
+    expect(resolveDirectWorkflowCommand("plain text\n/review", commands)).toBeUndefined()
+  })
+  test("doc: the function only matches the NAME — '/workflow x' is the caller's job", () => {
+    // The submit path consults parseWorkflowCommand first, so '/workflow x'
+    // never reaches this resolver; on its own it just looks up 'workflow'.
+    expect(resolveDirectWorkflowCommand("/workflow x", commands)).toBeUndefined()
+  })
 })
 
 describe("parseWorkflowArgs", () => {

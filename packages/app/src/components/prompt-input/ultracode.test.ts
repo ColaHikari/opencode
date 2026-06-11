@@ -7,6 +7,7 @@ import {
   detectUltracodeKeyword,
   stripBudgetDirective,
   stripUltracodeKeyword,
+  strongestReasoningVariant,
   systemReminder,
   ultracodeToggle,
   ULTRACODE_PROMPT_DIRECTIVE,
@@ -130,5 +131,26 @@ describe("ultracodeToggle", () => {
       title: "toast.ultracode.off.title",
       description: "toast.ultracode.off.description",
     })
+  })
+  test("a boost selects the boosted on-description", () => {
+    expect(ultracodeToggle(false, "high").toast.description).toBe("toast.ultracode.on.descriptionBoosted")
+  })
+  test("a boost is ignored when turning off", () => {
+    expect(ultracodeToggle(true, "high").toast.description).toBe("toast.ultracode.off.description")
+  })
+})
+
+describe("strongestReasoningVariant", () => {
+  test("prefers a known high-effort name regardless of case or position", () => {
+    expect(strongestReasoningVariant(["low", "medium", "high"])).toBe("high")
+    expect(strongestReasoningVariant(["Max", "low"])).toBe("Max")
+    // `preferred` order wins over list order: max beats high.
+    expect(strongestReasoningVariant(["high", "max"])).toBe("max")
+  })
+  test("falls back to the last variant (providers order low → high)", () => {
+    expect(strongestReasoningVariant(["mini", "turbo"])).toBe("turbo")
+  })
+  test("returns undefined for a model without variants", () => {
+    expect(strongestReasoningVariant([])).toBeUndefined()
   })
 })

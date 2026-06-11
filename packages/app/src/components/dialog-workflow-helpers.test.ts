@@ -3,6 +3,7 @@ import {
   capLogs,
   formatPhase,
   formatShortElapsed,
+  isResumable,
   normalizePhases,
   phaseIcon,
   phaseStatus,
@@ -41,6 +42,19 @@ describe("statusIcon", () => {
     ])
     expect(icons.size).toBe(6)
     expect(statusIcon("paused")).toBe("⏸")
+  })
+})
+
+describe("isResumable (mirrors the engine's RESUMABLE guard)", () => {
+  test("paused, interrupted, failed, and completed runs are resumable", () => {
+    expect(isResumable("paused")).toBe(true)
+    expect(isResumable("interrupted")).toBe(true)
+    expect(isResumable("failed")).toBe(true)
+    expect(isResumable("completed")).toBe(true)
+  })
+  test("running and cancelled runs are not", () => {
+    expect(isResumable("running")).toBe(false)
+    expect(isResumable("cancelled")).toBe(false)
   })
 })
 

@@ -68,7 +68,7 @@ import {
   promptLength,
 } from "./prompt-input/history"
 import { createPromptSubmit, type FollowupDraft } from "./prompt-input/submit"
-import { ultracodeToggle } from "./prompt-input/ultracode"
+import { strongestReasoningVariant, ultracodeToggle } from "./prompt-input/ultracode"
 import { workflowCommandOptions } from "./prompt-input/workflow-command"
 import { openWorkflowDashboard } from "./prompt-input/workflow-dashboard"
 import { PromptPopover, type AtOption, type SlashCommand } from "./prompt-input/slash-popover"
@@ -288,6 +288,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     applyingHistory: boolean
     variantOpen: boolean
     ultracodeSession: boolean
+    // The variant we switched away from when /ultracode boosted reasoning:
+    // `false` = nothing to restore, `null` = restore the default (no variant),
+    // a string = restore that variant.
+    ultracodeRestoreVariant: string | null | false
   }>({
     popover: null,
     historyIndex: -1,
@@ -298,6 +302,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     applyingHistory: false,
     variantOpen: false,
     ultracodeSession: false,
+    ultracodeRestoreVariant: false,
   })
   const [picker, setPicker] = createStore({
     projectOpen: false,
@@ -531,11 +536,30 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       category: language.t("command.category.session"),
       slash: "ultracode",
       onSelect: () => {
-        const result = ultracodeToggle(store.ultracodeSession)
+        // Best-effort reasoning boost on enable (TUI parity): switch to the
+        // strongest variant and remember what to restore on disable. No boost
+        // when the model has no variants or already runs the strongest one.
+        const boost = store.ultracodeSession ? undefined : strongestReasoningVariant(local.model.variant.list())
+        const result = ultracodeToggle(store.ultracodeSession, boost)
         setStore("ultracodeSession", result.next)
+        if (result.next) {
+          if (boost && local.model.variant.current() !== boost) {
+            // Remember what to restore (`null` = the default, no variant).
+            setStore("ultracodeRestoreVariant", local.model.variant.current() ?? null)
+            local.model.variant.set(boost)
+          } else {
+            setStore("ultracodeRestoreVariant", false)
+          }
+        } else if (store.ultracodeRestoreVariant !== false) {
+          local.model.variant.set(store.ultracodeRestoreVariant ?? undefined)
+          setStore("ultracodeRestoreVariant", false)
+        }
         showToast({
           title: language.t(result.toast.title as Parameters<typeof language.t>[0]),
-          description: language.t(result.toast.description as Parameters<typeof language.t>[0]),
+          description: language.t(
+            result.toast.description as Parameters<typeof language.t>[0],
+            boost === undefined ? undefined : { boost },
+          ),
         })
       },
     },
@@ -627,11 +651,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   // Ultracode session mode is per-session: reset it when the active session
   // changes (mirror TUI index.tsx:344-352) so the toggle never leaks across
-  // sessions.
+  // sessions. Unlike the TUI, the variant is deliberately NOT restored here:
+  // app variants are persisted per session (local.tsx write() → setSaved
+  // ('session', …)), so the boosted variant cannot leak onto another session —
+  // only the restore bookmark is dropped.
   createEffect(
     on(
       () => params.id,
-      () => setStore("ultracodeSession", false),
+      () => {
+        setStore("ultracodeSession", false)
+        setStore("ultracodeRestoreVariant", false)
+      },
       { defer: true },
     ),
   )
@@ -739,14 +769,22 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         type: "builtin" as const,
       }))
 
-    const custom = sync.data.command.map((cmd) => ({
-      id: `custom.${cmd.name}`,
-      trigger: cmd.name,
-      title: cmd.name,
-      description: cmd.description,
-      type: "custom" as const,
-      source: cmd.source,
-    }))
+    // Bonus A: the server registers every DISCOVERED workflow as a Command with
+    // source:'workflow' and an EMPTY template (discovery-only). Surfacing those
+    // as 'custom' entries would (a) duplicate/shadow the real type:'workflow'
+    // entries below (their names land in existingNames) and (b) route submits
+    // into session.command with the empty template — no run, no approval gate.
+    // Real commands (command/mcp/skill) keep precedence over workflows.
+    const custom = sync.data.command
+      .filter((cmd) => cmd.source !== "workflow")
+      .map((cmd) => ({
+        id: `custom.${cmd.name}`,
+        trigger: cmd.name,
+        title: cmd.name,
+        description: cmd.description,
+        type: "custom" as const,
+        source: cmd.source,
+      }))
 
     // A workflow that collides with any built-in slash trigger or any server
     // command name is dropped (workflowCommandOptions filter) so a workflow never
@@ -1720,6 +1758,15 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                       </TooltipKeybind>
                     </div>
                   </Show>
+                  {/* Ultracode session badge (TUI parity: the literal token, no i18n). */}
+                  <Show when={store.ultracodeSession}>
+                    <span
+                      data-component="ultracode-badge"
+                      class="shrink-0 px-1 text-11-medium font-bold text-v2-text-text-accent select-none"
+                    >
+                      ULTRACODE
+                    </span>
+                  </Show>
                 </div>
                 <Tooltip placement="top" inactive={!working() && blank()} value={tip()}>
                   <IconButton
@@ -2067,6 +2114,15 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                               />
                             </TooltipKeybind>
                           </div>
+                        </Show>
+                        {/* Ultracode session badge (TUI parity: the literal token, no i18n). */}
+                        <Show when={store.ultracodeSession}>
+                          <span
+                            data-component="ultracode-badge"
+                            class="shrink-0 px-1 text-11-medium font-bold text-v2-text-text-accent select-none"
+                          >
+                            ULTRACODE
+                          </span>
                         </Show>
                       </Show>
                     </Show>

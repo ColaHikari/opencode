@@ -7,6 +7,7 @@ import {
   saveWorkflowPayload,
   saveWorkflowRun,
   selectedAnswer,
+  workflowFinishedNotice,
 } from "./dialog-workflow-client"
 
 // The wire shapes the httpapi serializes for workflow errors (errors.ts +
@@ -190,6 +191,32 @@ describe("saveWorkflowRun status mapping", () => {
     expect(await saveWorkflowRun(throwingSave({}), { name: "n", source: "s" })).toEqual({
       type: "error",
       message: "request failed",
+    })
+  })
+})
+
+describe("workflowFinishedNotice", () => {
+  test("completed → success with no detail", () => {
+    expect(workflowFinishedNotice({ workflow: "review", status: "completed" })).toEqual({
+      done: true,
+      variant: "success",
+    })
+  })
+  test("failed → error with the run error as detail", () => {
+    expect(workflowFinishedNotice({ workflow: "review", status: "failed", error: "agent build exploded" })).toEqual({
+      done: false,
+      variant: "error",
+      detail: "agent build exploded",
+    })
+  })
+  test("failed without an error message falls back to the status text", () => {
+    expect(workflowFinishedNotice({ workflow: "review", status: "failed", error: "" }).detail).toBe("failed")
+  })
+  test("cancelled → error variant with the status as detail (TUI parity)", () => {
+    expect(workflowFinishedNotice({ workflow: "review", status: "cancelled" })).toEqual({
+      done: false,
+      variant: "error",
+      detail: "cancelled",
     })
   })
 })

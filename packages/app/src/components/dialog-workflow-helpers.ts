@@ -30,6 +30,17 @@ export function statusIcon(status: WorkflowRun["status"] | WorkflowRun["agents"]
   return "◌"
 }
 
+// The single app-side source of truth for "can this run be resumed?". Mirrors
+// the engine's RESUMABLE guard (workflow.ts: paused/interrupted plus — since the
+// failed/completed resume landed — failed and completed, both replaying the
+// journal into a NEW run). The dashboard's Resume button and the per-agent
+// re-run derive from this one list, so an engine change lands in exactly one place.
+const RESUMABLE: ReadonlySet<WorkflowRun["status"]> = new Set(["paused", "interrupted", "failed", "completed"])
+
+export function isResumable(status: WorkflowRun["status"]): boolean {
+  return RESUMABLE.has(status)
+}
+
 // N5: the engine never advances/clears `current_phase` at completion, so a run
 // that finished on a non-last declared phase left later phases rendering as
 // `pending` forever. A terminal run will NEVER reach those phases, so they read

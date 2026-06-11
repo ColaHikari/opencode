@@ -26,6 +26,7 @@ import {
   extractReservedBudget,
   parseWorkflowArgs,
   parseWorkflowCommand,
+  resolveDirectWorkflowCommand,
   type WorkflowArgDeclaration,
 } from "./workflow-command"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
@@ -96,7 +97,11 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
 
   const [head, ...tail] = text.split(" ")
   const cmd = head?.startsWith("/") ? head.slice(1) : undefined
-  if (cmd && input.sync.data.command.find((item) => item.name === cmd)) {
+  // Backstop (Bonus A): workflow-sourced commands are discovery-only rows with
+  // an EMPTY template — executing one via session.command would silently no-op
+  // the turn. A `/<name>` draft that still reaches the queue for a workflow
+  // therefore falls through to the plain-prompt path below instead.
+  if (cmd && input.sync.data.command.find((item) => item.name === cmd && item.source !== "workflow")) {
     setBusy()
     try {
       if (!(await wait())) {
@@ -336,6 +341,17 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     // run. This must run BEFORE the generic /command (session.command) branch so a
     // workflow is never sent as a plain custom command. Only in normal mode.
     const workflowCommand = mode === "normal" ? parseWorkflowCommand(text) : undefined
+    // Bonus A: a direct `/<name>` for a DISCOVERED workflow (server-registered
+    // command with source:'workflow' and an empty discovery-only template) must
+    // start a real run instead of falling into the generic /command branch,
+    // which would send session.command with the empty template — no run, no
+    // approval gate. Commands keep precedence: this is only consulted when
+    // parseWorkflowCommand did not already claim the input.
+    const directWorkflow = workflowCommand
+      ? undefined
+      : mode === "normal"
+        ? resolveDirectWorkflowCommand(text, sync.data.command)
+        : undefined
     if (workflowCommand?.type === "dashboard") {
       input.addToHistory(currentPrompt, mode)
       input.resetHistoryNavigation()
@@ -478,7 +494,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       })
     }
 
-    // `/workflow <name>` → start the run. Resolve the workflow's declared
+    // `/workflow <name>` (or a direct `/<name>` resolved against the server's
+    // workflow-sourced commands) → start the run. Resolve the workflow's declared
     // arguments for type-aware coercion, then call workflow.start with the
     // current session as the permission context (mirror TUI index.tsx:1202-1264).
     // An interactive start is gated behind the approval dialog (parity with the
@@ -486,9 +503,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     // whether to ask; "Yes, always" persists consent to workflows.approved.
     // Runs BEFORE the queue check so a workflow start is never deferred into the
     // session.command queue path.
-    if (workflowCommand?.type === "start") {
+    const startCommand = workflowCommand?.type === "start" ? workflowCommand : directWorkflow
+    if (startCommand) {
       clearInput()
-      const { name, args } = workflowCommand
+      const { name, args } = startCommand
       void (async () => {
         try {
           const workflows = await client.workflow

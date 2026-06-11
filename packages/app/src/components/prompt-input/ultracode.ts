@@ -100,26 +100,45 @@ export function budgetDirectiveText(usd: number): string {
   )
 }
 
+// Best-effort reasoning boost (TUI parity: prompt/index.tsx
+// strongestReasoningVariant): variants are the app's effort/reasoning concept.
+// Prefer a known high-effort name, otherwise the last variant (providers order
+// them low → high). Returns undefined when the model has no variants.
+export function strongestReasoningVariant(variants: string[]): string | undefined {
+  if (variants.length === 0) return undefined
+  const preferred = ["max", "ultra", "high", "xhigh", "extra"]
+  for (const name of preferred) {
+    const match = variants.find((variant) => variant.toLowerCase() === name)
+    if (match) return match
+  }
+  return variants[variants.length - 1]
+}
+
 // Pure derivation of the /ultracode session-toggle outcome: given the CURRENT
 // session-mode state, returns the next state plus the i18n keys for the command
 // title and the on/off toast (mirrors the TUI toggle toast, index.tsx:1489-1518).
 // Kept pure (returns keys, not resolved strings) so the toggle logic is unit-
 // testable; the prompt component resolves the keys via language.t and shows the
 // toast. The command title is for the state AFTER the toggle so the menu reads as
-// the action it will perform next.
+// the action it will perform next. `boost` is the reasoning variant the caller is
+// about to switch to when enabling — it selects the boosted on-description
+// (resolved with the {{boost}} param) and is ignored when turning off.
 export type UltracodeToggleResult = {
   next: boolean
   commandTitle: "command.ultracode.enable" | "command.ultracode.disable"
   toast: { title: string; description: string }
 }
 
-export function ultracodeToggle(current: boolean): UltracodeToggleResult {
+export function ultracodeToggle(current: boolean, boost?: string): UltracodeToggleResult {
   const next = !current
   return next
     ? {
         next,
         commandTitle: "command.ultracode.disable",
-        toast: { title: "toast.ultracode.on.title", description: "toast.ultracode.on.description" },
+        toast: {
+          title: "toast.ultracode.on.title",
+          description: boost === undefined ? "toast.ultracode.on.description" : "toast.ultracode.on.descriptionBoosted",
+        },
       }
     : {
         next,
