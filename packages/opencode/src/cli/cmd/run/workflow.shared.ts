@@ -76,7 +76,8 @@ export const RUN_ULTRACODE_DIRECTIVE =
   "The user opted into workflow orchestration for this task (ultracode). " +
   "Author a workflow for it with the workflow tool (action: create, then start) " +
   "instead of working turn by turn. Use parallel/pipeline fan-out and adversarial " +
-  "verification where they fit. Only skip the workflow if the task is trivial or " +
+  "verification where they fit. Discover the work list inline first, then fan the " +
+  "workflow out over it as args. Only skip the workflow if the task is trivial or " +
   "purely conversational."
 
 export function detectUltracodeKeyword(input: string): { index: number; length: number } | undefined {

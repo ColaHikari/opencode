@@ -19,14 +19,16 @@ export const ULTRACODE_PROMPT_DIRECTIVE =
   "The user opted into workflow orchestration for this task (ultracode). " +
   "Author a workflow for it with the workflow tool (action: create, then start) " +
   "instead of working turn by turn. Use parallel/pipeline fan-out and adversarial " +
-  "verification where they fit. Only skip the workflow if the task is trivial or " +
+  "verification where they fit. Discover the work list inline first, then fan the " +
+  "workflow out over it as args. Only skip the workflow if the task is trivial or " +
   "purely conversational."
 
-export const ULTRACODE_SESSION_DIRECTIVE =
-  "Ultracode session mode is ON: for every substantial task, plan and run workflows " +
-  "by default (workflow tool: create + start) — chain understand → change → verify " +
-  "runs when the task has phases. Skip only trivial or conversational turns. Treat " +
-  "explicit requests like 'use a workflow' as the same opt-in."
+// Item 13: there is deliberately NO session directive here anymore. The
+// /ultracode session toggle persists session.metadata.ultracode via PATCH
+// /session/:id; the SERVER then renders the standing opt-in into the system
+// prompt (ULTRACODE_SYSTEM_SECTION) and swaps the workflow tool description —
+// no per-message injection needed. Only the per-turn keyword directive above
+// remains client-side (kept word-identical with the TUI twin).
 
 // Wraps a directive in the <system-reminder> tag — the same state-confirmation
 // convention the TUI uses for editor file selections (formatEditorContext,
@@ -147,18 +149,18 @@ export function ultracodeToggle(current: boolean, boost?: string): UltracodeTogg
       }
 }
 
-// Assembles the ultracode directives to prepend to a normal prompt. `session` is
-// the /ultracode session-toggle state (every turn gets the session directive);
+// Assembles the ultracode directives to prepend to a normal prompt.
 // `keywordEnabled` gates the standalone-keyword detection (config flag). When the
 // keyword is present, it is stripped from the visible user text and the prompt
-// directive is added. Pure so it is unit-testable; the submit path prepends the
-// returned directives as leading text parts before the user text.
-export function buildUltracodeParts(input: { text: string; session: boolean; keywordEnabled: boolean }): {
+// directive is added. Item 13: the /ultracode session toggle no longer injects a
+// per-message directive — it lives server-side as session.metadata.ultracode.
+// Pure so it is unit-testable; the submit path prepends the returned directives
+// as leading text parts before the user text.
+export function buildUltracodeParts(input: { text: string; keywordEnabled: boolean }): {
   directives: string[]
   text: string
 } {
   const directives: string[] = []
-  if (input.session) directives.push(ULTRACODE_SESSION_DIRECTIVE)
   let text = input.text
   if (input.keywordEnabled && detectUltracodeKeyword(input.text)) {
     directives.push(ULTRACODE_PROMPT_DIRECTIVE)

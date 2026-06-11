@@ -11,7 +11,6 @@ import {
   systemReminder,
   ultracodeToggle,
   ULTRACODE_PROMPT_DIRECTIVE,
-  ULTRACODE_SESSION_DIRECTIVE,
 } from "./ultracode"
 
 describe("ultracode keyword", () => {
@@ -29,9 +28,13 @@ describe("ultracode keyword", () => {
     expect(stripUltracodeKeyword("ultracode: audit the repo")).toBe("audit the repo")
     expect(stripUltracodeKeyword("please ultracode this now")).toBe("please this now")
   })
-  test("directives are distinct non-empty constants", () => {
-    expect(ULTRACODE_PROMPT_DIRECTIVE).not.toBe(ULTRACODE_SESSION_DIRECTIVE)
+  // Item 13: the session directive no longer exists client-side — the
+  // /ultracode toggle persists session.metadata.ultracode and the server
+  // carries the standing opt-in in the system prompt.
+  test("the keyword directive is a non-empty constant", () => {
     expect(ULTRACODE_PROMPT_DIRECTIVE.length).toBeGreaterThan(0)
+    // Item 3: hybrid-scout recommendation (kept word-identical with the TUI twin).
+    expect(ULTRACODE_PROMPT_DIRECTIVE).toContain("Discover the work list inline first")
   })
 })
 
@@ -40,28 +43,27 @@ describe("systemReminder", () => {
     expect(systemReminder("X")).toBe("<system-reminder>X</system-reminder>")
   })
   test("wrapped directives keep the original wording", () => {
-    const wrapped = systemReminder(ULTRACODE_SESSION_DIRECTIVE)
-    expect(wrapped).toContain(ULTRACODE_SESSION_DIRECTIVE)
+    const wrapped = systemReminder(ULTRACODE_PROMPT_DIRECTIVE)
+    expect(wrapped).toContain(ULTRACODE_PROMPT_DIRECTIVE)
     expect(wrapped.startsWith("<system-reminder>")).toBe(true)
     expect(wrapped.endsWith("</system-reminder>")).toBe(true)
   })
 })
 
 describe("buildUltracodeParts", () => {
-  test("prepends session + keyword directives and strips keyword", () => {
-    const out = buildUltracodeParts({ text: "ultracode fix bug", session: true, keywordEnabled: true })
-    expect(out.directives).toContain(ULTRACODE_SESSION_DIRECTIVE)
-    expect(out.directives).toContain(ULTRACODE_PROMPT_DIRECTIVE)
+  test("prepends the keyword directive and strips the keyword", () => {
+    const out = buildUltracodeParts({ text: "ultracode fix bug", keywordEnabled: true })
+    expect(out.directives).toEqual([ULTRACODE_PROMPT_DIRECTIVE])
     expect(out.text).toBe("fix bug")
   })
-  test("no directives when off and no keyword", () => {
-    expect(buildUltracodeParts({ text: "fix bug", session: false, keywordEnabled: true })).toEqual({
+  test("no directives without a keyword", () => {
+    expect(buildUltracodeParts({ text: "fix bug", keywordEnabled: true })).toEqual({
       directives: [],
       text: "fix bug",
     })
   })
   test("keyword directive suppressed when keywordEnabled is false", () => {
-    const out = buildUltracodeParts({ text: "ultracode fix bug", session: false, keywordEnabled: false })
+    const out = buildUltracodeParts({ text: "ultracode fix bug", keywordEnabled: false })
     expect(out.directives).toEqual([])
     expect(out.text).toBe("ultracode fix bug")
   })
@@ -107,7 +109,7 @@ describe("buildBudgetPart", () => {
     expect(buildBudgetPart({ text: "do x", enabled: true })).toEqual({ text: "do x" })
   })
   test("composes with the ultracode strip (ultracode first, budget second)", () => {
-    const ultracode = buildUltracodeParts({ text: "ultracode +$5 audit src/", session: false, keywordEnabled: true })
+    const ultracode = buildUltracodeParts({ text: "ultracode +$5 audit src/", keywordEnabled: true })
     const budget = buildBudgetPart({ text: ultracode.text, enabled: true })
     expect(budget.text).toBe("audit src/")
     expect(budget.usd).toBe(5)

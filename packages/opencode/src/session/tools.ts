@@ -99,6 +99,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     modelID: ModelV2.ID.make(input.model.api.id),
     providerID: input.model.providerID,
     agent: input.agent,
+    // Item 13: ultracode sessions get the workflow tool with the standing
+    // "quality over cost" gate instead of the anti-default sentence.
+    ultracode: input.session.metadata?.["ultracode"] === true,
   })) {
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({

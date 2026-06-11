@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import type { Prompt } from "@/context/prompt"
 import type { FollowupDraft } from "./submit"
-import { ULTRACODE_PROMPT_DIRECTIVE, ULTRACODE_SESSION_DIRECTIVE } from "./ultracode"
+import { ULTRACODE_PROMPT_DIRECTIVE } from "./ultracode"
 import { resetSessionApprovalForTest } from "@/components/dialog-workflow-approval-helpers"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
@@ -36,6 +36,9 @@ const promptParts: Array<Array<{ type: string; text?: string; synthetic?: boolea
 // Recorder for session.command: Bonus A asserts a workflow-sourced /<name> is
 // NEVER executed as a session command (the empty-template bug).
 const sessionCommands: Array<{ directory: string; command: string; arguments?: string }> = []
+// Item 13: recorder for session.update — the ultracode toggle/submit persists
+// session.metadata.ultracode via PATCH.
+const sessionUpdates: Array<{ directory: string; sessionID: string; metadata?: Record<string, unknown> }> = []
 // The server-registered command list surfaced via sync.data.command; entries
 // with source:'workflow' are the discovery-only rows (empty template).
 let commandList: Array<{ name: string; description?: string; source?: string }> = []
@@ -87,6 +90,10 @@ const clientFor = (directory: string) => {
         return { data: undefined }
       },
       abort: async () => ({ data: undefined }),
+      update: async (input: { sessionID: string; metadata?: Record<string, unknown> }) => {
+        sessionUpdates.push({ directory, sessionID: input.sessionID, metadata: input.metadata })
+        return { data: undefined }
+      },
     },
     workflow: {
       list: async () => ({ data: workflowListData }),
@@ -320,6 +327,7 @@ beforeEach(() => {
   toasts.length = 0
   promptParts.length = 0
   sessionCommands.length = 0
+  sessionUpdates.length = 0
   commandList = []
   dashboardOpened = 0
   workflowListData = []
@@ -685,7 +693,10 @@ describe("workflow command routing on submit", () => {
 })
 
 describe("ultracode injection on submit", () => {
-  test("sends the session directive as a leading synthetic system-reminder part", async () => {
+  // Item 13: the session toggle no longer injects a per-message directive —
+  // the flag lives server-side (session.metadata.ultracode) and the server
+  // renders the standing opt-in into the system prompt.
+  test("session mode injects NO per-message directive part", async () => {
     params = { id: "session-1" }
     ultracodeSession = true
     promptValue = [{ type: "text", content: "fix the bug", start: 0, end: 11 }]
@@ -696,14 +707,47 @@ describe("ultracode injection on submit", () => {
     await flush()
 
     expect(promptParts).toHaveLength(1)
-    const [first, second] = promptParts[0]
-    expect(first).toMatchObject({ type: "text", synthetic: true })
-    expect(first?.text).toStartWith("<system-reminder>")
-    expect(first?.text).toEndWith("</system-reminder>")
-    expect(first?.text).toContain("Ultracode session mode is ON")
-    // The visible user part is the pure user text — no directive wording.
-    expect(second).toMatchObject({ type: "text", text: "fix the bug" })
-    expect(second?.synthetic).toBeUndefined()
+    expect(promptParts[0].some((part) => part.synthetic)).toBe(false)
+    const [first] = promptParts[0]
+    expect(first).toMatchObject({ type: "text", text: "fix the bug" })
+  })
+
+  // Item 13: toggling before the first session keeps the flag local; the
+  // submit path PATCHes session.metadata.ultracode onto the fresh session so
+  // the very first prompt already runs with the server-side standing opt-in.
+  test("a new session created while ultracode is on gets metadata.ultracode PATCHed", async () => {
+    params = {}
+    ultracodeSession = true
+    promptValue = [{ type: "text", content: "fix the bug", start: 0, end: 11 }]
+    const submit = createPromptSubmit({
+      ...workflowInput(),
+      info: () => undefined,
+      newSessionWorktree: () => "main",
+    })
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(createdSessions).toEqual(["/repo/main"])
+    expect(sessionUpdates).toEqual([
+      { directory: "/repo/main", sessionID: "session-1", metadata: { ultracode: true } },
+    ])
+  })
+
+  test("a new session with ultracode off is never PATCHed", async () => {
+    params = {}
+    promptValue = [{ type: "text", content: "fix the bug", start: 0, end: 11 }]
+    const submit = createPromptSubmit({
+      ...workflowInput(),
+      info: () => undefined,
+      newSessionWorktree: () => "main",
+    })
+
+    await submit.handleSubmit(event)
+    await flush()
+
+    expect(createdSessions).toEqual(["/repo/main"])
+    expect(sessionUpdates).toEqual([])
   })
 
   test("strips the keyword from the visible part and sends the prompt directive as reminder part", async () => {
@@ -796,9 +840,10 @@ describe("ultracode injection on submit", () => {
 
     // The turn is queued, not sent; the draft transports the directives so
     // sendFollowupDraft emits them later (pages/session.tsx followup path).
+    // Item 13: only the keyword directive travels — session mode is server-side.
     expect(promptParts).toEqual([])
     expect(queued).toHaveLength(1)
-    expect(queued[0]?.directives).toEqual([ULTRACODE_SESSION_DIRECTIVE, ULTRACODE_PROMPT_DIRECTIVE])
+    expect(queued[0]?.directives).toEqual([ULTRACODE_PROMPT_DIRECTIVE])
     expect(queued[0]?.prompt).toEqual([{ type: "text", content: "fix the bug", start: 0, end: 0 }])
   })
 })

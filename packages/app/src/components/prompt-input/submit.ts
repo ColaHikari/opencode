@@ -438,6 +438,14 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       if (created) {
         seed(sessionDirectory, created)
         session = created
+        // Item 13: the ultracode toggle was flipped before this session existed
+        // — persist the flag now so the very first prompt already gets the
+        // server-side standing opt-in (fresh session, nothing to merge).
+        if (input.ultracodeSession()) {
+          void client.session
+            .update({ sessionID: created.id, metadata: { ultracode: true } })
+            .catch(() => {})
+        }
         if (shouldAutoAccept) permission.enableAutoAccept(session.id, sessionDirectory)
         local.session.promote(sessionDirectory, session.id)
         layout.handoff.setTabs(base64Encode(sessionDirectory), session.id)
@@ -592,10 +600,12 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     // visible text (TUI consistency; the original leaves it standing — that
     // call is owned by the TUI part of this parity item and must stay uniform
     // across UIs). Runs before the queue branch so queued followups carry
-    // their directives too.
+    // their directives too. Item 13: only the per-turn keyword directive is
+    // injected here — the session toggle lives server-side as
+    // session.metadata.ultracode and needs no per-message part.
     if (mode === "normal" && !text.trimStart().startsWith("/")) {
       const keywordEnabled = sync.data.config?.workflows?.ultracode_keyword ?? true
-      const ultracode = buildUltracodeParts({ text, session: input.ultracodeSession(), keywordEnabled })
+      const ultracode = buildUltracodeParts({ text, keywordEnabled })
       // Budget directive (`+$<n>`): applied AFTER the ultracode strip, on
       // ultracode.text, so the strip order is deterministic (ultracode first,
       // budget second). The config gate (workflows.budget_directive) lands with

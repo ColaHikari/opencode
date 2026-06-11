@@ -53,7 +53,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Workflow } from "@/workflow/workflow"
-import { WorkflowTool } from "./workflow"
+import { WorkflowTool, workflowDescription } from "./workflow"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -77,6 +77,13 @@ export interface Interface {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
     agent: Agent.Info
+    /**
+     * Item 13: session.metadata.ultracode === true. Swaps the workflow tool's
+     * anti-default gate sentence for the standing "quality over cost" opt-in.
+     * Runs per prompt (descriptions are baked at Tool.init, so this is the
+     * only seam that can vary by session).
+     */
+    ultracode?: boolean
   }) => Effect.Effect<Tool.Def[]>
 }
 
@@ -296,9 +303,17 @@ export const layer = Layer.effect(
             output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
               ? output.jsonSchema
               : undefined
+          // Item 13: ultracode sessions swap the workflow tool's gate sentence
+          // (after plugin.trigger, like the task-roster append below). A plugin
+          // that overrode the description via tool.definition wins — the swap
+          // only applies while the description is still the built-in default.
+          const description =
+            tool.id === WorkflowTool.id && input.ultracode && output.description === workflowDescription(false)
+              ? workflowDescription(true)
+              : output.description
           return {
             id: tool.id,
-            description: [output.description, tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined]
+            description: [description, tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined]
               .filter(Boolean)
               .join("\n"),
             parameters: output.parameters,

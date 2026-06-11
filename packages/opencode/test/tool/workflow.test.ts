@@ -8,7 +8,7 @@ import os from "os"
 import path from "path"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
-import { WorkflowTool } from "@/tool/workflow"
+import { WorkflowTool, workflowDescription, WORKFLOW_GATE_DEFAULT, WORKFLOW_GATE_ULTRACODE } from "@/tool/workflow"
 import AUTHORING_GUIDE from "@/tool/workflow.txt"
 import { Workflow } from "@/workflow/workflow"
 import { Session } from "@/session/session"
@@ -2352,6 +2352,75 @@ export async function run(args, ctx) { if (args.hang) await new Promise(() => {}
         const result = yield* tool.execute({ action: "start", name: "bg", background: "true" }, recorder.ctx)
         // background "true" decoded to a real boolean: the run took the background path.
         expect(result.metadata.background).toBe(true)
+      }),
+    ),
+  )
+})
+
+// Item 3: the DESCRIPTION names the explicit trigger list, the offer path with
+// its cost mention, and the hybrid-scout recommendation — and mentions
+// 'pipeline' (the one-line authoring doctrine).
+describe("tool.workflow description hardening", () => {
+  it.live("workflow tool description names triggers, offer path, and hybrid scouting", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const tool = yield* workflowTool()
+        expect(tool.description).toContain("ultracode")
+        expect(tool.description).toContain("OFFER a workflow")
+        expect(tool.description).toContain("extra cost")
+        expect(tool.description).toContain("discover the work list inline first")
+        expect(tool.description).toContain("pipeline")
+      }),
+    ),
+  )
+
+  // The trigger/offer/hybrid sentences are UNCONDITIONAL: both gate variants
+  // carry them (item 13 swaps only the gate sentence).
+  it.effect("trigger guidance is present in both gate variants", () =>
+    Effect.gen(function* () {
+      for (const variant of [workflowDescription(false), workflowDescription(true)]) {
+        expect(variant).toContain("OFFER a workflow")
+        expect(variant).toContain("extra cost")
+        expect(variant).toContain("discover the work list inline first")
+        expect(variant).toContain("pipeline")
+      }
+    }),
+  )
+})
+
+// Item 13: ultracode sessions swap ONLY the gate sentence of the workflow tool
+// description ("quality over cost" instead of the anti-default rule). The swap
+// happens per prompt in ToolRegistry.tools (descriptions are baked at Tool.init).
+describe("tool.workflow ultracode description swap", () => {
+  it.effect("workflowDescription swaps exactly the gate sentence", () =>
+    Effect.gen(function* () {
+      const standard = workflowDescription(false)
+      const ultracode = workflowDescription(true)
+      expect(standard).toContain(WORKFLOW_GATE_DEFAULT)
+      expect(standard).not.toContain(WORKFLOW_GATE_ULTRACODE)
+      expect(ultracode).toContain(WORKFLOW_GATE_ULTRACODE)
+      expect(ultracode).toContain("quality over cost")
+      expect(ultracode).not.toContain("Do not use workflows by default")
+      // Everything except the gate line is identical in both variants.
+      expect(standard.replace(WORKFLOW_GATE_DEFAULT, "")).toBe(ultracode.replace(WORKFLOW_GATE_ULTRACODE, ""))
+    }),
+  )
+
+  it.live("ultracode flag swaps the workflow tool gate to quality over cost", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const registry = yield* ToolRegistry.Service
+        const agent = { name: "build", mode: "primary" as const, permission: [], options: {} }
+        const base = { providerID: ProviderV2.ID.opencode, modelID: ModelV2.ID.make("gpt-5"), agent }
+        const swapped = (yield* registry.tools({ ...base, ultracode: true })).find(
+          (tool) => tool.id === WorkflowTool.id,
+        )
+        expect(swapped?.description).toContain("quality over cost")
+        expect(swapped?.description).not.toContain("Do not use workflows by default")
+        // Counter-check: without the flag the anti-default gate stays in place.
+        const standard = (yield* registry.tools(base)).find((tool) => tool.id === WorkflowTool.id)
+        expect(standard?.description).toContain("Do not use workflows by default")
+        expect(standard?.description).not.toContain("quality over cost")
       }),
     ),
   )

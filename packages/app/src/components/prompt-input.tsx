@@ -542,6 +542,19 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         const boost = store.ultracodeSession ? undefined : strongestReasoningVariant(local.model.variant.list())
         const result = ultracodeToggle(store.ultracodeSession, boost)
         setStore("ultracodeSession", result.next)
+        // Item 13: persist the flag server-side (session.metadata.ultracode) so
+        // the system prompt carries the standing opt-in and the workflow tool
+        // description swaps its gate. PATCH replaces the whole metadata record,
+        // so merge the synced keys. Toggling before the first session keeps the
+        // flag local; the submit path PATCHes the freshly created session.
+        if (params.id) {
+          void sdk.client.session
+            .update({
+              sessionID: params.id,
+              metadata: { ...(info()?.metadata ?? {}), ultracode: result.next },
+            })
+            .catch(() => {})
+        }
         if (result.next) {
           if (boost && local.model.variant.current() !== boost) {
             // Remember what to restore (`null` = the default, no variant).
@@ -649,18 +662,27 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onCleanup(() => clearInterval(interval))
   })
 
-  // Ultracode session mode is per-session: reset it when the active session
-  // changes (mirror TUI index.tsx:344-352) so the toggle never leaks across
-  // sessions. Unlike the TUI, the variant is deliberately NOT restored here:
+  // Ultracode session mode is per-session: re-initialize it from the SERVER
+  // flag (session.metadata.ultracode, item 13) when the active session changes
+  // (mirror TUI prompt/index.tsx) so the toggle never leaks across sessions and
+  // the server stays the source of truth. Within a session, a metadata change
+  // (our own PATCH landing, or another client toggling) is followed too.
+  // Unlike the TUI, the variant is deliberately NOT restored here:
   // app variants are persisted per session (local.tsx write() → setSaved
   // ('session', …)), so the boosted variant cannot leak onto another session —
   // only the restore bookmark is dropped.
   createEffect(
     on(
-      () => params.id,
-      () => {
-        setStore("ultracodeSession", false)
-        setStore("ultracodeRestoreVariant", false)
+      () =>
+        [params.id, params.id ? sync.session.get(params.id)?.metadata?.["ultracode"] === true : false] as const,
+      ([sessionID, serverFlag], prev) => {
+        const sessionChanged = prev === undefined || prev[0] !== sessionID
+        if (sessionChanged) {
+          setStore("ultracodeSession", serverFlag)
+          setStore("ultracodeRestoreVariant", false)
+          return
+        }
+        if (serverFlag !== store.ultracodeSession) setStore("ultracodeSession", serverFlag)
       },
       { defer: true },
     ),

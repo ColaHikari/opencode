@@ -7,7 +7,6 @@ import {
   stripUltracodeKeyword,
   ultracodeReminder,
   ULTRACODE_PROMPT_DIRECTIVE,
-  ULTRACODE_SESSION_DIRECTIVE,
 } from "../../../../src/component/prompt/ultracode"
 
 describe("ultracode keyword", () => {
@@ -28,10 +27,12 @@ describe("ultracode keyword", () => {
     expect(stripUltracodeKeyword("bitte ultracode  nutzen")).toBe("bitte nutzen")
   })
 
-  it("Direktiven nennen workflow-Tool, create und substantial", () => {
+  // Item 13: die Session-Direktive existiert klientenseitig nicht mehr — der
+  // /ultracode-Toggle persistiert session.metadata.ultracode, der Server trägt
+  // das standing opt-in im Systemprompt. Nur die Keyword-Direktive bleibt.
+  it("Direktive nennt workflow-Tool und create", () => {
     expect(ULTRACODE_PROMPT_DIRECTIVE).toContain("workflow")
     expect(ULTRACODE_PROMPT_DIRECTIVE).toContain("create")
-    expect(ULTRACODE_SESSION_DIRECTIVE).toContain("substantial")
   })
 
   // Edge cases beyond the mandated spec. Boundaries follow identifier rules:
@@ -77,12 +78,11 @@ describe("ultracode keyword", () => {
     expect(stripUltracodeKeyword("ultracode  ")).toBe("")
   })
 
-  it("Direktiven transportieren die volle opt-in Semantik", () => {
+  it("Direktive transportiert die volle opt-in Semantik", () => {
     expect(ULTRACODE_PROMPT_DIRECTIVE).toContain("ultracode")
     expect(ULTRACODE_PROMPT_DIRECTIVE).toContain("start")
-    expect(ULTRACODE_SESSION_DIRECTIVE).toContain("workflow")
-    expect(ULTRACODE_SESSION_DIRECTIVE).toContain("create")
-    expect(ULTRACODE_SESSION_DIRECTIVE).toContain("ON")
+    // Item 3: Hybrid-Scout-Empfehlung — Arbeitsliste inline entdecken, dann fan-out.
+    expect(ULTRACODE_PROMPT_DIRECTIVE).toContain("Discover the work list inline first")
   })
 
   it("ultracodeReminder wrappt in <system-reminder>", () => {
@@ -90,7 +90,7 @@ describe("ultracode keyword", () => {
   })
 
   it("gewrappte Direktiven enthalten den Originalwortlaut", () => {
-    for (const directive of [ULTRACODE_SESSION_DIRECTIVE, ULTRACODE_PROMPT_DIRECTIVE]) {
+    for (const directive of [ULTRACODE_PROMPT_DIRECTIVE]) {
       const wrapped = ultracodeReminder(directive)
       expect(wrapped).toContain(directive)
       expect(wrapped.startsWith("<system-reminder>")).toBeTrue()

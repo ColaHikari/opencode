@@ -81,7 +81,6 @@ import {
   stripUltracodeKeyword,
   ultracodeReminder,
   ULTRACODE_PROMPT_DIRECTIVE,
-  ULTRACODE_SESSION_DIRECTIVE,
 } from "./ultracode"
 import { readLocalAttachment } from "./local-attachment"
 
@@ -267,8 +266,12 @@ export function Prompt(props: PromptProps) {
   let budgetDirectiveTypeId = 0
   const event = useEvent()
 
-  // Session toggle (/ultracode): when on, every submit gets the session directive
-  // prepended. State lives on the session, not config, so it resets per session.
+  // Session toggle (/ultracode). Item 13: the flag is persisted SERVER-side as
+  // session.metadata.ultracode (PATCH /session/:id); the server renders the
+  // standing opt-in into the system prompt and swaps the workflow tool's gate
+  // sentence — there is no per-message session directive anymore. This signal
+  // mirrors the server flag for the badge/toggle UI and is initialized from the
+  // synced session metadata on every session switch (server = source of truth).
   const [ultracodeSession, setUltracodeSession] = createSignal(false)
   // The variant we switched away from when boosting reasoning, so we can restore
   // it when the session toggle is turned off.
@@ -375,16 +378,28 @@ export function Prompt(props: PromptProps) {
 
   createEffect(
     on(
-      () => props.sessionID,
-      () => {
-        setStore("placeholder", randomIndex(list().length))
-        // Ultracode session mode is session-scoped state, so reset it whenever the
-        // session changes. The reasoning-variant boost is disk-persistent model
-        // state, so restore the pre-boost variant before clearing — otherwise the
-        // boost leaks onto the model for the next session.
-        if (ultracodeSession() && ultracodeRestoreVariant !== false) local.model.variant.set(ultracodeRestoreVariant)
-        setUltracodeSession(false)
-        ultracodeRestoreVariant = false
+      () =>
+        [
+          props.sessionID,
+          props.sessionID ? sync.session.get(props.sessionID)?.metadata?.["ultracode"] === true : false,
+        ] as const,
+      ([sessionID, serverFlag], prev) => {
+        const sessionChanged = prev === undefined || prev[0] !== sessionID
+        if (sessionChanged) {
+          setStore("placeholder", randomIndex(list().length))
+          // Ultracode session mode is session-scoped state, so re-initialize it
+          // from the SERVER flag whenever the session changes. The reasoning-
+          // variant boost is disk-persistent model state, so restore the
+          // pre-boost variant before clearing — otherwise the boost leaks onto
+          // the model for the next session.
+          if (ultracodeSession() && ultracodeRestoreVariant !== false) local.model.variant.set(ultracodeRestoreVariant)
+          setUltracodeSession(serverFlag)
+          ultracodeRestoreVariant = false
+          return
+        }
+        // Same session, server flag changed: our own PATCH landed (no-op) or
+        // another client toggled the flag — follow the server either way.
+        if (serverFlag !== ultracodeSession()) setUltracodeSession(serverFlag)
       },
       { defer: true },
     ),
@@ -1151,6 +1166,13 @@ export function Prompt(props: PromptProps) {
       }
 
       sessionID = res.data.id
+
+      // Item 13: the toggle was flipped before this session existed — persist
+      // the flag now so the very first prompt already gets the server-side
+      // standing opt-in (fresh session, nothing to merge).
+      if (ultracodeSession()) {
+        void sdk.client.session.update({ sessionID, metadata: { ultracode: true } })
+      }
     }
 
     // Paste-placeholder spans tracked on the RAW input. Expansion is positional, so
@@ -1307,13 +1329,13 @@ export function Prompt(props: PromptProps) {
       return true
     }
 
-    // Ultracode opt-in (normal prompt path only). The session directive rides every
-    // substantial submit while the toggle is on; the keyword directive fires for the
+    // Ultracode opt-in (normal prompt path only). The keyword directive fires for the
     // single turn that contains a standalone `ultracode` token, which is stripped from
-    // the visible text. Both are prepended as synthetic text parts so the agent sees
-    // the orchestration instruction before the user's words. Both ride inside the
+    // the visible text; it is prepended as a synthetic text part so the agent sees
+    // the orchestration instruction before the user's words, inside the
     // <system-reminder> wrapper (state confirmation convention), so the model reads
-    // them as harness state, not user prose.
+    // it as harness state, not user prose. The session toggle is server-side state
+    // (session.metadata.ultracode, see toggleUltracodeSession) and injects nothing here.
     //
     // Deliberate deviation from the original, which leaves the keyword in the visible
     // text: we keep stripping it because the reminder restates the opt-in in full, the
@@ -1353,10 +1375,10 @@ export function Prompt(props: PromptProps) {
           return sentinels.reduce((acc, s) => acc.replace(s.sentinel, s.text), stripped)
         })()
       : inputText
+    // Item 13: no session-directive part anymore — the session toggle persists
+    // session.metadata.ultracode and the SERVER carries the standing opt-in via
+    // the system prompt. Only the per-turn keyword and budget reminders remain.
     const ultracodeParts = [
-      ...(ultracodeSession()
-        ? [{ type: "text" as const, text: ultracodeReminder(ULTRACODE_SESSION_DIRECTIVE), synthetic: true }]
-        : []),
       ...(keywordActive
         ? [{ type: "text" as const, text: ultracodeReminder(ULTRACODE_PROMPT_DIRECTIVE), synthetic: true }]
         : []),
@@ -1641,6 +1663,20 @@ export function Prompt(props: PromptProps) {
   function toggleUltracodeSession() {
     const next = !ultracodeSession()
     setUltracodeSession(next)
+
+    // Item 13: persist the flag server-side so the system prompt carries the
+    // standing opt-in and the workflow tool description swaps its gate. PATCH
+    // replaces the whole metadata record, so merge the synced keys. Toggling
+    // before the first session keeps the flag local; the submit path PATCHes it
+    // onto the freshly created session.
+    const sessionID = props.sessionID
+    if (sessionID) {
+      const current = sync.session.get(sessionID)
+      void sdk.client.session.update({
+        sessionID,
+        metadata: { ...(current?.metadata ?? {}), ultracode: next },
+      })
+    }
 
     const boost = strongestReasoningVariant()
     if (next) {

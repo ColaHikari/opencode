@@ -1357,7 +1357,9 @@ export const layer = Layer.effect(
           yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
           const [skills, env, instructions, modelMsgs] = yield* Effect.all([
-            sys.skills(agent),
+            // Item 13: session.metadata.ultracode appends the standing workflow
+            // opt-in section (replaces the clients' per-message session directive).
+            sys.skills(agent, { ultracode: session.metadata?.["ultracode"] === true }),
             sys.environment(model),
             instruction.system().pipe(Effect.orDie),
             MessageV2.toModelMessagesEffect(msgs, model),

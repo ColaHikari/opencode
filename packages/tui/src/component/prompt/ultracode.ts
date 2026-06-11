@@ -19,14 +19,16 @@ export const ULTRACODE_PROMPT_DIRECTIVE =
   "The user opted into workflow orchestration for this task (ultracode). " +
   "Author a workflow for it with the workflow tool (action: create, then start) " +
   "instead of working turn by turn. Use parallel/pipeline fan-out and adversarial " +
-  "verification where they fit. Only skip the workflow if the task is trivial or " +
+  "verification where they fit. Discover the work list inline first, then fan the " +
+  "workflow out over it as args. Only skip the workflow if the task is trivial or " +
   "purely conversational."
 
-export const ULTRACODE_SESSION_DIRECTIVE =
-  "Ultracode session mode is ON: for every substantial task, plan and run workflows " +
-  "by default (workflow tool: create + start) — chain understand → change → verify " +
-  "runs when the task has phases. Skip only trivial or conversational turns. Treat " +
-  "explicit requests like 'use a workflow' as the same opt-in."
+// Item 13: there is deliberately NO session directive here anymore. The
+// /ultracode session toggle persists session.metadata.ultracode via PATCH
+// /session/:id; the SERVER then renders the standing opt-in into the system
+// prompt (ULTRACODE_SYSTEM_SECTION) and swaps the workflow tool description —
+// no per-message injection needed. Only the per-turn keyword directive above
+// remains client-side.
 
 // Wraps an injected directive in the <system-reminder> convention the TUI already
 // uses for state/context confirmations — same wrapper as formatEditorContext

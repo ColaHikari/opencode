@@ -143,18 +143,56 @@ const Parameters = Schema.Struct({
 type Params = Schema.Schema.Type<typeof Parameters>
 type Metadata = Record<string, unknown>
 
-const DESCRIPTION = [
-  "Manage workflows (project .opencode/workflows, global config workflows, and built-in workflows) through one action-based tool.",
-  "Do not use workflows by default. Use this only when the user explicitly asks for a workflow, asks to create one, or confirms workflow automation.",
-  "Actions:",
-  "- read: with name, return one workflow's metadata, arguments, phases, and path; WITHOUT name, return the workflow AUTHORING GUIDE (module shape, ctx API, patterns, copyable examples) plus all available workflows. Read the guide before writing or editing any workflow source.",
-  "- start: start a workflow (project, global, or built-in). Waits a short grace window (default 45s); a run still going then continues in the background and notifies this session on completion. background=true returns immediately; background=false or an explicit timeout keeps the old foreground wait. script_path starts a script file directly (edit + re-invoke to iterate).",
-  "- wait: wait for a running workflow by run_id.",
-  "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
-  "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
-  "- cancel: stop a running workflow run by run_id (terminal; already-finished runs are returned as-is).",
-  "- pause: suspend a running run, keeping its completed-agent journal; resume later by starting the same workflow with resume_of=<run_id>.",
+// Item 13: the gate sentence is the ONLY conditional piece of the description.
+// Default sessions keep the anti-default gate; an ultracode session
+// (session.metadata.ultracode === true) swaps it for the standing opt-in below.
+// ToolRegistry.tools() performs the swap per prompt — tool descriptions are
+// baked into InstanceState at Tool.init, so there is no per-execute ctx here.
+export const WORKFLOW_GATE_DEFAULT =
+  "Do not use workflows by default. Use this only when the user explicitly asks for a workflow, asks to create one, or confirms workflow automation."
+
+export const WORKFLOW_GATE_ULTRACODE =
+  "Ultracode session mode is ON for this session: quality over cost. Author and run workflows by default for every substantial task (create + start, chain understand → change → verify runs); skip only trivial or conversational turns."
+
+// Item 13: the systemprompt counterpart of WORKFLOW_GATE_ULTRACODE (single
+// source of truth — session/system.ts imports this instead of duplicating the
+// wording). Appended after the workflow section when the session flag is on.
+export const ULTRACODE_SYSTEM_SECTION = [
+  WORKFLOW_GATE_ULTRACODE,
+  "This is a standing opt-in for the whole session; you do not need a per-message trigger.",
 ].join("\n")
+
+// Item 3: trigger list, offer path (with cost mention), and hybrid-scout
+// recommendation. Shared verbatim between this DESCRIPTION and the workflow
+// section of the system prompt (session/system.ts imports it — single source,
+// no drift). UNCONDITIONAL: present in both gate variants; workflowDescription
+// swaps ONLY the gate sentence, never these.
+export const WORKFLOW_TRIGGER_GUIDANCE: string[] = [
+  "Use a workflow when one of these triggers applies: the user writes the keyword 'ultracode'; ultracode session mode is on; the user literally asks to run, create, or automate a workflow; a skill or AGENTS.md file instructs you to use one; or the user invokes a workflow by name. Otherwise do not start workflows on your own.",
+  "If no trigger applies but a task would clearly benefit from parallel fan-out across many independent items, OFFER a workflow and mention the extra cost (every agent step is a separate subagent session) — do not start one unasked.",
+  "Hybrid scouting: discover the work list inline first (grep/glob/read in this session), then write a workflow that receives that list as args and fans out — do not burn agent steps on discovery a single grep can do.",
+]
+
+export function workflowDescription(ultracode: boolean): string {
+  return [
+    "Manage workflows (project .opencode/workflows, global config workflows, and built-in workflows) through one action-based tool.",
+    ultracode ? WORKFLOW_GATE_ULTRACODE : WORKFLOW_GATE_DEFAULT,
+    ...WORKFLOW_TRIGGER_GUIDANCE,
+    // Item 3: one-line authoring doctrine (the full version lives in the
+    // action=read guide, workflow.txt) so 'pipeline' shows up here too.
+    "Inside workflow source, default to per-item ctx.pipeline chains; insert a parallel barrier only when a step must see all items at once.",
+    "Actions:",
+    "- read: with name, return one workflow's metadata, arguments, phases, and path; WITHOUT name, return the workflow AUTHORING GUIDE (module shape, ctx API, patterns, copyable examples) plus all available workflows. Read the guide before writing or editing any workflow source.",
+    "- start: start a workflow (project, global, or built-in). Waits a short grace window (default 45s); a run still going then continues in the background and notifies this session on completion. background=true returns immediately; background=false or an explicit timeout keeps the old foreground wait. script_path starts a script file directly (edit + re-invoke to iterate).",
+    "- wait: wait for a running workflow by run_id.",
+    "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
+    "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
+    "- cancel: stop a running workflow run by run_id (terminal; already-finished runs are returned as-is).",
+    "- pause: suspend a running run, keeping its completed-agent journal; resume later by starting the same workflow with resume_of=<run_id>.",
+  ].join("\n")
+}
+
+const DESCRIPTION = workflowDescription(false)
 
 function promptOps(ctx: Tool.Context) {
   const ops = ctx.extra?.promptOps
