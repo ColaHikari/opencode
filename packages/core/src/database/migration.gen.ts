@@ -38,5 +38,7 @@ export const migrations = (
     import("./migration/20260606101213_add_workflow_run_directory"),
     import("./migration/20260606172815_workflow_run_paused_resume"),
     import("./migration/20260607000000_workflow_run_pending_question"),
+    import("./migration/20260611035744_credential"),
+    import("./migration/20260611192811_lush_chimera"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

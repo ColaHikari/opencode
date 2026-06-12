@@ -7700,6 +7700,9 @@ export async function run(args, ctx) {
     }),
     // Item 23: kill-switch — see the budget shell test above.
     { config: { workflows: { shell_permission: false } } },
+    // The body sleeps 4s by design (leak window) — the 5s default timeout
+    // leaves <1s for spawn + poll + cancel.
+    15000,
   )
 
   // Item 23 (Stufe 1, deny): a caller session carrying a bash DENY rule gates
