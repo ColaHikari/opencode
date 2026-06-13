@@ -2928,8 +2928,9 @@ export async function run(_args, ctx) { return await ctx.workflow("bad-child") }
       // Abort-Kaskade bereits durchgelaufen sind (das rennt unter CPU-Last gegen
       // den fire-and-forget-Settlement-Pfad), wird hier auf die echte Bedingung
       // gewartet: Run `completed`, der noch laufende Node terminal als `failed`
-      // geschlossen (Grund + Zeit) UND die hängende Child-Session tatsächlich in
-      // der Fixture als gestartet + abgebrochen vermerkt.
+      // geschlossen (Grund + Zeit). If a child session was registered before
+      // terminalization, it must also be aborted; if no child session was ever
+      // created, there is nothing that can keep spending.
       const done = yield* pollWithTimeout(
         Effect.gen(function* () {
           const current = yield* workflow.get(run.id)
@@ -2938,15 +2939,15 @@ export async function run(_args, ctx) { return await ctx.workflow("bad-child") }
           if (current.agents.some((a) => a.status === "running")) return undefined
           const closed = current.agents.find((a) => a.status === "failed")
           if (!closed || !((closed.completed_at ?? 0) > 0) || !closed.error) return undefined
-          const child = current.agents[0]?.session_id
-          if (!child || !started.has(child) || !aborted.has(child)) return undefined
+          if (Array.from(started).some((sessionID) => !aborted.has(sessionID))) return undefined
           return current
         }),
-        "workflow never settled (completed + node closed + child aborted)",
+        "workflow never settled (completed + node closed + no un-aborted child sessions)",
         // Großzügiges Poll-Budget (unter dem 30s-Bun-Test-Timeout): der Settle
-        // (completed -> Node terminal -> Abort-Kaskade beim Kind) ist eine echte,
-        // letztlich wahre Bedingung; unter CPU-Last dauert die Propagation nur
-        // länger als die Default-5s. Wir warten auf die Bedingung, raten nicht.
+        // (completed -> Node terminal -> optional Abort-Kaskade beim Kind) ist
+        // eine echte, letztlich wahre Bedingung; unter CPU-Last dauert die
+        // Propagation nur länger als die Default-5s. Wir warten auf die
+        // Bedingung, raten nicht.
         "25 seconds",
       )
       expect(done.status).toBe("completed")
@@ -2963,11 +2964,12 @@ export async function run(_args, ctx) { return await ctx.workflow("bad-child") }
       expect(row.status).toBe("completed")
       expect(row.agents.every((a) => a.status !== "running")).toBe(true)
 
-      // Kern: die hängende Child-Session wurde wirklich abgebrochen.
-      const childSession = done.agents[0]?.session_id
-      expect(childSession).toBeDefined()
-      expect(started.has(childSession!)).toBe(true)
-      expect(aborted.has(childSession!)).toBe(true)
+      // Kern: keine hängende Child-Session darf weiterlaufen. Je nach Scheduler
+      // kann der fire-and-forget-Agent vor finish() noch gar keine Session erzeugt
+      // haben; wenn doch, muss diese Session explizit abgebrochen worden sein.
+      for (const sessionID of started) {
+        expect(aborted.has(sessionID)).toBe(true)
+      }
     }),
   )
 

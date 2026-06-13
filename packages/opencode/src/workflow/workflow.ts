@@ -2464,13 +2464,15 @@ export const layer = Layer.effect(
                 ? "agent step never settled before the run completed"
                 : "Workflow failed"
       }
-      // Abort the child session of every node that was still running, so a
-      // detached agent does not keep spending after the run is terminal (N11).
-      // The per-run scope close below interrupts the dispatched agent FIBER, but
-      // that does not run the prompt-ops `cancel` vector (the actual session
-      // abort, same path as TUI Esc / HTTP abort) — so abort explicitly here.
-      // Idempotent: on the cancel/remove path abortRun already aborted these, and
-      // a node with no session_id (never reached session creation) is skipped.
+      // Stop the run-scoped agent fibers before collecting session ids to abort.
+      // A fire-and-forget ctx.agent can register its child session after `lingering`
+      // is collected but before the old cancel list was evaluated. Closing the
+      // run scope first prevents new work from progressing and lets a session_id
+      // that was registered just before interruption become visible on the same
+      // node objects in `lingering`. Then the explicit prompt cancel below aborts
+      // every lingering child session that actually exists, without touching
+      // already-completed agent sessions.
+      yield* Scope.close(active.runScope, Exit.void).pipe(Effect.ignore)
       if (active.cancelSession) {
         const cancelSession = active.cancelSession
         yield* Effect.forEach(
@@ -2520,13 +2522,9 @@ export const layer = Layer.effect(
         next.delete(id)
         return next
       })
-      // Free the per-run scope now that the run is terminal so it does not linger
-      // (one empty child scope per run) on the instance scope until teardown. By
-      // the time finish runs the body fiber has exited and all dispatched agent
-      // fibers have settled, so this interrupts nothing live; on the cancel/remove
-      // path abortRun already closed it and a second close is a no-op. Forked so a
-      // finalizer cannot delay the terminal return.
-      yield* Scope.close(active.runScope, Exit.void).pipe(Effect.ignore, Effect.forkIn(inst.scope))
+      // The run scope was closed above before terminal persistence so no detached
+      // agent fiber can write after the final row. A second close would be a no-op,
+      // but keeping one close point makes the terminal ordering easier to reason about.
       return result
     })
 
@@ -3748,6 +3746,7 @@ export const layer = Layer.effect(
                 cwd,
                 nothrow: true,
                 abort: controller.signal,
+                timeout: opts?.timeout,
               }).finally(() => {
                 if (timer) clearTimeout(timer)
               })
