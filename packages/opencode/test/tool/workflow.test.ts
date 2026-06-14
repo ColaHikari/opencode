@@ -1,4 +1,5 @@
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { afterEach, describe, expect } from "bun:test"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import fs from "fs/promises"
@@ -22,7 +23,13 @@ import { PartID } from "@/session/schema"
 // Session service the ToolRegistry already builds internally, so a session
 // created here is the same one the workflow tool's background completion path
 // reads via `sessions.get(ctx.sessionID)` before delivering its message.
-const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, Session.defaultLayer, CrossSpawnSpawner.defaultLayer))
+const it = testEffect(
+  Layer.mergeAll(
+    ToolRegistry.defaultLayer.pipe(Layer.provide(Ripgrep.defaultLayer)),
+    Session.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+  ),
+)
 
 const baseCtx: Omit<Tool.Context, "ask"> = {
   sessionID: SessionID.make("ses_test"),

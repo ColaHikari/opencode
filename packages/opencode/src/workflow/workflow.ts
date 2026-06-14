@@ -1,3 +1,4 @@
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
@@ -1764,10 +1765,6 @@ export const layer = Layer.effect(
             const callerSession = input.caller
               ? yield* sessions.get(input.caller.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
               : undefined
-            const callerAgent =
-              input.caller?.agent !== undefined
-                ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-                : undefined
             const session = yield* sessions.create({
               parentID: active.run.session_id ? SessionID.make(active.run.session_id) : undefined,
               title: `${active.run.workflow} ${node.id} (@${selected.name} subagent)`,
@@ -1776,7 +1773,6 @@ export const layer = Layer.effect(
               permission: callerSession
                 ? deriveSubagentSessionPermission({
                     parentSessionPermission: callerSession.permission ?? [],
-                    parentAgent: callerAgent,
                     subagent: selected,
                   })
                 : undefined,
@@ -2207,5 +2203,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
 )
+
+export const node = LayerNode.make(layer, [Config.node, Agent.node, Session.node, Database.node])
 
 export * as Workflow from "./workflow"
