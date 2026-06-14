@@ -56,6 +56,7 @@ import { WorkflowTool, workflowDescription } from "./workflow"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
+import { SubagentLimits } from "@/session/subagent-limits"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -87,6 +88,15 @@ export interface Interface {
      */
     ultracode?: boolean
     permission?: PermissionV1.Ruleset
+    /**
+     * Nesting depth of the requesting session (root = 1), derived from the
+     * real parent chain by SessionTools.resolve. At depth >= maxDepth the
+     * task tool is filtered from the list (design-final §4.1, defense line 2);
+     * on levels 2..max−1 the task description carries a depth hint. Infinity
+     * marks an unresolvable lineage (treated as at-limit). Callers that don't
+     * know their depth (debug/HTTP listings) default to the root's depth 1.
+     */
+    depth?: number
   }) => Effect.Effect<Tool.Def[]>
 }
 
@@ -296,7 +306,19 @@ const layer = Layer.effect(
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      // Resolve-time depth gate (design-final §4.1, defense line 2):
+      // config-aware on purpose — it also covers the kill switch
+      // (`subagent_max_depth: 1` removes task from the ROOT, which has no
+      // persisted deny) and a later LOWERING of max_depth for existing
+      // sessions whose ruleset predates the change.
+      const depthLimit = SubagentLimits.maxDepth(yield* config.get())
+      const depth = input.depth ?? 1
       const filtered = (yield* all()).filter((tool) => {
+        // At the maximum nesting depth the task tool is not in the tool list at
+        // all (Claude-Code parity: the model plans without delegation instead
+        // of burning turns on refused calls).
+        if (tool.id === TaskTool.id && depth >= depthLimit) return false
+
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
         }
@@ -335,10 +357,19 @@ const layer = Layer.effect(
             tool.id === WorkflowTool.id && input.ultracode && output.description === workflowDescription(false)
               ? workflowDescription(true)
               : output.description
+          // Depth hint (design-final Ü5): sub-agents on levels 2..max−1 are
+          // told their remaining delegation budget instead of discovering it
+          // by failed calls. Applied after plugin.trigger like the roster
+          // below; the root's description stays byte-identical.
+          const depthHint =
+            tool.id === TaskTool.id && depth >= 2 && depth < depthLimit
+              ? SubagentLimits.depthHint(depth, depthLimit)
+              : undefined
           return {
             id: tool.id,
             description: [
               description,
+              depthHint,
               tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
               tool.id === "execute" ? codeModeDescription : undefined,
             ]
