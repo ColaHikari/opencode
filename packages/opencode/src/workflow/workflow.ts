@@ -61,7 +61,7 @@ import { MetaReader } from "./meta-reader"
 import { Meta } from "./meta"
 import { BUILTIN_WORKFLOWS, builtinPath, inlinePath } from "./builtin"
 import { Process } from "@/util/process"
-import { Shell } from "@/shell/shell"
+import { Shell } from "@opencode-ai/core/shell"
 
 // Branded id for a workflow run. Follows the repo's ID convention (cf. SessionID
 // / MessageID in `session/schema.ts`): a `job_`-prefixed string carrying a

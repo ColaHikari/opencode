@@ -58,24 +58,24 @@ export const DialogWorkflow: Component = () => {
   const language = useLanguage()
 
   const [workflows] = createResource(() =>
-    sdk.client.workflow
-      .list({ directory: sdk.directory })
+    sdk().client.workflow
+      .list({ directory: sdk().directory })
       .then((response) => response.data ?? [])
       .catch(() => [] as WorkflowInfo[]),
   )
 
   const [runs, { refetch }] = createResource(
     () =>
-      sdk.client.workflow
-        .runs({ directory: sdk.directory })
+      sdk().client.workflow
+        .runs({ directory: sdk().directory })
         .then((response) => response.data ?? [])
         .catch(() => [] as WorkflowRun[]),
     { initialValue: [] as WorkflowRun[] },
   )
 
   // Instant refresh on lifecycle events + a 1s poll fallback (mirror TUI :425-437).
-  const offUpdated = sdk.event.on("workflow.run.updated", () => void refetch())
-  const offFinished = sdk.event.on("workflow.run.finished", () => void refetch())
+  const offUpdated = sdk().event.on("workflow.run.updated", () => void refetch())
+  const offFinished = sdk().event.on("workflow.run.finished", () => void refetch())
   const poll = setInterval(() => void refetch(), 1000)
   onCleanup(() => {
     offUpdated()
@@ -106,7 +106,7 @@ export const DialogWorkflow: Component = () => {
 
   const pause = async (run: WorkflowRun) => {
     try {
-      await sdk.client.workflow.pause({ id: run.id, directory: sdk.directory })
+      await sdk().client.workflow.pause({ id: run.id, directory: sdk().directory })
       refresh()
     } catch {
       showToast({ variant: "error", title: language.t("toast.workflow.pause.failed.title") })
@@ -115,7 +115,7 @@ export const DialogWorkflow: Component = () => {
 
   const cancel = async (run: WorkflowRun) => {
     try {
-      await sdk.client.workflow.cancel({ id: run.id, directory: sdk.directory })
+      await sdk().client.workflow.cancel({ id: run.id, directory: sdk().directory })
       refresh()
     } catch {
       showToast({ variant: "error", title: language.t("toast.workflow.cancel.failed.title") })
@@ -129,9 +129,9 @@ export const DialogWorkflow: Component = () => {
   // selection follows the new run so the resume is observable.
   const resume = async (run: WorkflowRun, invalidate?: number[]) => {
     try {
-      const result = await sdk.client.workflow.start({
+      const result = await sdk().client.workflow.start({
         name: run.workflow,
-        directory: sdk.directory,
+        directory: sdk().directory,
         workflowStartPayload: {
           resume_of: run.id,
           ...(invalidate !== undefined ? { invalidate_agents: invalidate } : {}),
@@ -308,7 +308,7 @@ const WorkflowDetail: Component<{
   // closing the dialog lands the user on the session view.
   const openAgentSession = (agent: WorkflowAgentRun) => {
     if (!agent.session_id) return
-    navigate(`/${base64Encode(sdk.directory)}/session/${agent.session_id}`)
+    navigate(`/${base64Encode(sdk().directory)}/session/${agent.session_id}`)
     dialog.close()
   }
 
@@ -480,7 +480,7 @@ const DialogWorkflowSave: Component<{ run: WorkflowRun }> = (props) => {
       return
     }
     setPending(true)
-    const result = await saveWorkflowRun(sdk, { name: safe, source, scope: scope() })
+    const result = await saveWorkflowRun(sdk(), { name: safe, source, scope: scope() })
     setPending(false)
     if (result.type === "ok") {
       showToast({
@@ -564,7 +564,7 @@ const DialogWorkflowDeleteConfirm: Component<{ run: WorkflowRun }> = (props) => 
     if (pending()) return
     setPending(true)
     try {
-      const result = await sdk.client.workflow.delete({ id: props.run.id, directory: sdk.directory })
+      const result = await sdk().client.workflow.delete({ id: props.run.id, directory: sdk().directory })
       // The endpoint returns a boolean: `false` means the row was already gone
       // (e.g. a concurrent delete), so the toast must not claim a deletion that
       // did not happen here (TUI parity).

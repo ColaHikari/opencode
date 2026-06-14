@@ -1,5 +1,5 @@
 import type { Event, WorkflowRun } from "@opencode-ai/sdk/v2"
-import type { useSDK } from "@/context/sdk"
+import type { DirectorySDK } from "@/context/sdk"
 
 // Thin web-side layer over the generated v2 SDK workflow surface, ported from the
 // TUI (`dialog-workflow-client.ts` + `dialog-workflow-question-helpers.ts`):
@@ -54,7 +54,7 @@ export type AnswerInput = {
 // typed answer() method) and the active directory (forwarded as the directory
 // query param, matching how the rest of the dashboard calls the client).
 export type WorkflowAnswerClient = {
-  client: ReturnType<typeof useSDK>["client"]
+  client: DirectorySDK["client"]
   directory?: string
 }
 

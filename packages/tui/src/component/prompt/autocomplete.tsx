@@ -386,7 +386,8 @@ export function Autocomplete(props: {
       const text = `${res.name} (${res.uri})`
       options.push({
         display: Locale.truncateMiddle(text, width),
-        value: text,
+        // Match the name only; matching the URI caused unrelated fuzzy hits.
+        value: res.name,
         description: res.description,
         onSelect: () => {
           insertPart(res.name, {
@@ -582,6 +583,8 @@ export function Autocomplete(props: {
     })
     if (workflow) return workflow
 
+    // @<alias>/... — narrow to the matched reference, files come from fff
+    // already ranked so there is no re-ranking here.
     if (store.visible === "@" && referenceMatchValue) {
       return referenceAliasesValue.filter((item) => item.display === `@${referenceMatchValue.name}`)
     }
@@ -604,7 +607,8 @@ export function Autocomplete(props: {
       .go(removeLineRange(searchValue), nonFileOptions, {
         keys: [
           (obj) => removeLineRange((obj.value ?? obj.display).trimEnd()),
-          "description",
+          // Match description for slash commands only; for "@" it surfaced unrelated items.
+          ...(store.visible === "/" ? ["description" as const] : []),
           (obj) => obj.aliases?.join(" ") ?? "",
         ],
         limit: 10,

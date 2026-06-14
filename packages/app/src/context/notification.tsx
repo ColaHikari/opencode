@@ -131,7 +131,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     const currentSession = createMemo(() => params.id)
 
     const [store, setStore, _, ready] = persisted(
-      Persist.serverGlobal(serverSDK.scope, "notification", ["notification.v1"]),
+      Persist.serverGlobal(serverSDK().scope, "notification", ["notification.v1"]),
       createStore({
         list: [] as Notification[],
       }),
@@ -214,11 +214,11 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
 
     const lookup = async (directory: string, sessionID?: string) => {
       if (!sessionID) return undefined
-      const [syncStore] = serverSync.child(directory, { bootstrap: false })
+      const [syncStore] = serverSync().child(directory, { bootstrap: false })
       const match = Binary.search(syncStore.session, sessionID, (s) => s.id)
       if (match.found) return syncStore.session[match.index]
-      return serverSDK.client.session
-        .get({ directory, sessionID })
+      return serverSDK()
+        .client.session.get({ directory, sessionID })
         .then((x) => x.data)
         .catch(() => undefined)
     }
@@ -322,8 +322,8 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
       if (!settings.notifications.agent()) return
       // The finished event carries no session_id — resolve it best-effort for a
       // deep link into the run's session; on failure fall back to the project.
-      void serverSDK.client.workflow
-        .get({ id: run.id, directory })
+      void serverSDK()
+        .client.workflow.get({ id: run.id, directory })
         .then((result) => result.data?.session_id)
         .catch(() => undefined)
         .then((sessionID) => {
@@ -339,7 +339,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
         })
     }
 
-    const unsub = serverSDK.event.listen((e) => {
+    const unsub = serverSDK().event.listen((e) => {
       const event = e.details
       const workflowEvent = asWorkflowRunEvent(event)
       if (workflowEvent?.kind === "finished") {

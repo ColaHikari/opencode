@@ -28,7 +28,7 @@ const DialogWorkflowQuestion: Component<{ run: WorkflowRun; onResolved?: () => v
     const answer = selectedAnswer(options(), selected(), freetext())
     if (answer === undefined || pending()) return
     setPending(true)
-    const result = await answerWorkflowRun(sdk, { id: props.run.id, answer })
+    const result = await answerWorkflowRun(sdk(), { id: props.run.id, answer })
     setPending(false)
     if (result.type === "ok") {
       props.onResolved?.()

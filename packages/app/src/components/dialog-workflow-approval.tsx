@@ -45,7 +45,7 @@ const DialogWorkflowApproval: Component<{
   const [source] = createResource(
     () => (view() === "source" ? props.info.name : undefined),
     async (name) => {
-      const result = await sdk.client.workflow.source({ name }).catch(() => undefined)
+      const result = await sdk().client.workflow.source({ name }).catch(() => undefined)
       return result?.data?.source
     },
   )

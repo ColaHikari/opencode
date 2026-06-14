@@ -63,6 +63,32 @@ let keywordEnabled = true
 
 let promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
 
+// Prompt-state mock matching ReturnType<typeof usePrompt>. Backed by the mutable
+// promptValue so tests can stage input by reassigning promptValue. Named `prompt`
+// because the @/context/prompt mock returns it (usePrompt: () => prompt) and the
+// createPromptSubmit input requires a `prompt` field of this shape.
+const prompt: ReturnType<typeof import("@/context/prompt").usePrompt> = {
+  ready: () => Object.assign(() => true, { promise: Promise.resolve(true) }),
+  current: () => promptValue,
+  cursor: () => undefined,
+  dirty: () => true,
+  context: {
+    items: () => [],
+    add: () => undefined,
+    remove: () => undefined,
+    removeComment: () => undefined,
+    updateComment: () => undefined,
+    replaceComments: () => undefined,
+  },
+  // No-ops (matching ours' original usePrompt mock): the existing tests stage
+  // input by reassigning promptValue directly and expect current() to keep
+  // returning it across multiple submits, so set/reset must NOT mutate it —
+  // a side-effecting reset() would clear promptValue after the first submit and
+  // make a second submit see empty input.
+  set: () => undefined,
+  reset: () => undefined,
+}
+
 const clientFor = (directory: string) => {
   createdClients.push(directory)
   return {
@@ -138,6 +164,7 @@ beforeAll(async () => {
   }))
 
   mock.module("@opencode-ai/ui/toast", () => ({
+    Toast: { Region: () => null },
     showToast: () => 0,
   }))
 
@@ -188,16 +215,7 @@ beforeAll(async () => {
   }))
 
   mock.module("@/context/prompt", () => ({
-    usePrompt: () => ({
-      current: () => promptValue,
-      reset: () => undefined,
-      set: () => undefined,
-      context: {
-        add: () => undefined,
-        remove: () => undefined,
-        items: () => [],
-      },
-    }),
+    usePrompt: () => prompt,
   }))
 
   mock.module("@/context/layout", () => ({
@@ -219,12 +237,12 @@ beforeAll(async () => {
           return clientFor(opts.directory)
         },
       }
-      return sdk
+      return () => sdk
     },
   }))
 
   mock.module("@/context/sync", () => ({
-    useSync: () => ({
+    useSync: () => () => ({
       data: {
         command: commandList,
         config: {
@@ -257,7 +275,7 @@ beforeAll(async () => {
   }))
 
   mock.module("@/context/server-sync", () => ({
-    useServerSync: () => ({
+    useServerSync: () => () => ({
       child: (directory: string) => {
         syncedDirectories.push(directory)
         storedSessions[directory] ??= []
@@ -353,6 +371,7 @@ beforeEach(() => {
 describe("prompt submit worktree selection", () => {
   test("reads the latest worktree accessor value per submit", async () => {
     const submit = createPromptSubmit({
+      prompt,
       info: () => undefined,
       imageAttachments: () => [],
       commentCount: () => 0,
@@ -392,6 +411,7 @@ describe("prompt submit worktree selection", () => {
 
   test("applies auto-accept to newly created sessions", async () => {
     const submit = createPromptSubmit({
+      prompt,
       info: () => undefined,
       imageAttachments: () => [],
       commentCount: () => 0,
@@ -424,6 +444,7 @@ describe("prompt submit worktree selection", () => {
     variant = "high"
 
     const submit = createPromptSubmit({
+      prompt,
       info: () => ({ id: "session-1" }),
       imageAttachments: () => [],
       commentCount: () => 0,
@@ -457,6 +478,7 @@ describe("prompt submit worktree selection", () => {
 
   test("seeds new sessions before optimistic prompts are added", async () => {
     const submit = createPromptSubmit({
+      prompt,
       info: () => undefined,
       imageAttachments: () => [],
       commentCount: () => 0,
@@ -497,6 +519,7 @@ const flush = async () => {
 }
 
 const workflowInput = () => ({
+  prompt,
   info: () => ({ id: "session-1" }),
   imageAttachments: () => [],
   commentCount: () => 0,
