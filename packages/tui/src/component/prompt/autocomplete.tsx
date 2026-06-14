@@ -24,6 +24,7 @@ import { displayCharAt, mentionTriggerIndex } from "../../prompt/display"
 import {
   isWorkflowCommandInput,
   listWorkflowInfos,
+  reservedSlashNames,
   workflowArgContext,
   workflowAutocompleteTriggerIndex,
   workflowCommandOption,
@@ -485,6 +486,26 @@ export function Autocomplete(props: {
 
     for (const serverCommand of sync.data.command) {
       if (serverCommand.source === "skill") continue
+      // Spec §5.2 (3): a server command with source "workflow" is a discovered
+      // workflow surfaced in Command.list() — it must route via /workflow <name>
+      // (NOT the generic /<name> insertion, which would try to run an empty
+      // template as a prompt). DELTA 5b: the SDK Command.source union does not
+      // carry "workflow" (SDK not regenerated), so compare defensively as a
+      // string; remove the cast after the Phase-3 regen.
+      if ((serverCommand.source as string) === "workflow") {
+        results.push({
+          display: "/" + serverCommand.name,
+          description: serverCommand.description,
+          onSelect: () => {
+            const newText = `${WORKFLOW_COMMAND_PREFIX}${serverCommand.name} `
+            const cursor = props.input().logicalCursor
+            props.input().deleteRange(0, 0, cursor.row, cursor.col)
+            props.input().insertText(newText)
+            props.input().cursorOffset = Bun.stringWidth(newText)
+          },
+        })
+        continue
+      }
       const label = serverCommand.source === "mcp" ? ":mcp" : ""
       results.push({
         display: "/" + serverCommand.name + label,
@@ -499,13 +520,22 @@ export function Autocomplete(props: {
       })
     }
 
-    // Discovered workflows as direct `/<name>` slash commands. The collision set
-    // is every command name already in `results` (built-in slashes + server/MCP
-    // commands): strip the leading `/` and any `:mcp` suffix so a workflow never
-    // shadows or duplicates a real command. Selecting one routes EXACTLY like
-    // `/workflow <name>` (the existing parseWorkflowCommand dispatch) — the helper
-    // is pure, so the onSelect that inserts the routed text is attached here.
-    const existingCommandNames = new Set(results.map((item) => item.display.replace(/^\//, "").replace(/:mcp$/, "")))
+    // Discovered workflows as direct `/<name>` slash commands. Item 30: the
+    // collision set is the SAME reservedSlashNames helper that guards the typed
+    // `/<name>` submit dispatch (prompt/index.tsx), so popover and typed routing
+    // can never disagree on what counts as a real command (built-in slashes incl.
+    // aliases, server/MCP/skill commands; skill commands are hidden from this
+    // popover but DO win the typed dispatch, so a colliding workflow must not
+    // surface here either). The popover additionally reserves the source-
+    // "workflow" command entries pushed above — they are the workflows themselves
+    // (discovery mirrors), deliberately NOT reserved for the typed route, but
+    // listing them twice here would duplicate rows. Selecting one routes EXACTLY
+    // like `/workflow <name>` (the existing parseWorkflowCommand dispatch) — the
+    // helper is pure, so the onSelect that inserts the routed text is attached here.
+    const existingCommandNames = reservedSlashNames(slashes(), sync.data.command)
+    for (const serverCommand of sync.data.command) {
+      if ((serverCommand.source as string) === "workflow") existingCommandNames.add(serverCommand.name)
+    }
     for (const option of workflowCommandOptions(slashCommandWorkflowInfos(), existingCommandNames)) {
       const name = option.value!
       results.push({

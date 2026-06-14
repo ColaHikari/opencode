@@ -365,10 +365,15 @@ import type {
   VcsGetResponses,
   VcsStatusErrors,
   VcsStatusResponses,
+  WorkflowAnswerErrors,
+  WorkflowAnswerPayload,
+  WorkflowAnswerResponses,
   WorkflowCancelErrors,
   WorkflowCancelResponses,
   WorkflowDeleteErrors,
   WorkflowDeleteResponses,
+  WorkflowExportErrors,
+  WorkflowExportResponses,
   WorkflowGetErrors,
   WorkflowGetResponses,
   WorkflowListErrors,
@@ -377,6 +382,13 @@ import type {
   WorkflowPauseResponses,
   WorkflowRunsErrors,
   WorkflowRunsResponses,
+  WorkflowSaveErrors,
+  WorkflowSavePayload,
+  WorkflowSaveResponses,
+  WorkflowSkipErrors,
+  WorkflowSkipResponses,
+  WorkflowSourceErrors,
+  WorkflowSourceResponses,
   WorkflowStartErrors,
   WorkflowStartPayload,
   WorkflowStartResponses,
@@ -3711,6 +3723,11 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      turnBudget?: {
+        usd?: number
+        tokens?: number
+      }
+      mcp?: "eager" | "lazy"
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -3732,6 +3749,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "turnBudget" },
+            { in: "body", key: "mcp" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4066,6 +4085,11 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      turnBudget?: {
+        usd?: number
+        tokens?: number
+      }
+      mcp?: "eager" | "lazy"
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -4087,6 +4111,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "turnBudget" },
+            { in: "body", key: "mcp" },
             { in: "body", key: "parts" },
           ],
         },
@@ -5040,6 +5066,43 @@ export class Workflow extends HeyApiClient {
   }
 
   /**
+   * Save workflow
+   *
+   * Save a workflow source string as a discoverable workflow file under the project or global workflows directory.
+   */
+  public save<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      workflowSavePayload?: WorkflowSavePayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowSavePayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowSaveResponses, WorkflowSaveErrors, ThrowOnError>({
+      url: "/workflow/save",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * Delete workflow run
    *
    * Delete a workflow run from persisted history.
@@ -5098,6 +5161,38 @@ export class Workflow extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<WorkflowGetResponses, WorkflowGetErrors, ThrowOnError>({
       url: "/workflow/run/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Read workflow source
+   *
+   * Resolve a single named workflow's module source (file text for an on-disk workflow, the bundled string for a builtin) for the pre-run approval preview.
+   */
+  public source<ThrowOnError extends boolean = false>(
+    parameters: {
+      name: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "name" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<WorkflowSourceResponses, WorkflowSourceErrors, ThrowOnError>({
+      url: "/workflow/{name}/source",
       ...options,
       ...params,
     })
@@ -5201,6 +5296,111 @@ export class Workflow extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<WorkflowPauseResponses, WorkflowPauseErrors, ThrowOnError>({
       url: "/workflow/run/{id}/pause",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Skip workflow agent step
+   *
+   * Skip one in-flight agent step of a live workflow run; the step's ctx.agent call resolves null and the run continues.
+   */
+  public skip<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      agentId: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "path", key: "agentId" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowSkipResponses, WorkflowSkipErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/agent/{agentId}/skip",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Answer workflow question
+   *
+   * Answer a run's open human-in-the-loop question. A live run resolves in place; a parked run is resumed.
+   */
+  public answer<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+      workflowAnswerPayload?: WorkflowAnswerPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "workflowAnswerPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowAnswerResponses, WorkflowAnswerErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/answer",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Export workflow run transcripts
+   *
+   * Export a run's transcripts as JSONL files; returns the directory path.
+   */
+  public export<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<WorkflowExportResponses, WorkflowExportErrors, ThrowOnError>({
+      url: "/workflow/run/{id}/export",
       ...options,
       ...params,
     })

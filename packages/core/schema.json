@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "bb783fec-090d-449b-8386-71fe180f614d",
+  "id": "033d5b3f-0657-4723-8793-6ea6ec20246d",
   "prevIds": [
-    "00000000-0000-0000-0000-000000000000"
+    "4afa16d2-a0b8-4cf9-9b05-a04364ee5ec9"
   ],
   "ddl": [
     {
@@ -1663,6 +1663,16 @@
       "default": null,
       "generated": null,
       "name": "resume_of",
+      "entityType": "columns",
+      "table": "workflow_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pending_question",
       "entityType": "columns",
       "table": "workflow_run"
     },

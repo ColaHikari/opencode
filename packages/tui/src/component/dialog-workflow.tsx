@@ -6,10 +6,11 @@ import { Global } from "@opencode-ai/core/global"
 import { useProject } from "../context/project"
 import { useRoute } from "../context/route"
 import { useSDK } from "../context/sdk"
+import { useEvent } from "../context/event"
 import { selectedForeground, useTheme } from "../context/theme"
 import { useDialog } from "../ui/dialog"
 import { useToast } from "../ui/toast"
-import { createEffect, createMemo, createResource, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import fs from "fs/promises"
 import path from "path"
@@ -18,24 +19,30 @@ import { DialogConfirm } from "../ui/dialog-confirm"
 import * as Clipboard from "../clipboard"
 import { getScrollAcceleration } from "../util/scroll"
 import {
-  capLogs,
+  firstSelectableRow,
   formatPhase,
   formatShortElapsed,
+  mergeObservedPhases,
   phaseIcon,
+  phaseRows,
   phaseStatus,
+  phaseTitles,
+  questionBadge,
   reanchorSelection,
+  resultPhase,
   sanitizeWorkflowFilename,
   saveTargets,
   spentThisMonth,
   statusIcon,
+  stepSelectableRow,
   timestamp,
+  type WorkflowPhaseRow,
 } from "./dialog-workflow-helpers"
+import { asWorkflowRunEvent } from "./dialog-workflow-client"
+import { DialogWorkflowQuestion } from "./dialog-workflow-question"
 
 // Re-exported so existing pure derivations keep a single import surface.
 export { phaseStatus } from "./dialog-workflow-helpers"
-
-// Upper bound on log rows rendered in the non-scrolling Logs section (see capLogs).
-const MAX_VISIBLE_LOGS = 20
 
 function formatShortDuration(run: WorkflowRun) {
   return formatShortElapsed(run.started_at, run.completed_at)
@@ -85,16 +92,15 @@ export function agentEffectiveEnd(run: WorkflowRun, agent: WorkflowRun["agents"]
   return agent.completed_at ?? (run.status !== "running" ? run.completed_at : undefined)
 }
 
-function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
-  const phases = workflow?.meta.phases?.length
-    ? workflow.meta.phases
-    : Array.from(
-        new Set([
-          ...run.logs.flatMap((item) => (item.phase ? [item.phase] : [])),
-          ...run.agents.flatMap((agent) => (agent.phase ? [agent.phase] : [])),
-          ...(run.current_phase ? [run.current_phase] : []),
-        ]),
-      )
+// Item 14: the phase list is the declared plan (meta.phases, normalized to title
+// strings via phaseTitles) MERGED with every observed phase — child-workflow
+// phases ('<name>: x') and undeclared parent setPhase titles used to never match
+// a declared phase, leaving their agents/logs invisible in the detail view. The
+// return type stays string[]: every consumer (phaseStatus/indexOf, selectedPhase,
+// phaseRows, phaseProgress, initial selection) keeps working on plain titles; the
+// child flag is re-derived where needed (childPhases memo). Exported for tests.
+export function runPhases(run: WorkflowRun, workflow?: WorkflowInfo) {
+  const phases = mergeObservedPhases(phaseTitles(workflow?.meta.phases), run).map((entry) => entry.title)
   return phases.length ? phases : [run.status === "completed" ? "complete" : (run.current_phase ?? "pending")]
 }
 
@@ -136,29 +142,19 @@ function agentTokens(agent: WorkflowRun["agents"][number]) {
   return agent.tokens?.total ?? (agent.tokens ? agent.tokens.input + agent.tokens.output + agent.tokens.reasoning : 0)
 }
 
-function phaseAgents(run: WorkflowRun, phase?: string) {
-  if (!phase) return run.agents
-  return run.agents.filter((agent) => agent.phase === phase)
-}
+// Item 19: a narrator log row is never selectable, so every row-detail helper
+// below only deals with the agent/result variants.
+type SelectablePhaseRow = Exclude<WorkflowPhaseRow, { type: "log" }>
 
-type WorkflowPhaseRow = { type: "agent"; agent: WorkflowRun["agents"][number] } | { type: "result" }
-
-function resultPhase(run: WorkflowRun, phases: readonly string[]) {
-  if (run.result === undefined) return
-  if (run.current_phase && phases.includes(run.current_phase)) return run.current_phase
-  return phases.at(-1)
-}
-
-function phaseRows(run: WorkflowRun, phases: readonly string[], phase?: string): WorkflowPhaseRow[] {
-  const rows: WorkflowPhaseRow[] = phaseAgents(run, phase).map((agent) => ({ type: "agent", agent }))
-  if (phase && phase === resultPhase(run, phases)) rows.push({ type: "result" })
-  return rows
-}
-
-function phaseProgress(run: WorkflowRun, phases: readonly string[], phase: string) {
-  const rows = phaseRows(run, phases, phase)
-  if (rows.length === 0) return ""
-  return `${rows.filter((row) => row.type === "result" || row.agent.status !== "running").length}/${rows.length}`
+// Exported for tests (pattern: agentEffectiveStatus/runPhases).
+export function phaseProgress(run: WorkflowRun, phases: readonly string[], phase: string) {
+  // Item 19: narrator log rows count in neither numerator nor denominator.
+  const counted = phaseRows(run, phases, phase, { includeLogs: false })
+  if (counted.length === 0) return ""
+  const done = counted.filter(
+    (row) => row.type === "result" || (row.type === "agent" && row.agent.status !== "running"),
+  )
+  return `${done.length}/${counted.length}`
 }
 
 function agentProgress(run: WorkflowRun) {
@@ -166,8 +162,12 @@ function agentProgress(run: WorkflowRun) {
   return `${run.agents.filter((agent) => agent.status !== "running").length}/${run.agents.length} agents`
 }
 
-function agentLabel(agent: WorkflowRun["agents"][number]) {
-  return agent.agent ?? `agent:${agent.id}`
+// Item 16: a per-call display name (`ctx.agent({label})`, persisted on the
+// node) wins over the subagent type name; a node with neither falls back to its
+// id. Label is display-only — selection, session-open, and the journal key all
+// keep working off the node itself. Exported for tests (pattern: phaseProgress).
+export function agentLabel(agent: WorkflowRun["agents"][number]) {
+  return agent.label ?? agent.agent ?? `agent:${agent.id}`
 }
 
 function modelLabel(agent: WorkflowRun["agents"][number]) {
@@ -188,22 +188,22 @@ function agentMetrics(run: WorkflowRun, agent: WorkflowRun["agents"][number]) {
     .join(" · ")
 }
 
-function phaseRowLabel(row: WorkflowPhaseRow) {
+function phaseRowLabel(row: SelectablePhaseRow) {
   if (row.type === "result") return "workflow:result"
   return agentLabel(row.agent)
 }
 
-function phaseRowModel(row: WorkflowPhaseRow) {
+function phaseRowModel(row: SelectablePhaseRow) {
   if (row.type === "result") return "local workflow"
   return modelLabel(row.agent)
 }
 
-function phaseRowMetrics(run: WorkflowRun, row: WorkflowPhaseRow) {
+function phaseRowMetrics(run: WorkflowRun, row: SelectablePhaseRow) {
   if (row.type === "result") return `0 tok · ${formatShortDuration(run)}`
   return agentMetrics(run, row.agent)
 }
 
-function phaseRowIcon(run: WorkflowRun, row: WorkflowPhaseRow) {
+function phaseRowIcon(run: WorkflowRun, row: SelectablePhaseRow) {
   if (row.type === "result") return "✔"
   // Fund 34: a lingering `running` agent on a terminal run renders terminal
   // (never the live `●`), so a finished run never shows a perpetually-live agent.
@@ -345,7 +345,9 @@ function scrollIndexIntoView(scroll: ScrollBoxRenderable | undefined, index: num
 
 export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string; openAgentID?: string }) {
   const dialog = useDialog()
+  const route = useRoute()
   const sdk = useSDK()
+  const events = useEvent()
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
@@ -408,6 +410,18 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
         notifyClose: false,
       },
     )
+  })
+
+  onMount(() => {
+    // QW1 (Spec §5.2 (1)): subscribe to workflow.run.updated/finished so the
+    // dashboard refreshes instantly on a server that emits them. The 1s poll
+    // below STAYS as the degraded-but-correct fallback against an older server
+    // that does not (Delta 10) — a double read is harmless (only network).
+    const off = events.subscribe((evt) => {
+      if (!asWorkflowRunEvent(evt)) return
+      void refetch()
+    })
+    onCleanup(off)
   })
 
   onMount(() => {
@@ -489,6 +503,37 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
     }
   }
 
+  // Spec §5.2 (4): answer the selected run's pending question, read straight off
+  // the generated `WorkflowRun.pending_question`. Live runs resolve in place; a
+  // parked (paused) run spawns a NEW resume run, and we then follow that new id
+  // into its detail view. The dialog replaces the dashboard, so we re-open the
+  // dashboard whichever way it resolves.
+  async function answerSelected() {
+    const run = selected()
+    if (!run || !run.pending_question) return
+    const sessionID = route.data.type === "session" ? route.data.sessionID : undefined
+    const resumeRunID = await DialogWorkflowQuestion.show(dialog, { run, sessionID })
+    if (resumeRunID) {
+      // Follow the freshly-spawned resume run into its detail view. Fetch it once
+      // so the detail view has an `initial` to render before its own poll/event
+      // refetch arrives; fall back to the dashboard if the run is not retrievable.
+      const resumed = await sdk.client.workflow.get({ id: resumeRunID }).then(
+        (r) => r.data,
+        () => undefined,
+      )
+      if (resumed) {
+        dialog.replace(
+          () => <DialogWorkflowRun id={resumeRunID} initial={resumed} workflows={workflows()} />,
+          undefined,
+          { notifyClose: false },
+        )
+        return
+      }
+    }
+    dialog.replace(() => <DialogWorkflow />, undefined, { notifyClose: false })
+    void refetch()
+  }
+
   // Fund 10 (behavior change): deleting a run from history is irreversible, so it
   // now asks for confirmation first. DialogConfirm.show replaces the dashboard, so
   // the dashboard is re-opened afterwards whichever way the prompt resolves.
@@ -530,6 +575,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
       { key: "return", desc: "View workflow details", group: "Workflow", cmd: openSelected },
       { key: "r", desc: "Refresh workflows", group: "Workflow", cmd: () => void refetchWorkflows() },
       { key: "x", desc: "Kill workflow run", group: "Workflow", cmd: cancelSelected },
+      { key: "a", desc: "Answer pending question", group: "Workflow", cmd: () => void answerSelected() },
       { key: "p", desc: "Pause running / resume paused run", group: "Workflow", cmd: pauseOrResumeSelected },
       { key: "d", desc: "Delete workflow run from history", group: "Workflow", cmd: () => void deleteSelected() },
       { key: "b", desc: "Exit workflows dashboard", group: "Workflow", cmd: () => dialog.clear() },
@@ -603,7 +649,10 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
                 <text fg={active() ? selectedForeground(theme) : theme.text} wrapMode="none" overflow="hidden">
                   {dashboardRowText(
                     {
-                      marker: active() ? "›" : "",
+                      // Spec §5.2 (4): a run waiting on an answer (running/parked
+                      // with a pending question) shows the ⏳ badge; otherwise the
+                      // selection arrow when active. The marker cell is 2 wide.
+                      marker: questionBadge(run) || (active() ? "›" : ""),
                       id: shortRunID(run),
                       workflow: run.workflow,
                       input: workflowInput(run),
@@ -628,7 +677,7 @@ export function DialogWorkflow(props?: { openRunID?: string; openPhase?: string;
           Spent this month: {formatCost(monthlySpend())} | Active Background Workers: {activeWorkers()}
         </text>
         <text fg={theme.textMuted}>
-          [Enter] View Details | [R] Refresh | [X] Kill | [D] Delete history | [Esc]/[B] Exit
+          [Enter] View Details | [A] Answer | [R] Refresh | [X] Kill | [D] Delete history | [Esc]/[B] Exit
         </text>
       </box>
     </box>
@@ -762,6 +811,7 @@ function DialogWorkflowRun(props: {
   const dialog = useDialog()
   const route = useRoute()
   const sdk = useSDK()
+  const events = useEvent()
   const toast = useToast()
   const { theme } = useTheme()
   const dimensions = useTerminalDimensions()
@@ -778,6 +828,16 @@ function DialogWorkflowRun(props: {
   const current = createMemo(() => run() ?? props.initial)
   const workflow = createMemo(() => props.workflows.find((item) => item.name === current().workflow))
   const phases = createMemo(() => runPhases(current(), workflow()))
+  // Item 14: phase titles observed from a nested ctx.workflow child ('<name>: x')
+  // render indented with a '↳' marker so the parent plan stays visually primary.
+  const childPhases = createMemo(
+    () =>
+      new Set(
+        mergeObservedPhases(phaseTitles(workflow()?.meta.phases), current())
+          .filter((entry) => entry.child)
+          .map((entry) => entry.title),
+      ),
+  )
   const [store, setStore] = createStore({
     runID: "",
     selectedPhase: 0,
@@ -785,19 +845,10 @@ function DialogWorkflowRun(props: {
     resultOffset: 0,
   })
   const selectedPhase = createMemo(() => phases()[store.selectedPhase] ?? phases()[0])
+  // Item 19 (was N7): ctx.log entries are no longer a separate capped Logs box —
+  // phaseRows interleaves them chronologically as dimmed narrator rows between
+  // the agent rows of their phase, inside the scrolling agent panel.
   const selectedPhaseRows = createMemo(() => phaseRows(current(), phases(), selectedPhase()))
-  // N7: ctx.log entries are persisted on the run but were never surfaced anywhere
-  // in the TUI (the docs promise they are visible). Show the logs scoped to the
-  // selected phase, plus any phase-less entries (the engine writes some logs
-  // before a phase is set).
-  const phaseLogs = createMemo(() => current().logs.filter((entry) => !entry.phase || entry.phase === selectedPhase()))
-  // IMPORTANT: the Logs box does not scroll and never shrinks, so an unbounded
-  // render lets a chatty run starve the other panels. Cap to the most recent
-  // entries (newest live at the bottom) and surface the dropped count as a hint.
-  // `<Index>` keys by position rather than object reference, so the 1s refetch —
-  // which rebuilds `logs` into fresh objects every tick — only re-renders rows
-  // whose text actually changed instead of tearing down every line each tick.
-  const cappedLogs = createMemo(() => capLogs(phaseLogs(), MAX_VISIBLE_LOGS))
   const selectedRow = createMemo(() => selectedPhaseRows()[store.selectedAgent])
   const selectedResult = createMemo(() => selectedRow()?.type === "result" && current().result !== undefined)
   const phasePanelWidth = createMemo(() => Math.min(44, Math.max(28, Math.floor((dimensions().width - 6) * 0.28))))
@@ -837,27 +888,37 @@ function DialogWorkflowRun(props: {
     setStore("runID", current().id)
     if (next >= 0) {
       setStore("selectedPhase", next)
-      setStore("selectedAgent", initialAgentIndex >= 0 ? initialAgentIndex : 0)
+      // Item 19: land on the first selectable row — a phase may open with
+      // leading narrator log rows, which are never selectable.
+      setStore(
+        "selectedAgent",
+        initialAgentIndex >= 0 ? initialAgentIndex : firstSelectableRow(phaseRows(current(), phases(), phases()[next])),
+      )
       setStore("resultOffset", 0)
       return
     }
     if (store.selectedPhase >= phases().length) {
       setStore("selectedPhase", 0)
-      setStore("selectedAgent", 0)
+      setStore("selectedAgent", firstSelectableRow(phaseRows(current(), phases(), phases()[0])))
       setStore("resultOffset", 0)
     }
   })
 
   createEffect(() => {
     if (store.selectedPhase < phases().length) return
-    setStore("selectedPhase", Math.max(0, phases().length - 1))
-    setStore("selectedAgent", 0)
+    const next = Math.max(0, phases().length - 1)
+    setStore("selectedPhase", next)
+    setStore("selectedAgent", firstSelectableRow(phaseRows(current(), phases(), phases()[next])))
     setStore("resultOffset", 0)
   })
 
   createEffect(() => {
-    if (store.selectedAgent < selectedPhaseRows().length) return
-    setStore("selectedAgent", Math.max(0, selectedPhaseRows().length - 1))
+    const rows = selectedPhaseRows()
+    if (store.selectedAgent < rows.length) return
+    const last = Math.max(0, rows.length - 1)
+    // Item 19: when the rows shrank below the selection, land on the last
+    // SELECTABLE row — a trailing narrator log row is skipped backwards.
+    setStore("selectedAgent", rows[last]?.type === "log" ? stepSelectableRow(rows, last, -1) : last)
     setStore("resultOffset", 0)
   })
 
@@ -876,6 +937,18 @@ function DialogWorkflowRun(props: {
     const index = store.selectedAgent
     if (selectedResult()) return
     requestAnimationFrame(() => scrollIndexIntoView(agentScroll, index))
+  })
+
+  onMount(() => {
+    // QW1 (Spec §5.2 (1)): refetch the detail view the moment THIS run emits an
+    // updated/finished event. The 1s running-only poll below STAYS as the
+    // fallback against a server that does not emit (Delta 10).
+    const off = events.subscribe((evt) => {
+      const wf = asWorkflowRunEvent(evt)
+      if (!wf || wf.run.id !== props.id) return
+      void refetch()
+    })
+    onCleanup(off)
   })
 
   onMount(() => {
@@ -948,16 +1021,18 @@ function DialogWorkflowRun(props: {
   // completed agent still replays from the journal.
   const resumeInvalidatingSelectedAgent = () => {
     const row = selectedRow()
-    if (row?.type === "result") return
-    const index = current().agents.findIndex((agent) => agent.id === row?.agent.id)
+    // Item 19: only an agent row can be re-run (result and narrator log rows no-op).
+    if (row?.type !== "agent") return
+    const index = current().agents.findIndex((agent) => agent.id === row.agent.id)
     if (index < 0) return
     resume([index])
   }
 
   function openAgentSession() {
     const row = selectedRow()
-    if (row?.type === "result") return
-    const sessionID = row?.agent.session_id
+    // Item 19: only an agent row has a session (result and narrator log rows no-op).
+    if (row?.type !== "agent") return
+    const sessionID = row.agent.session_id
     if (!sessionID) return
     route.navigate({
       type: "session",
@@ -974,16 +1049,15 @@ function DialogWorkflowRun(props: {
     if (phases().length === 0) return
     const next = Math.max(0, Math.min(phases().length - 1, store.selectedPhase + direction))
     setStore("selectedPhase", next)
-    setStore("selectedAgent", 0)
+    setStore("selectedAgent", firstSelectableRow(phaseRows(current(), phases(), phases()[next])))
     setStore("resultOffset", 0)
   }
 
   function moveAgent(direction: number) {
     if (selectedPhaseRows().length === 0) return
-    setStore(
-      "selectedAgent",
-      (store.selectedAgent + direction + selectedPhaseRows().length) % selectedPhaseRows().length,
-    )
+    // Item 19: narrator log rows are skipped — the cyclic step lands on the next
+    // agent/result row (or stays put when the phase has only logs).
+    setStore("selectedAgent", stepSelectableRow(selectedPhaseRows(), store.selectedAgent, direction < 0 ? -1 : 1))
     setStore("resultOffset", 0)
   }
 
@@ -996,7 +1070,14 @@ function DialogWorkflowRun(props: {
 
   function copySelectedResponse() {
     const row = selectedRow()
-    const text = row?.type === "result" ? workflowResultText(current().result) : row?.agent.output
+    // Item 19: a narrator log row copies its message (the narration is copyable
+    // even though the row is not selectable via ←/→ — e.g. a logs-only phase).
+    const text =
+      row?.type === "result"
+        ? workflowResultText(current().result)
+        : row?.type === "log"
+          ? row.entry.message
+          : row?.agent.output
     if (!text?.trim()) {
       toast.show({ message: "No response to copy", variant: "info" })
       return
@@ -1066,19 +1147,34 @@ function DialogWorkflowRun(props: {
   }))
 
   function PhaseRowItem(props: { row: WorkflowPhaseRow; index: () => number }) {
+    // The <For> keys rows by reference, so a row's variant is fixed for the
+    // lifetime of this component instance — branching once on the captured const
+    // is safe (and lets TypeScript narrow it inside the memos below).
+    const row = props.row
+    if (row.type === "log") {
+      // Item 19: narrator row — dimmed, indented under the agent rows, no
+      // metrics columns, no '›' marker, and no mouse selection (click is a
+      // no-op: log rows are not selectable). If the 1s refetch ever causes
+      // visible flicker here, memoize on entry.time+message.
+      return (
+        <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
+          {`  ${formatLogTime(row.entry.time)} ${row.entry.message}`}
+        </text>
+      )
+    }
     const active = createMemo(() => props.index() === store.selectedAgent)
     const color = createMemo(() => {
       if (active()) return theme.primary
-      if (props.row.type === "result") return theme.text
-      if (props.row.agent.status === "failed") return theme.error
-      if (props.row.agent.status === "completed") return theme.text
+      if (row.type === "result") return theme.text
+      if (row.agent.status === "failed") return theme.error
+      if (row.agent.status === "completed") return theme.text
       return theme.textMuted
     })
     const labelWidth = createMemo(() => Math.min(30, Math.max(14, Math.floor(agentPanelWidth() * 0.32))))
     const rowText = createMemo(() =>
       fitColumns(
-        `${active() ? "›" : phaseRowIcon(current(), props.row)} ${Locale.truncate(phaseRowLabel(props.row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(props.row)}`,
-        phaseRowMetrics(current(), props.row),
+        `${active() ? "›" : phaseRowIcon(current(), row)} ${Locale.truncate(phaseRowLabel(row), labelWidth()).padEnd(labelWidth())} ${phaseRowModel(row)}`,
+        phaseRowMetrics(current(), row),
         agentPanelWidth() - 2,
       ),
     )
@@ -1140,8 +1236,12 @@ function DialogWorkflowRun(props: {
               {(phase, index) => {
                 const status = createMemo(() => phaseStatus(current(), phases(), phase))
                 const active = createMemo(() => index() === store.selectedPhase)
+                // Item 14: a child-workflow phase reads as a nested step — '↳'
+                // instead of the number/status icon when inactive (active keeps
+                // the '›' selection arrow) plus a 2-space title indent.
+                const child = createMemo(() => childPhases().has(phase))
                 const marker = createMemo(() =>
-                  active() ? "›" : status() === "pending" ? `${index() + 1}` : phaseIcon(status()),
+                  active() ? "›" : child() ? "↳" : status() === "pending" ? `${index() + 1}` : phaseIcon(status()),
                 )
                 const color = createMemo(() => {
                   if (active()) return theme.primary
@@ -1155,7 +1255,7 @@ function DialogWorkflowRun(props: {
                     width="100%"
                     onMouseDown={() => {
                       setStore("selectedPhase", index())
-                      setStore("selectedAgent", 0)
+                      setStore("selectedAgent", firstSelectableRow(phaseRows(current(), phases(), phase)))
                     }}
                   >
                     <text
@@ -1175,7 +1275,7 @@ function DialogWorkflowRun(props: {
                     </text>
                     <box flexGrow={1} minWidth={0}>
                       <text fg={color()} wrapMode="none" overflow="hidden">
-                        {active() ? `${index() + 1} ${phase}` : phase}
+                        {`${child() ? "  " : ""}${active() ? `${index() + 1} ${phase}` : phase}`}
                       </text>
                     </box>
                     <text fg={active() ? theme.primary : theme.textMuted} flexShrink={0} wrapMode="none">
@@ -1204,7 +1304,13 @@ function DialogWorkflowRun(props: {
                     </box>
                   }
                 >
-                  <For each={selectedPhaseRows()}>{(row, index) => <PhaseRowItem row={row} index={index} />}</For>
+                  {/* Item 19: this box does not scroll, so narrator log rows are
+                      filtered out — a chatty run must never displace the result
+                      pager. Rows keep their ORIGINAL index (reference-identical
+                      lookup) so the active marker still matches selectedAgent. */}
+                  <For each={selectedPhaseRows().filter((row) => row.type !== "log")}>
+                    {(row) => <PhaseRowItem row={row} index={() => selectedPhaseRows().indexOf(row)} />}
+                  </For>
                 </Show>
               </box>
             }
@@ -1253,26 +1359,6 @@ function DialogWorkflowRun(props: {
                   </text>
                 </box>
               </Show>
-            </box>
-          </Show>
-          <Show when={cappedLogs().entries.length}>
-            <box height={1} flexShrink={0} border={["top"]} borderColor={theme.border} />
-            <box flexShrink={0} paddingLeft={1}>
-              <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-                {sectionTitle("Logs", agentPanelWidth() - 4)}
-              </text>
-              <Show when={cappedLogs().hidden}>
-                <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-                  … {cappedLogs().hidden} earlier entries
-                </text>
-              </Show>
-              <Index each={cappedLogs().entries}>
-                {(entry) => (
-                  <text fg={theme.textMuted} wrapMode="none" overflow="hidden">
-                    {formatLogTime(entry().time)} {entry().message}
-                  </text>
-                )}
-              </Index>
             </box>
           </Show>
         </box>

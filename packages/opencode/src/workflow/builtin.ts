@@ -38,6 +38,23 @@ export function isBuiltinPath(path: string) {
   return path.startsWith(BUILTIN_PATH_PREFIX)
 }
 
+// The synthetic path marker for an INLINE-source workflow is `inline:<metaName>`
+// (P3). Like `builtin:`, it is never a real filesystem path: an inline start
+// supplies the module source directly, loaded through the SAME source-string
+// import path builtins use (loadModule materializes a randomized temp module
+// under the global workflows dir). Discovery globs real `*.ts` files only, so an
+// `inline:` marker — exactly like `builtin:` — can never be picked up as a
+// discovered workflow.
+export const INLINE_PATH_PREFIX = "inline:"
+
+export function inlinePath(name: string) {
+  return `${INLINE_PATH_PREFIX}${name}`
+}
+
+export function isInlinePath(path: string) {
+  return path.startsWith(INLINE_PATH_PREFIX)
+}
+
 // deep-research: fan out a question into distinct search angles, research each
 // in parallel, adversarially verify every claim against its cited sources, then
 // synthesize a cited report from only the surviving claims. The meta fields are
@@ -65,7 +82,9 @@ const DEEP_RESEARCH = `export default {
     })
 
     ctx.setPhase("research")
-    const findings = await ctx.parallel(
+    // ctx.parallel drops a rejecting/agent-erroring task to null at its position
+    // (P1 Claude parity) — filter before dereferencing the findings.
+    const findings = (await ctx.parallel(
       plan.data.angles.map((angle) => () =>
         ctx.agent({
           prompt: \`Research this angle using your available web/search tools. If NO web/search tools are available, return {"claims": [], "no_web_tools": true} via the schema. Angle: \${angle}\\nFull question: \${question}\\nReturn findings with source URLs via the schema.\`,
@@ -89,7 +108,7 @@ const DEEP_RESEARCH = `export default {
           },
         }),
       ),
-    )
+    )).filter((f) => f !== null)
     // Gate via the structured schema (a forced-JSON schema makes the old plaintext
     // sentinel unreachable — StructuredOutputError would fire before any reply
     // text could carry it). An agent with no web/search tools instead sets the
@@ -100,7 +119,8 @@ const DEEP_RESEARCH = `export default {
     const claims = findings.flatMap((f) => f.data.claims)
 
     ctx.setPhase("verify")
-    const verified = await ctx.parallel(
+    // Same null-drop contract here — filter the verdicts before dereferencing.
+    const verified = (await ctx.parallel(
       claims.map((c) => () =>
         ctx
           .agent({
@@ -114,7 +134,7 @@ const DEEP_RESEARCH = `export default {
           .then((v) => ({ ...c, verdict: v.data })),
       ),
       { concurrencyLimit: 8 },
-    )
+    )).filter((v) => v !== null)
     const surviving = verified.filter((c) => c.verdict.supported)
     const rejected = verified.filter((c) => !c.verdict.supported)
 

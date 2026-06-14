@@ -22,7 +22,12 @@ export type WorkflowDefinitionRow = {
   meta: {
     name: string
     description?: string
-    phases?: string[]
+    // Phases are persisted in their NORMALIZED (decoded) shape — always objects
+    // (`{ title, detail?, model? }`), never bare strings. The engine normalizes a
+    // workflow's authored phases (which may be strings OR objects on the public
+    // contract) the moment meta is decoded, and `mutableMeta` writes that decoded
+    // form into the definition JSON, so the row only ever holds objects.
+    phases?: { title: string; detail?: string; model?: string }[]
     arguments?: Record<string, { type?: string; default?: unknown; description?: string }>
   }
   source?: string
@@ -37,20 +42,30 @@ export type WorkflowLogRow = {
 
 export type WorkflowAgentRow = {
   id: string
-  // Agent NODES only ever carry these three. The run-level `status` column below
-  // is widened to also include "cancelled"/"interrupted", but those are RUN
-  // lifecycle states only: on cancel/interrupt the engine rewrites a still-running
-  // agent node to "failed" (with an explanatory error), and the orphan sweep
-  // touches only the run row, never the agents JSON. Keep this union in lockstep
-  // with the engine's `AgentRun` schema (asserted at compile time over there).
-  status: "running" | "completed" | "failed"
+  // Agent NODES only ever carry these four ("skipped" = a human skipped the step
+  // via skipAgent, Item 15). The run-level `status` column below is widened to
+  // also include "cancelled"/"interrupted", but those are RUN lifecycle states
+  // only: on cancel/interrupt the engine rewrites a still-running agent node to
+  // "failed" (with an explanatory error), and the orphan sweep touches only the
+  // run row, never the agents JSON. Keep this union in lockstep with the
+  // engine's `AgentRun` schema (asserted at compile time over there).
+  status: "running" | "completed" | "failed" | "skipped"
   started_at: number
   completed_at?: number
   phase?: string
   agent?: string
+  // Per-call display name (Item 16), set from `ctx.agent({ label })`. Display-only
+  // (never part of the resume journal key). Keep in lockstep with the engine's
+  // `AgentRun` schema (asserted at compile time over there).
+  label?: string
   model?: string
   session_id?: string
   message_id?: string
+  // Item 7: the isolated `git worktree` base directory this step ran in (only
+  // for isolation:"worktree" steps; preserved worktrees stay inspectable here).
+  // Keep in lockstep with the engine's `AgentRun` schema (asserted at compile
+  // time over there).
+  worktree?: string
   prompt: string
   output?: string
   cost?: number
@@ -69,6 +84,18 @@ export type WorkflowAgentRow = {
   // journal rather than executed live. Omitted for a live step. Keep this in
   // lockstep with the engine's `AgentRun` schema (asserted at compile time).
   cached?: boolean
+  // The journal node KIND (Tasks 12/13). `"agent"` (or undefined, for rows
+  // written before this field existed) is a normal LLM agent step; `"question"`
+  // is a human-in-the-loop `ctx.question` step whose `prompt` holds the question
+  // text and whose `answer` (below) is filled in once the user replies. Old rows
+  // decode with `kind` absent, which the engine reads as `"agent"`. Keep this in
+  // lockstep with the engine's `AgentRun` schema (asserted at compile time).
+  kind?: "agent" | "question"
+  // The answer recorded on a `kind:"question"` node once the question was
+  // answered (live) or replayed from a resumed run's journal. Omitted while the
+  // question is still open / for non-question nodes. Keep in lockstep with the
+  // engine's `AgentRun` schema.
+  answer?: string
 }
 
 export const WorkflowRunTable = sqliteTable(
@@ -121,6 +148,15 @@ export const WorkflowRunTable = sqliteTable(
     // (non-resume) start. Purely a provenance/audit field on the row; the engine
     // reads it back as `resume_of` on the public Run.
     resume_of: text(),
+    // The open human-in-the-loop question a running run is currently waiting on
+    // (Tasks 12/13). Set when `ctx.question` is awaited and the answer has not yet
+    // arrived; cleared the moment the answer lands (live) or the question node is
+    // replayed during a resume. A JSON object `{ question, options?, asked_at }` so
+    // a paused run that timed out keeps the open question persisted across restarts
+    // (the journal also keeps the matching `kind:"question"` agent node). NULL when
+    // no question is pending — the common case. Distinct from the agent journal:
+    // this is the SINGLE in-flight question, the journal is the audit trail.
+    pending_question: text({ mode: "json" }).$type<{ question: string; options?: string[]; asked_at: number }>(),
     ...Timestamps,
   },
   (table) => [

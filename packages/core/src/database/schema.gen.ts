@@ -256,6 +256,7 @@ export default {
           \`result\` text,
           \`error\` text,
           \`resume_of\` text,
+          \`pending_question\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL
         );

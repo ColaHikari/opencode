@@ -3892,10 +3892,168 @@
         ]
       }
     },
-    "/experimental/project/{projectID}/copy/generate-name": {
+    "/experimental/project/{projectID}/copy": {
       "post": {
         "tags": ["projectCopy"],
-        "operationId": "experimental.projectCopy.generateName",
+        "operationId": "experimental.projectCopy.create",
+        "parameters": [
+          {
+            "name": "projectID",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Project copy created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectCopyCopy"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "ProjectCopyError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProjectCopyError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Create a local physical copy of a project using the selected strategy.",
+        "summary": "Create project copy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "strategy": {
+                    "type": "string",
+                    "enum": ["git_worktree"]
+                  },
+                  "directory": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "context": {
+                    "type": "string"
+                  }
+                },
+                "required": ["strategy", "directory"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.projectCopy.create({\n  ...\n})"
+          }
+        ]
+      },
+      "delete": {
+        "tags": ["projectCopy"],
+        "operationId": "experimental.projectCopy.remove",
+        "parameters": [
+          {
+            "name": "projectID",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project copy removed"
+          },
+          "400": {
+            "description": "ProjectCopyError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProjectCopyError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Remove a local physical copy of a project using the selected strategy.",
+        "summary": "Remove project copy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "directory": {
+                    "type": "string"
+                  },
+                  "force": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["directory", "force"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.projectCopy.remove({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/experimental/project/{projectID}/copy/refresh": {
+      "post": {
+        "tags": ["projectCopy"],
+        "operationId": "experimental.projectCopy.refresh",
         "parameters": [
           {
             "name": "projectID",
@@ -3923,55 +4081,33 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "name": {
-                      "type": "string"
-                    }
-                  },
-                  "required": ["name"],
-                  "additionalProperties": false
-                }
-              }
-            }
+          "204": {
+            "description": "Project copies refreshed"
           },
           "400": {
-            "description": "Bad request",
+            "description": "ProjectCopyError | InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProjectCopyError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
                 }
               }
             }
           }
         },
-        "description": "Generate a short name for a project copy from task context.",
-        "summary": "Generate project copy name",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "context": {
-                    "type": "string"
-                  }
-                },
-                "additionalProperties": false
-              }
-            }
-          }
-        },
+        "description": "Discover local project copies using one or all configured strategies.",
+        "summary": "Refresh project copies",
         "x-codeSamples": [
           {
             "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.projectCopy.generateName({\n  ...\n})"
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.projectCopy.refresh({\n  ...\n})"
           }
         ]
       }
@@ -6307,6 +6443,24 @@
                   "variant": {
                     "type": "string"
                   },
+                  "turnBudget": {
+                    "type": "object",
+                    "properties": {
+                      "usd": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "tokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mcp": {
+                    "type": "string",
+                    "enum": ["eager", "lazy"]
+                  },
                   "parts": {
                     "type": "array",
                     "items": {
@@ -7192,6 +7346,24 @@
                   },
                   "variant": {
                     "type": "string"
+                  },
+                  "turnBudget": {
+                    "type": "object",
+                    "properties": {
+                      "usd": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "tokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mcp": {
+                    "type": "string",
+                    "enum": ["eager", "lazy"]
                   },
                   "parts": {
                     "type": "array",
@@ -9890,6 +10062,86 @@
         ]
       }
     },
+    "/workflow/save": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.save",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow saved to disk",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowSaveResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "WorkflowApiError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkflowApiError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Save a workflow source string as a discoverable workflow file under the project or global workflows directory.",
+        "summary": "Save workflow",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowSavePayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.save({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/workflow/run/{id}": {
       "get": {
         "tags": ["workflow"],
@@ -10028,6 +10280,78 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.delete({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/{name}/source": {
+      "get": {
+        "tags": ["workflow"],
+        "operationId": "workflow.source",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowSource"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Resolve a single named workflow's module source (file text for an on-disk workflow, the bundled string for a builtin) for the pre-run approval preview.",
+        "summary": "Read workflow source",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.source({\n  ...\n})"
           }
         ]
       }
@@ -10276,6 +10600,286 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.pause({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}/agent/{agentId}/skip": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.skip",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "agentId",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run after requesting the skip",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Skip one in-flight agent step of a live workflow run; the step's ctx.agent call resolves null and the run continues.",
+        "summary": "Skip workflow agent step",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.skip({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}/answer": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.answer",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run after answering its open question",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | WorkflowApiError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WorkflowApiError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Answer a run's open human-in-the-loop question. A live run resolves in place; a parked run is resumed.",
+        "summary": "Answer workflow question",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowAnswerPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.answer({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/workflow/run/{id}/export": {
+      "post": {
+        "tags": ["workflow"],
+        "operationId": "workflow.export",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^job"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workflow run transcripts exported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowExportResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Export a run's transcripts as JSONL files; returns the directory path.",
+        "summary": "Export workflow run transcripts",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.workflow.export({\n  ...\n})"
           }
         ]
       }
@@ -12461,25 +13065,6 @@
               "type": "string"
             },
             "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
           }
         ],
         "security": [],
@@ -12545,25 +13130,6 @@
               "type": "string"
             },
             "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
           }
         ],
         "security": [],
@@ -13479,722 +14045,6 @@
         ]
       }
     },
-    "/api/pty": {
-      "get": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.list",
-        "parameters": [
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "location": {
-                      "$ref": "#/components/schemas/LocationInfo"
-                    },
-                    "data": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/Pty"
-                      }
-                    }
-                  },
-                  "required": ["location", "data"],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          }
-        },
-        "description": "List PTY sessions for a location, including exited sessions retained until removal.",
-        "summary": "List PTY sessions",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.list({\n  ...\n})"
-          }
-        ]
-      },
-      "post": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.create",
-        "parameters": [
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "location": {
-                      "$ref": "#/components/schemas/LocationInfo"
-                    },
-                    "data": {
-                      "$ref": "#/components/schemas/Pty"
-                    }
-                  },
-                  "required": ["location", "data"],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Create a pseudo-terminal session for a location.",
-        "summary": "Create PTY session",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "command": {
-                    "type": "string"
-                  },
-                  "args": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "cwd": {
-                    "type": "string"
-                  },
-                  "title": {
-                    "type": "string"
-                  },
-                  "env": {
-                    "type": "object",
-                    "additionalProperties": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "additionalProperties": false
-              }
-            }
-          },
-          "required": true
-        },
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.create({\n  ...\n})"
-          }
-        ]
-      }
-    },
-    "/api/pty/{ptyID}": {
-      "get": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.get",
-        "parameters": [
-          {
-            "name": "ptyID",
-            "in": "path",
-            "schema": {
-              "type": "string",
-              "pattern": "^pty"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "location": {
-                      "$ref": "#/components/schemas/LocationInfo"
-                    },
-                    "data": {
-                      "$ref": "#/components/schemas/Pty"
-                    }
-                  },
-                  "required": ["location", "data"],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "PtyNotFoundError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PtyNotFoundError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Get one PTY session, including its exit code once exited.",
-        "summary": "Get PTY session",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.get({\n  ...\n})"
-          }
-        ]
-      },
-      "put": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.update",
-        "parameters": [
-          {
-            "name": "ptyID",
-            "in": "path",
-            "schema": {
-              "type": "string",
-              "pattern": "^pty"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "location": {
-                      "$ref": "#/components/schemas/LocationInfo"
-                    },
-                    "data": {
-                      "$ref": "#/components/schemas/Pty"
-                    }
-                  },
-                  "required": ["location", "data"],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "PtyNotFoundError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PtyNotFoundError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Update the title or viewport size of one PTY session.",
-        "summary": "Update PTY session",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "title": {
-                    "type": "string"
-                  },
-                  "size": {
-                    "type": "object",
-                    "properties": {
-                      "rows": {
-                        "type": "integer",
-                        "exclusiveMinimum": 0
-                      },
-                      "cols": {
-                        "type": "integer",
-                        "exclusiveMinimum": 0
-                      }
-                    },
-                    "required": ["rows", "cols"],
-                    "additionalProperties": false
-                  }
-                },
-                "additionalProperties": false
-              }
-            }
-          },
-          "required": true
-        },
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.update({\n  ...\n})"
-          }
-        ]
-      },
-      "delete": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.remove",
-        "parameters": [
-          {
-            "name": "ptyID",
-            "in": "path",
-            "schema": {
-              "type": "string",
-              "pattern": "^pty"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "security": [],
-        "responses": {
-          "204": {
-            "description": "<No Content>"
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "PtyNotFoundError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PtyNotFoundError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Terminate and remove one PTY session.",
-        "summary": "Remove PTY session",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.remove({\n  ...\n})"
-          }
-        ]
-      }
-    },
-    "/api/pty/{ptyID}/connect-token": {
-      "post": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.connectToken",
-        "parameters": [
-          {
-            "name": "ptyID",
-            "in": "path",
-            "schema": {
-              "type": "string",
-              "pattern": "^pty"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "location": {
-                      "$ref": "#/components/schemas/LocationInfo"
-                    },
-                    "data": {
-                      "type": "object",
-                      "properties": {
-                        "ticket": {
-                          "type": "string"
-                        },
-                        "expires_in": {
-                          "type": "integer",
-                          "exclusiveMinimum": 0
-                        }
-                      },
-                      "required": ["ticket", "expires_in"],
-                      "additionalProperties": false
-                    }
-                  },
-                  "required": ["location", "data"],
-                  "additionalProperties": false
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "ForbiddenError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ForbiddenError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "PtyNotFoundError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PtyNotFoundError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Create a short-lived single-use ticket for opening a PTY WebSocket connection.",
-        "summary": "Create PTY WebSocket token",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.connectToken({\n  ...\n})"
-          }
-        ]
-      }
-    },
-    "/api/pty/{ptyID}/connect": {
-      "get": {
-        "tags": ["pty"],
-        "operationId": "v2.pty.connect",
-        "parameters": [
-          {
-            "name": "ptyID",
-            "in": "path",
-            "schema": {
-              "type": "string",
-              "pattern": "^pty"
-            },
-            "required": true
-          },
-          {
-            "in": "query",
-            "name": "location[directory]",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "location[workspace]",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "cursor",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "ticket",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "security": [],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "boolean"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvalidRequestError"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "UnauthorizedError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnauthorizedError"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "ForbiddenError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ForbiddenError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "PtyNotFoundError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PtyNotFoundError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Establish a WebSocket connection streaming PTY output and accepting terminal input.",
-        "summary": "Connect to PTY session",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.pty.connect({\n  ...\n})"
-          }
-        ]
-      }
-    },
     "/api/question/request": {
       "get": {
         "tags": ["session questions"],
@@ -14612,241 +14462,6 @@
         ]
       }
     },
-    "/experimental/project/{projectID}/copy": {
-      "post": {
-        "tags": ["projectCopy"],
-        "operationId": "v2.projectCopy.create",
-        "parameters": [
-          {
-            "name": "projectID",
-            "in": "path",
-            "schema": {
-              "type": "string"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "ProjectCopy.Copy",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProjectCopyCopy"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "ProjectCopyError | InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/ProjectCopyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
-                }
-              }
-            }
-          }
-        },
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "strategy": {
-                    "type": "string"
-                  },
-                  "directory": {
-                    "type": "string"
-                  },
-                  "name": {
-                    "type": "string"
-                  }
-                },
-                "required": ["strategy", "directory"],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.projectCopy.create({\n  ...\n})"
-          }
-        ]
-      },
-      "delete": {
-        "tags": ["projectCopy"],
-        "operationId": "v2.projectCopy.remove",
-        "parameters": [
-          {
-            "name": "projectID",
-            "in": "path",
-            "schema": {
-              "type": "string"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "<No Content>"
-          },
-          "400": {
-            "description": "ProjectCopyError | InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/ProjectCopyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
-                }
-              }
-            }
-          }
-        },
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "directory": {
-                    "type": "string"
-                  },
-                  "force": {
-                    "type": "boolean"
-                  }
-                },
-                "required": ["directory", "force"],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.projectCopy.remove({\n  ...\n})"
-          }
-        ]
-      }
-    },
-    "/experimental/project/{projectID}/copy/refresh": {
-      "post": {
-        "tags": ["projectCopy"],
-        "operationId": "v2.projectCopy.refresh",
-        "parameters": [
-          {
-            "name": "projectID",
-            "in": "path",
-            "schema": {
-              "type": "string"
-            },
-            "required": true
-          },
-          {
-            "name": "location",
-            "in": "query",
-            "schema": {
-              "type": "object",
-              "properties": {
-                "directory": {
-                  "type": "string"
-                },
-                "workspace": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            },
-            "required": false,
-            "style": "deepObject",
-            "explode": true
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "<No Content>"
-          },
-          "400": {
-            "description": "ProjectCopyError | InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/ProjectCopyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
-                }
-              }
-            }
-          }
-        },
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.v2.projectCopy.refresh({\n  ...\n})"
-          }
-        ]
-      }
-    },
     "/pty/{ptyID}/connect": {
       "get": {
         "tags": ["pty"],
@@ -14945,10 +14560,7 @@
             "$ref": "#/components/schemas/EventPluginAdded"
           },
           {
-            "$ref": "#/components/schemas/EventIntegrationUpdated"
-          },
-          {
-            "$ref": "#/components/schemas/EventCatalogUpdated"
+            "$ref": "#/components/schemas/EventCatalogModelUpdated"
           },
           {
             "$ref": "#/components/schemas/EventSessionCreated"
@@ -15083,6 +14695,9 @@
             "$ref": "#/components/schemas/EventFileEdited"
           },
           {
+            "$ref": "#/components/schemas/EventIntegrationUpdated"
+          },
+          {
             "$ref": "#/components/schemas/EventPermissionV2Asked"
           },
           {
@@ -15090,9 +14705,6 @@
           },
           {
             "$ref": "#/components/schemas/EventReferenceUpdated"
-          },
-          {
-            "$ref": "#/components/schemas/EventProjectDirectoriesUpdated"
           },
           {
             "$ref": "#/components/schemas/EventFileWatcherUpdated"
@@ -15149,16 +14761,22 @@
             "$ref": "#/components/schemas/EventMcpBrowserOpenFailed"
           },
           {
+            "$ref": "#/components/schemas/EventWorkflowRunUpdated"
+          },
+          {
+            "$ref": "#/components/schemas/EventWorkflowRunFinished"
+          },
+          {
             "$ref": "#/components/schemas/EventCommandExecuted"
+          },
+          {
+            "$ref": "#/components/schemas/EventProjectDirectoriesUpdated"
           },
           {
             "$ref": "#/components/schemas/EventProjectUpdated"
           },
           {
-            "$ref": "#/components/schemas/EventSessionStatus"
-          },
-          {
-            "$ref": "#/components/schemas/EventSessionIdle"
+            "$ref": "#/components/schemas/EventVcsBranchUpdated"
           },
           {
             "$ref": "#/components/schemas/EventQuestionAsked"
@@ -15170,10 +14788,19 @@
             "$ref": "#/components/schemas/EventQuestionRejected"
           },
           {
+            "$ref": "#/components/schemas/EventSessionStatus"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionIdle"
+          },
+          {
             "$ref": "#/components/schemas/EventSessionCompacted"
           },
           {
-            "$ref": "#/components/schemas/EventVcsBranchUpdated"
+            "$ref": "#/components/schemas/EventWorktreeReady"
+          },
+          {
+            "$ref": "#/components/schemas/EventWorktreeFailed"
           },
           {
             "$ref": "#/components/schemas/EventWorkspaceReady"
@@ -15183,12 +14810,6 @@
           },
           {
             "$ref": "#/components/schemas/EventWorkspaceStatus"
-          },
-          {
-            "$ref": "#/components/schemas/EventWorktreeReady"
-          },
-          {
-            "$ref": "#/components/schemas/EventWorktreeFailed"
           },
           {
             "$ref": "#/components/schemas/EventServerConnected"
@@ -16908,10 +16529,6 @@
           "pid": {
             "type": "integer",
             "minimum": 0
-          },
-          "exitCode": {
-            "type": "integer",
-            "minimum": 0
           }
         },
         "required": ["id", "title", "command", "args", "cwd", "status", "pid"],
@@ -16935,6 +16552,69 @@
         },
         "required": ["content", "status", "priority"],
         "additionalProperties": false
+      },
+      "QuestionOption": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Display text (1-5 words, concise)"
+          },
+          "description": {
+            "type": "string",
+            "description": "Explanation of choice"
+          }
+        },
+        "required": ["label", "description"],
+        "additionalProperties": false
+      },
+      "QuestionInfo": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Complete question"
+          },
+          "header": {
+            "type": "string",
+            "description": "Very short label (max 30 chars)"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionOption"
+            },
+            "description": "Available choices"
+          },
+          "multiple": {
+            "type": "boolean"
+          },
+          "custom": {
+            "type": "boolean"
+          }
+        },
+        "required": ["question", "header", "options"],
+        "additionalProperties": false
+      },
+      "QuestionTool": {
+        "type": "object",
+        "properties": {
+          "messageID": {
+            "type": "string",
+            "pattern": "^msg"
+          },
+          "callID": {
+            "type": "string"
+          }
+        },
+        "required": ["messageID", "callID"],
+        "additionalProperties": false
+      },
+      "QuestionAnswer": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
       },
       "SessionStatus": {
         "anyOf": [
@@ -17009,69 +16689,6 @@
           }
         ]
       },
-      "QuestionOption": {
-        "type": "object",
-        "properties": {
-          "label": {
-            "type": "string",
-            "description": "Display text (1-5 words, concise)"
-          },
-          "description": {
-            "type": "string",
-            "description": "Explanation of choice"
-          }
-        },
-        "required": ["label", "description"],
-        "additionalProperties": false
-      },
-      "QuestionInfo": {
-        "type": "object",
-        "properties": {
-          "question": {
-            "type": "string",
-            "description": "Complete question"
-          },
-          "header": {
-            "type": "string",
-            "description": "Very short label (max 30 chars)"
-          },
-          "options": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/QuestionOption"
-            },
-            "description": "Available choices"
-          },
-          "multiple": {
-            "type": "boolean"
-          },
-          "custom": {
-            "type": "boolean"
-          }
-        },
-        "required": ["question", "header", "options"],
-        "additionalProperties": false
-      },
-      "QuestionTool": {
-        "type": "object",
-        "properties": {
-          "messageID": {
-            "type": "string",
-            "pattern": "^msg"
-          },
-          "callID": {
-            "type": "string"
-          }
-        },
-        "required": ["messageID", "callID"],
-        "additionalProperties": false
-      },
-      "QuestionAnswer": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        }
-      },
       "GlobalEvent": {
         "type": "object",
         "properties": {
@@ -17139,30 +16756,17 @@
                   },
                   "type": {
                     "type": "string",
-                    "enum": ["integration.updated"]
+                    "enum": ["catalog.model.updated"]
                   },
                   "properties": {
                     "type": "object",
-                    "properties": {}
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string",
-                    "pattern": "^evt_"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["catalog.updated"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {}
+                    "properties": {
+                      "model": {
+                        "$ref": "#/components/schemas/ModelV2Info"
+                      }
+                    },
+                    "required": ["model"],
+                    "additionalProperties": false
                   }
                 },
                 "required": ["id", "type", "properties"],
@@ -18922,6 +18526,25 @@
                   },
                   "type": {
                     "type": "string",
+                    "enum": ["integration.updated"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {}
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
                     "enum": ["permission.v2.asked"]
                   },
                   "properties": {
@@ -19011,31 +18634,6 @@
                   "properties": {
                     "type": "object",
                     "properties": {}
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string",
-                    "pattern": "^evt_"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["project.directories.updated"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {
-                      "projectID": {
-                        "type": "string"
-                      }
-                    },
-                    "required": ["projectID"],
-                    "additionalProperties": false
                   }
                 },
                 "required": ["id", "type", "properties"],
@@ -19628,6 +19226,264 @@
                   },
                   "type": {
                     "type": "string",
+                    "enum": ["workflow.run.updated"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "workflow": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": ["running", "completed", "failed", "cancelled", "interrupted", "paused"]
+                      },
+                      "current_phase": {
+                        "type": "string"
+                      },
+                      "directory": {
+                        "type": "string"
+                      },
+                      "agents": {
+                        "type": "object",
+                        "properties": {
+                          "total": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          },
+                          "running": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          },
+                          "failed": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          }
+                        },
+                        "required": ["total", "running", "failed"],
+                        "additionalProperties": false
+                      },
+                      "pending_question": {
+                        "type": "boolean"
+                      },
+                      "error": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "workflow",
+                      "status",
+                      "current_phase",
+                      "directory",
+                      "agents",
+                      "pending_question",
+                      "error"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["workflow.run.finished"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "workflow": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": ["running", "completed", "failed", "cancelled", "interrupted", "paused"]
+                      },
+                      "current_phase": {
+                        "type": "string"
+                      },
+                      "directory": {
+                        "type": "string"
+                      },
+                      "agents": {
+                        "type": "object",
+                        "properties": {
+                          "total": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          },
+                          "running": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          },
+                          "failed": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          }
+                        },
+                        "required": ["total", "running", "failed"],
+                        "additionalProperties": false
+                      },
+                      "pending_question": {
+                        "type": "boolean"
+                      },
+                      "error": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "workflow",
+                      "status",
+                      "current_phase",
+                      "directory",
+                      "agents",
+                      "pending_question",
+                      "error"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
                     "enum": ["command.executed"]
                   },
                   "properties": {
@@ -19649,6 +19505,31 @@
                       }
                     },
                     "required": ["name", "sessionID", "arguments", "messageID"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["project.directories.updated"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "projectID": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["projectID"],
                     "additionalProperties": false
                   }
                 },
@@ -19749,46 +19630,15 @@
                   },
                   "type": {
                     "type": "string",
-                    "enum": ["session.status"]
+                    "enum": ["vcs.branch.updated"]
                   },
                   "properties": {
                     "type": "object",
                     "properties": {
-                      "sessionID": {
-                        "type": "string",
-                        "pattern": "^ses"
-                      },
-                      "status": {
-                        "$ref": "#/components/schemas/SessionStatus"
+                      "branch": {
+                        "type": "string"
                       }
                     },
-                    "required": ["sessionID", "status"],
-                    "additionalProperties": false
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string",
-                    "pattern": "^evt_"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["session.idle"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {
-                      "sessionID": {
-                        "type": "string",
-                        "pattern": "^ses"
-                      }
-                    },
-                    "required": ["sessionID"],
                     "additionalProperties": false
                   }
                 },
@@ -19910,6 +19760,61 @@
                   },
                   "type": {
                     "type": "string",
+                    "enum": ["session.status"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "status": {
+                        "$ref": "#/components/schemas/SessionStatus"
+                      }
+                    },
+                    "required": ["sessionID", "status"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.idle"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      }
+                    },
+                    "required": ["sessionID"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
                     "enum": ["session.compacted"]
                   },
                   "properties": {
@@ -19936,15 +19841,44 @@
                   },
                   "type": {
                     "type": "string",
-                    "enum": ["vcs.branch.updated"]
+                    "enum": ["worktree.ready"]
                   },
                   "properties": {
                     "type": "object",
                     "properties": {
+                      "name": {
+                        "type": "string"
+                      },
                       "branch": {
                         "type": "string"
                       }
                     },
+                    "required": ["name"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["worktree.failed"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "message": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["message"],
                     "additionalProperties": false
                   }
                 },
@@ -20025,59 +19959,6 @@
                       }
                     },
                     "required": ["workspaceID", "status"],
-                    "additionalProperties": false
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string",
-                    "pattern": "^evt_"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["worktree.ready"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {
-                      "name": {
-                        "type": "string"
-                      },
-                      "branch": {
-                        "type": "string"
-                      }
-                    },
-                    "required": ["name"],
-                    "additionalProperties": false
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string",
-                    "pattern": "^evt_"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["worktree.failed"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {
-                      "message": {
-                        "type": "string"
-                      }
-                    },
-                    "required": ["message"],
                     "additionalProperties": false
                   }
                 },
@@ -21220,6 +21101,23 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "foreground_grace_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "budget_directive": {
+                "type": "boolean"
+              },
+              "shell_permission": {
+                "type": "boolean"
+              },
+              "lint": {
+                "type": "string",
+                "enum": ["off", "warn", "deny"]
+              },
+              "lazy_mcp": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -22178,7 +22076,7 @@
           },
           "source": {
             "type": "string",
-            "enum": ["command", "mcp", "skill"]
+            "enum": ["command", "mcp", "skill", "workflow"]
           },
           "template": {
             "type": "string"
@@ -22487,6 +22385,30 @@
           }
         },
         "required": ["_tag", "projectID", "message"],
+        "additionalProperties": false
+      },
+      "ProjectCopyError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["ProjectCopyError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "forceRequired": {
+                "type": "boolean"
+              }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
         "additionalProperties": false
       },
       "PtyNotFoundError": {
@@ -23204,6 +23126,22 @@
         "required": ["name", "data"],
         "additionalProperties": false
       },
+      "WorkflowPhase": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          }
+        },
+        "required": ["title"],
+        "additionalProperties": false
+      },
       "WorkflowArgument": {
         "type": "object",
         "properties": {
@@ -23226,10 +23164,20 @@
           "description": {
             "type": "string"
           },
+          "whenToUse": {
+            "type": "string"
+          },
           "phases": {
             "type": "array",
             "items": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowPhase"
+                }
+              ]
             }
           },
           "arguments": {
@@ -23314,7 +23262,7 @@
           },
           "status": {
             "type": "string",
-            "enum": ["running", "completed", "failed"]
+            "enum": ["running", "completed", "failed", "skipped"]
           },
           "started_at": {
             "type": "number"
@@ -23328,6 +23276,9 @@
           "agent": {
             "type": "string"
           },
+          "label": {
+            "type": "string"
+          },
           "model": {
             "type": "string"
           },
@@ -23335,6 +23286,9 @@
             "type": "string"
           },
           "message_id": {
+            "type": "string"
+          },
+          "worktree": {
             "type": "string"
           },
           "prompt": {
@@ -23383,6 +23337,13 @@
           },
           "cached": {
             "type": "boolean"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["agent", "question"]
+          },
+          "answer": {
+            "type": "string"
           }
         },
         "required": ["id", "status", "started_at", "prompt"],
@@ -23479,36 +23440,77 @@
           "resume_of": {
             "type": "string",
             "pattern": "^job"
+          },
+          "pending_question": {
+            "type": "object",
+            "properties": {
+              "question": {
+                "type": "string"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "asked_at": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              }
+            },
+            "required": ["question", "asked_at"],
+            "additionalProperties": false
           }
         },
         "required": ["id", "workflow", "status", "started_at", "logs", "agents"],
         "additionalProperties": false
       },
-      "WorkflowStartPayload": {
+      "WorkflowSavePayload": {
         "type": "object",
         "properties": {
-          "args": {
-            "type": "object"
-          },
-          "budget": {
-            "type": "number",
-            "minimum": 0
-          },
-          "permissionSessionID": {
+          "name": {
             "type": "string",
-            "pattern": "^ses"
+            "description": "Workflow file base name (becomes /<name>); letters, numbers, underscores, and dashes only."
           },
-          "resume_of": {
+          "source": {
             "type": "string",
-            "pattern": "^job"
+            "description": "The complete TypeScript/JavaScript workflow module source."
           },
-          "invalidate_agents": {
-            "type": "array",
-            "items": {
-              "type": "integer"
-            }
+          "scope": {
+            "type": "string",
+            "enum": ["project", "global"]
           }
         },
+        "required": ["name", "source"],
+        "additionalProperties": false
+      },
+      "WorkflowSaveResult": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["path"],
         "additionalProperties": false
       },
       "WorkflowApiError": {
@@ -23529,6 +23531,109 @@
           }
         },
         "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "ConflictError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["ConflictError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "WorkflowSource": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_kind": {
+            "type": "string",
+            "enum": ["builtin"]
+          }
+        },
+        "required": ["name", "path", "source"],
+        "additionalProperties": false
+      },
+      "WorkflowStartPayload": {
+        "type": "object",
+        "properties": {
+          "args": {
+            "type": "object"
+          },
+          "budget": {
+            "type": "number",
+            "minimum": 0
+          },
+          "budget_tokens": {
+            "type": "number",
+            "minimum": 0
+          },
+          "permissionSessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "resume_of": {
+            "type": "string",
+            "pattern": "^job"
+          },
+          "invalidate_agents": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "replay": {
+            "type": "string",
+            "enum": ["prefix", "keyed"]
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkflowAnswerPayload": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string",
+            "description": "The human answer to the run's open question."
+          },
+          "permissionSessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          }
+        },
+        "required": ["answer"],
+        "additionalProperties": false
+      },
+      "WorkflowExportResult": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["path", "files"],
         "additionalProperties": false
       },
       "UnauthorizedError": {
@@ -23694,44 +23799,6 @@
         "required": ["_tag", "providerID", "message"],
         "additionalProperties": false
       },
-      "ForbiddenError": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["ForbiddenError"]
-          },
-          "message": {
-            "type": "string"
-          }
-        },
-        "required": ["_tag", "message"],
-        "additionalProperties": false
-      },
-      "ProjectCopyError": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "enum": ["ProjectCopyError"]
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "message": {
-                "type": "string"
-              },
-              "forceRequired": {
-                "type": "boolean"
-              }
-            },
-            "required": ["message"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["name", "data"],
-        "additionalProperties": false
-      },
       "effect_HttpApiError_Forbidden": {
         "type": "object",
         "properties": {
@@ -23889,6 +23956,596 @@
           }
         },
         "required": ["directory"],
+        "additionalProperties": false
+      },
+      "ModelV2Info": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "providerID": {
+            "type": "string"
+          },
+          "family": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "api": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["aisdk"]
+                  },
+                  "package": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "settings": {
+                    "type": "object"
+                  }
+                },
+                "required": ["id", "type", "package"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["native"]
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "settings": {
+                    "type": "object"
+                  }
+                },
+                "required": ["id", "type", "settings"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "tools": {
+                "type": "boolean"
+              },
+              "input": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "output": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": ["tools", "input", "output"],
+            "additionalProperties": false
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "body": {
+                "type": "object"
+              },
+              "generation": {
+                "type": "object",
+                "properties": {
+                  "maxTokens": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "temperature": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "topP": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "topK": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "frequencyPenalty": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "presencePenalty": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "seed": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity", "-Infinity", "NaN"]
+                      }
+                    ]
+                  },
+                  "stop": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
+              "options": {
+                "type": "object"
+              },
+              "variant": {
+                "type": "string"
+              }
+            },
+            "required": ["headers", "body"],
+            "additionalProperties": false
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "headers": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "body": {
+                  "type": "object"
+                },
+                "generation": {
+                  "type": "object",
+                  "properties": {
+                    "maxTokens": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "temperature": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "topP": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "topK": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "frequencyPenalty": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "presencePenalty": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "seed": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    },
+                    "stop": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": ["id", "headers", "body"],
+              "additionalProperties": false
+            }
+          },
+          "time": {
+            "type": "object",
+            "properties": {
+              "released": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              }
+            },
+            "required": ["released"],
+            "additionalProperties": false
+          },
+          "cost": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tier": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": ["context"]
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["type", "size"],
+                  "additionalProperties": false
+                },
+                "input": {
+                  "type": "number"
+                },
+                "output": {
+                  "type": "number"
+                },
+                "cache": {
+                  "type": "object",
+                  "properties": {
+                    "read": {
+                      "type": "number"
+                    },
+                    "write": {
+                      "type": "number"
+                    }
+                  },
+                  "required": ["read", "write"],
+                  "additionalProperties": false
+                }
+              },
+              "required": ["input", "output", "cache"],
+              "additionalProperties": false
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": ["alpha", "beta", "deprecated", "active"]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "object",
+            "properties": {
+              "context": {
+                "type": "integer"
+              },
+              "input": {
+                "type": "integer"
+              },
+              "output": {
+                "type": "integer"
+              }
+            },
+            "required": ["context", "output"],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "providerID",
+          "name",
+          "api",
+          "capabilities",
+          "request",
+          "variants",
+          "time",
+          "cost",
+          "status",
+          "enabled",
+          "limit"
+        ],
         "additionalProperties": false
       },
       "LocationRef": {
@@ -26312,13 +26969,24 @@
             "directory": {
               "type": "string"
             },
-            "strategy": {
-              "type": "string"
+            "type": {
+              "type": "string",
+              "enum": ["main", "root", "git_worktree"]
             }
           },
-          "required": ["directory"],
+          "required": ["directory", "type"],
           "additionalProperties": false
         }
+      },
+      "ProjectCopyCopy": {
+        "type": "object",
+        "properties": {
+          "directory": {
+            "type": "string"
+          }
+        },
+        "required": ["directory"],
+        "additionalProperties": false
       },
       "LocationInfo": {
         "type": "object",
@@ -27215,596 +27883,6 @@
           }
         ]
       },
-      "ModelV2Info": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "providerID": {
-            "type": "string"
-          },
-          "family": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "api": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["aisdk"]
-                  },
-                  "package": {
-                    "type": "string"
-                  },
-                  "url": {
-                    "type": "string"
-                  },
-                  "settings": {
-                    "type": "object"
-                  }
-                },
-                "required": ["id", "type", "package"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["native"]
-                  },
-                  "url": {
-                    "type": "string"
-                  },
-                  "settings": {
-                    "type": "object"
-                  }
-                },
-                "required": ["id", "type", "settings"],
-                "additionalProperties": false
-              }
-            ]
-          },
-          "capabilities": {
-            "type": "object",
-            "properties": {
-              "tools": {
-                "type": "boolean"
-              },
-              "input": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "output": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
-            },
-            "required": ["tools", "input", "output"],
-            "additionalProperties": false
-          },
-          "request": {
-            "type": "object",
-            "properties": {
-              "headers": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "string"
-                }
-              },
-              "body": {
-                "type": "object"
-              },
-              "generation": {
-                "type": "object",
-                "properties": {
-                  "maxTokens": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "temperature": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "topP": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "topK": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "frequencyPenalty": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "presencePenalty": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "seed": {
-                    "anyOf": [
-                      {
-                        "type": "number"
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["NaN"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["-Infinity"]
-                      },
-                      {
-                        "type": "string",
-                        "enum": ["Infinity", "-Infinity", "NaN"]
-                      }
-                    ]
-                  },
-                  "stop": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "additionalProperties": false
-              },
-              "options": {
-                "type": "object"
-              },
-              "variant": {
-                "type": "string"
-              }
-            },
-            "required": ["headers", "body"],
-            "additionalProperties": false
-          },
-          "variants": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "headers": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "string"
-                  }
-                },
-                "body": {
-                  "type": "object"
-                },
-                "generation": {
-                  "type": "object",
-                  "properties": {
-                    "maxTokens": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "temperature": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "topP": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "topK": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "frequencyPenalty": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "presencePenalty": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "seed": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["NaN"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
-                        },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
-                        }
-                      ]
-                    },
-                    "stop": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  },
-                  "additionalProperties": false
-                },
-                "options": {
-                  "type": "object"
-                }
-              },
-              "required": ["id", "headers", "body"],
-              "additionalProperties": false
-            }
-          },
-          "time": {
-            "type": "object",
-            "properties": {
-              "released": {
-                "anyOf": [
-                  {
-                    "type": "number"
-                  },
-                  {
-                    "type": "string",
-                    "enum": ["NaN"]
-                  },
-                  {
-                    "type": "string",
-                    "enum": ["Infinity"]
-                  },
-                  {
-                    "type": "string",
-                    "enum": ["-Infinity"]
-                  },
-                  {
-                    "type": "string",
-                    "enum": ["Infinity", "-Infinity", "NaN"]
-                  }
-                ]
-              }
-            },
-            "required": ["released"],
-            "additionalProperties": false
-          },
-          "cost": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "tier": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "enum": ["context"]
-                    },
-                    "size": {
-                      "type": "integer"
-                    }
-                  },
-                  "required": ["type", "size"],
-                  "additionalProperties": false
-                },
-                "input": {
-                  "type": "number"
-                },
-                "output": {
-                  "type": "number"
-                },
-                "cache": {
-                  "type": "object",
-                  "properties": {
-                    "read": {
-                      "type": "number"
-                    },
-                    "write": {
-                      "type": "number"
-                    }
-                  },
-                  "required": ["read", "write"],
-                  "additionalProperties": false
-                }
-              },
-              "required": ["input", "output", "cache"],
-              "additionalProperties": false
-            }
-          },
-          "status": {
-            "type": "string",
-            "enum": ["alpha", "beta", "deprecated", "active"]
-          },
-          "enabled": {
-            "type": "boolean"
-          },
-          "limit": {
-            "type": "object",
-            "properties": {
-              "context": {
-                "type": "integer"
-              },
-              "input": {
-                "type": "integer"
-              },
-              "output": {
-                "type": "integer"
-              }
-            },
-            "required": ["context", "output"],
-            "additionalProperties": false
-          }
-        },
-        "required": [
-          "id",
-          "providerID",
-          "name",
-          "api",
-          "capabilities",
-          "request",
-          "variants",
-          "time",
-          "cost",
-          "status",
-          "enabled",
-          "limit"
-        ],
-        "additionalProperties": false
-      },
       "ProviderV2Info": {
         "type": "object",
         "properties": {
@@ -27814,8 +27892,61 @@
           "name": {
             "type": "string"
           },
-          "disabled": {
-            "type": "boolean"
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean",
+                "enum": [false]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "via": {
+                    "type": "string",
+                    "enum": ["env"]
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": ["via", "name"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "via": {
+                    "type": "string",
+                    "enum": ["credential"]
+                  },
+                  "credentialID": {
+                    "type": "string"
+                  }
+                },
+                "required": ["via", "credentialID"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "via": {
+                    "type": "string",
+                    "enum": ["custom"]
+                  },
+                  "data": {
+                    "type": "object"
+                  }
+                },
+                "required": ["via", "data"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "api": {
             "anyOf": [
@@ -27875,7 +28006,7 @@
             "additionalProperties": false
           }
         },
-        "required": ["id", "name", "api", "request"],
+        "required": ["id", "name", "enabled", "env", "api", "request"],
         "additionalProperties": false
       },
       "IntegrationWhen": {
@@ -28410,16 +28541,6 @@
         "required": ["name", "path", "source"],
         "additionalProperties": false
       },
-      "ProjectCopyCopy": {
-        "type": "object",
-        "properties": {
-          "directory": {
-            "type": "string"
-          }
-        },
-        "required": ["directory"],
-        "additionalProperties": false
-      },
       "EventModels-devRefreshed": {
         "type": "object",
         "properties": {
@@ -28464,26 +28585,537 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
-      "EventIntegrationUpdated": {
+      "ModelV2Info1": {
         "type": "object",
         "properties": {
           "id": {
-            "type": "string",
-            "pattern": "^evt_"
+            "type": "string"
           },
-          "type": {
-            "type": "string",
-            "enum": ["integration.updated"]
+          "providerID": {
+            "type": "string"
           },
-          "properties": {
+          "family": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "api": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["aisdk"]
+                  },
+                  "package": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "settings": {
+                    "type": "object"
+                  }
+                },
+                "required": ["id", "type", "package"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["native"]
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "settings": {
+                    "type": "object"
+                  }
+                },
+                "required": ["id", "type", "settings"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "capabilities": {
             "type": "object",
-            "properties": {}
+            "properties": {
+              "tools": {
+                "type": "boolean"
+              },
+              "input": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "output": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": ["tools", "input", "output"],
+            "additionalProperties": false
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "body": {
+                "type": "object"
+              },
+              "generation": {
+                "type": "object",
+                "properties": {
+                  "maxTokens": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "temperature": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "topP": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "topK": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "frequencyPenalty": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "presencePenalty": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "seed": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "stop": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
+              "options": {
+                "type": "object"
+              },
+              "variant": {
+                "type": "string"
+              }
+            },
+            "required": ["headers", "body"],
+            "additionalProperties": false
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "headers": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "body": {
+                  "type": "object"
+                },
+                "generation": {
+                  "type": "object",
+                  "properties": {
+                    "maxTokens": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "temperature": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "topP": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "topK": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "frequencyPenalty": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "presencePenalty": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "seed": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        }
+                      ]
+                    },
+                    "stop": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": ["id", "headers", "body"],
+              "additionalProperties": false
+            }
+          },
+          "time": {
+            "type": "object",
+            "properties": {
+              "released": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  }
+                ]
+              }
+            },
+            "required": ["released"],
+            "additionalProperties": false
+          },
+          "cost": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tier": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": ["context"]
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["type", "size"],
+                  "additionalProperties": false
+                },
+                "input": {
+                  "type": "number"
+                },
+                "output": {
+                  "type": "number"
+                },
+                "cache": {
+                  "type": "object",
+                  "properties": {
+                    "read": {
+                      "type": "number"
+                    },
+                    "write": {
+                      "type": "number"
+                    }
+                  },
+                  "required": ["read", "write"],
+                  "additionalProperties": false
+                }
+              },
+              "required": ["input", "output", "cache"],
+              "additionalProperties": false
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": ["alpha", "beta", "deprecated", "active"]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "object",
+            "properties": {
+              "context": {
+                "type": "integer"
+              },
+              "input": {
+                "type": "integer"
+              },
+              "output": {
+                "type": "integer"
+              }
+            },
+            "required": ["context", "output"],
+            "additionalProperties": false
           }
         },
-        "required": ["id", "type", "properties"],
+        "required": [
+          "id",
+          "providerID",
+          "name",
+          "api",
+          "capabilities",
+          "request",
+          "variants",
+          "time",
+          "cost",
+          "status",
+          "enabled",
+          "limit"
+        ],
         "additionalProperties": false
       },
-      "EventCatalogUpdated": {
+      "EventCatalogModelUpdated": {
         "type": "object",
         "properties": {
           "id": {
@@ -28492,11 +29124,17 @@
           },
           "type": {
             "type": "string",
-            "enum": ["catalog.updated"]
+            "enum": ["catalog.model.updated"]
           },
           "properties": {
             "type": "object",
-            "properties": {}
+            "properties": {
+              "model": {
+                "$ref": "#/components/schemas/ModelV2Info1"
+              }
+            },
+            "required": ["model"],
+            "additionalProperties": false
           }
         },
         "required": ["id", "type", "properties"],
@@ -30239,6 +30877,25 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventIntegrationUpdated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["integration.updated"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventPermissionV2Asked": {
         "type": "object",
         "properties": {
@@ -30337,31 +30994,6 @@
           "properties": {
             "type": "object",
             "properties": {}
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventProjectDirectoriesUpdated": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["project.directories.updated"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "projectID": {
-                "type": "string"
-              }
-            },
-            "required": ["projectID"],
-            "additionalProperties": false
           }
         },
         "required": ["id", "type", "properties"],
@@ -30807,6 +31439,240 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventWorkflowRunUpdated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["workflow.run.updated"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "workflow": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["running", "completed", "failed", "cancelled", "interrupted", "paused"]
+              },
+              "current_phase": {
+                "type": "string"
+              },
+              "directory": {
+                "type": "string"
+              },
+              "agents": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "running": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "failed": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  }
+                },
+                "required": ["total", "running", "failed"],
+                "additionalProperties": false
+              },
+              "pending_question": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "workflow",
+              "status",
+              "current_phase",
+              "directory",
+              "agents",
+              "pending_question",
+              "error"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventWorkflowRunFinished": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["workflow.run.finished"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "workflow": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["running", "completed", "failed", "cancelled", "interrupted", "paused"]
+              },
+              "current_phase": {
+                "type": "string"
+              },
+              "directory": {
+                "type": "string"
+              },
+              "agents": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "running": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  },
+                  "failed": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["NaN"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["Infinity"]
+                      },
+                      {
+                        "type": "string",
+                        "enum": ["-Infinity"]
+                      }
+                    ]
+                  }
+                },
+                "required": ["total", "running", "failed"],
+                "additionalProperties": false
+              },
+              "pending_question": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "workflow",
+              "status",
+              "current_phase",
+              "directory",
+              "agents",
+              "pending_question",
+              "error"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventCommandExecuted": {
         "type": "object",
         "properties": {
@@ -30837,6 +31703,31 @@
               }
             },
             "required": ["name", "sessionID", "arguments", "messageID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventProjectDirectoriesUpdated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["project.directories.updated"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "projectID": {
+                "type": "string"
+              }
+            },
+            "required": ["projectID"],
             "additionalProperties": false
           }
         },
@@ -30928,7 +31819,7 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
-      "EventSessionStatus": {
+      "EventVcsBranchUpdated": {
         "type": "object",
         "properties": {
           "id": {
@@ -30937,46 +31828,15 @@
           },
           "type": {
             "type": "string",
-            "enum": ["session.status"]
+            "enum": ["vcs.branch.updated"]
           },
           "properties": {
             "type": "object",
             "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "status": {
-                "$ref": "#/components/schemas/SessionStatus"
+              "branch": {
+                "type": "string"
               }
             },
-            "required": ["sessionID", "status"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventSessionIdle": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.idle"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              }
-            },
-            "required": ["sessionID"],
             "additionalProperties": false
           }
         },
@@ -31089,6 +31949,61 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventSessionStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.status"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "$ref": "#/components/schemas/SessionStatus"
+              }
+            },
+            "required": ["sessionID", "status"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionIdle": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.idle"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventSessionCompacted": {
         "type": "object",
         "properties": {
@@ -31115,7 +32030,7 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
-      "EventVcsBranchUpdated": {
+      "EventWorktreeReady": {
         "type": "object",
         "properties": {
           "id": {
@@ -31124,15 +32039,44 @@
           },
           "type": {
             "type": "string",
-            "enum": ["vcs.branch.updated"]
+            "enum": ["worktree.ready"]
           },
           "properties": {
             "type": "object",
             "properties": {
+              "name": {
+                "type": "string"
+              },
               "branch": {
                 "type": "string"
               }
             },
+            "required": ["name"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventWorktreeFailed": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["worktree.failed"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": ["message"],
             "additionalProperties": false
           }
         },
@@ -31213,59 +32157,6 @@
               }
             },
             "required": ["workspaceID", "status"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventWorktreeReady": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["worktree.ready"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "branch": {
-                "type": "string"
-              }
-            },
-            "required": ["name"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventWorktreeFailed": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["worktree.failed"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "message": {
-                "type": "string"
-              }
-            },
-            "required": ["message"],
             "additionalProperties": false
           }
         },
@@ -31379,7 +32270,7 @@
     },
     {
       "name": "projectCopy",
-      "description": "Project copy naming routes."
+      "description": "Project copy management routes."
     },
     {
       "name": "pty",
@@ -31474,20 +32365,12 @@
       "description": "Experimental event stream route."
     },
     {
-      "name": "pty",
-      "description": "Experimental location-scoped PTY routes."
-    },
-    {
       "name": "session questions",
       "description": "Experimental session question routes."
     },
     {
       "name": "reference",
       "description": "Location-scoped project references."
-    },
-    {
-      "name": "projectCopy",
-      "description": "Project copy management routes."
     },
     {
       "name": "pty",

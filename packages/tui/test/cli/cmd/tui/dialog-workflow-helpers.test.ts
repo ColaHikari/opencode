@@ -1,16 +1,20 @@
 import { describe, expect, test } from "bun:test"
 import {
-  capLogs,
   formatPhase,
   formatShortElapsed,
+  mergeRunEvent,
+  parseDirectWorkflowCommand,
   parseWorkflowCommand,
   phaseIcon,
   phaseStatus,
+  phaseTitles,
+  questionBadge,
   reanchorSelection,
   sanitizeWorkflowFilename,
   saveTargets,
   spentThisMonth,
   statusIcon,
+  workflowPermissionDisplay,
 } from "../../../../src/component/dialog-workflow-helpers"
 import type { WorkflowInfo, WorkflowRun } from "@opencode-ai/sdk/v2"
 import path from "path"
@@ -194,38 +198,6 @@ describe("reanchorSelection (Fund 10 — selection follows run.id across re-sort
   })
 })
 
-describe("capLogs (IMPORTANT — bound the non-scrolling logs section)", () => {
-  const makeLog = (time: number) => ({ time, message: `m${time}` })
-
-  test("returns every entry unchanged when within the cap (no hidden count)", () => {
-    const entries = [makeLog(1), makeLog(2), makeLog(3)]
-    const result = capLogs(entries, 5)
-    expect(result.entries).toEqual(entries)
-    expect(result.hidden).toBe(0)
-  })
-
-  test("keeps only the last N entries and reports how many were dropped", () => {
-    const entries = Array.from({ length: 25 }, (_, i) => makeLog(i))
-    const result = capLogs(entries, 20)
-    expect(result.entries).toHaveLength(20)
-    // The last 20 are kept; the oldest 5 are hidden.
-    expect(result.entries[0]).toEqual(makeLog(5))
-    expect(result.entries.at(-1)).toEqual(makeLog(24))
-    expect(result.hidden).toBe(5)
-  })
-
-  test("an exactly-full list keeps everything with no hidden count", () => {
-    const entries = Array.from({ length: 20 }, (_, i) => makeLog(i))
-    const result = capLogs(entries, 20)
-    expect(result.entries).toHaveLength(20)
-    expect(result.hidden).toBe(0)
-  })
-
-  test("an empty list is empty with no hidden count", () => {
-    expect(capLogs([], 20)).toEqual({ entries: [], hidden: 0 })
-  })
-})
-
 describe("parseWorkflowCommand (Fund 59 — dispatch, Fund 60 — raw remainder)", () => {
   test("/workflows opens the dashboard", () => {
     expect(parseWorkflowCommand("/workflows")).toEqual({ type: "dashboard" })
@@ -266,6 +238,101 @@ describe("parseWorkflowCommand (Fund 59 — dispatch, Fund 60 — raw remainder)
   })
 })
 
+describe("parseDirectWorkflowCommand (Item 30 — typed /<name> direct routing)", () => {
+  test("a bare /<name> parses with empty args", () => {
+    expect(parseDirectWorkflowCommand("/review")).toEqual({ name: "review", args: "" })
+  })
+
+  test("args are the raw remainder, preserving quotes and multiple spaces (Fund 60)", () => {
+    expect(parseDirectWorkflowCommand('/review a=1 b="x y"')).toEqual({ name: "review", args: 'a=1 b="x y"' })
+    expect(parseDirectWorkflowCommand('/review msg="hello   world"')).toEqual({
+      name: "review",
+      args: 'msg="hello   world"',
+    })
+  })
+
+  test("the full discovery-name charset is accepted", () => {
+    expect(parseDirectWorkflowCommand("/deep_research-2 x=1")).toEqual({ name: "deep_research-2", args: "x=1" })
+  })
+
+  test("leading whitespace before the slash is tolerated (parseWorkflowCommand parity)", () => {
+    expect(parseDirectWorkflowCommand("  /review a=1")).toEqual({ name: "review", args: "a=1" })
+  })
+
+  test("the /workflow[s] dispatch words never parse as a direct command", () => {
+    expect(parseDirectWorkflowCommand("/workflow x")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/workflow")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/workflows")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/workflows foo")).toBeUndefined()
+  })
+
+  test("a bare slash, non-slash input, and out-of-charset names are rejected", () => {
+    expect(parseDirectWorkflowCommand("/")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("hello")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("review")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/re$view")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("/re.view x")).toBeUndefined()
+    expect(parseDirectWorkflowCommand("")).toBeUndefined()
+  })
+
+  test("only the first line is parsed (parseWorkflowCommand consistency)", () => {
+    expect(parseDirectWorkflowCommand("/review a=1\nsecond line")).toEqual({ name: "review", args: "a=1" })
+    expect(parseDirectWorkflowCommand("hello\n/review")).toBeUndefined()
+  })
+})
+
+describe("mergeRunEvent (event-driven dashboard refresh)", () => {
+  test("overlays a finished event's status onto the matching run without dropping unrelated runs", () => {
+    const runs = [makeRun({ id: "job_a", status: "running" }), makeRun({ id: "job_b", status: "running" })]
+    const next = mergeRunEvent(runs, {
+      kind: "finished",
+      run: {
+        id: "job_a",
+        workflow: "demo",
+        status: "completed",
+        current_phase: "",
+        directory: "/ws",
+        agents: { total: 1, running: 0, failed: 0 },
+        pending_question: false,
+        error: "",
+      },
+    })
+    expect(next.find((r) => r.id === "job_a")!.status).toBe("completed")
+    expect(next.find((r) => r.id === "job_b")!.status).toBe("running")
+    expect(next.length).toBe(2)
+  })
+
+  test("an event for an unknown run id leaves the list unchanged (a full refetch will pick it up)", () => {
+    const runs = [makeRun({ id: "job_a", status: "running" })]
+    const next = mergeRunEvent(runs, {
+      kind: "updated",
+      run: {
+        id: "job_new",
+        workflow: "demo",
+        status: "running",
+        current_phase: "",
+        directory: "/ws",
+        agents: { total: 0, running: 0, failed: 0 },
+        pending_question: false,
+        error: "",
+      },
+    })
+    expect(next).toBe(runs)
+  })
+})
+
+describe("questionBadge (Dashboard ⏳ for waiting/parked runs)", () => {
+  test("a running run with pending_question gets the waiting badge", () => {
+    expect(questionBadge(makeRun({ status: "running", pending_question: { question: "q?", asked_at: 1 } }))).toBe("⏳")
+  })
+  test("a paused run with pending_question gets the waiting badge (parked)", () => {
+    expect(questionBadge(makeRun({ status: "paused", pending_question: { question: "q?", asked_at: 1 } }))).toBe("⏳")
+  })
+  test("a run without a pending question gets no badge", () => {
+    expect(questionBadge(makeRun({ status: "running" }))).toBe("")
+  })
+})
+
 describe("sanitizeWorkflowFilename (save-as-command guard)", () => {
   test("a plain name is accepted unchanged", () => {
     expect(sanitizeWorkflowFilename("deep-research")).toBe("deep-research")
@@ -301,5 +368,87 @@ describe("saveTargets (project vs global workflow file destinations)", () => {
     const targets = saveTargets("/proj", "/home/.config/opencode", "review")
     expect(targets.project).toBe(path.join("/proj", ".opencode", "workflows", "review.ts"))
     expect(targets.global).toBe(path.join("/home/.config/opencode", "workflows", "review.ts"))
+  })
+})
+
+describe("workflowPermissionDisplay (Item 9 — workflow permission prompt derivation)", () => {
+  test("fully populated metadata titles with the display name and derives every field", () => {
+    const d = workflowPermissionDisplay({
+      name: "deep-research",
+      display_name: "Deep Research",
+      description: "Researches a topic in depth.",
+      action: "start",
+      args: { topic: "effect", rounds: 3 },
+      background: true,
+    })
+    expect(d.title).toBe("Start workflow: Deep Research")
+    expect(d.description).toBe("Researches a topic in depth.")
+    // display name differs from the command name, so the command name surfaces.
+    expect(d.commandName).toBe("deep-research")
+    expect(d.args).toEqual([
+      ["topic", "effect"],
+      ["rounds", "3"],
+    ])
+    expect(d.background).toBe(true)
+  })
+
+  test("commandName stays unset when the display name equals the name", () => {
+    const d = workflowPermissionDisplay({ name: "Inline", display_name: "Inline" })
+    expect(d.title).toBe("Start workflow: Inline")
+    expect(d.commandName).toBeUndefined()
+  })
+
+  test("empty or undefined metadata degrades to the generic title without crashing", () => {
+    for (const metadata of [undefined, {}]) {
+      const d = workflowPermissionDisplay(metadata)
+      expect(d.title).toBe("Start workflow: workflow")
+      expect(d.description).toBeUndefined()
+      expect(d.commandName).toBeUndefined()
+      expect(d.args).toEqual([])
+      expect(d.background).toBe(false)
+    }
+  })
+
+  test("action create titles with Create", () => {
+    const d = workflowPermissionDisplay({ name: "made", display_name: "Made Nicely", action: "create" })
+    expect(d.title).toBe("Create workflow: Made Nicely")
+  })
+
+  test("non-string and malformed fields are ignored defensively", () => {
+    const d = workflowPermissionDisplay({
+      name: 42,
+      display_name: { evil: true },
+      description: 7,
+      args: ["not", "a", "record"],
+      background: "true",
+    })
+    expect(d.title).toBe("Start workflow: workflow")
+    expect(d.description).toBeUndefined()
+    expect(d.args).toEqual([])
+    // background must be a real boolean true, never a truthy string.
+    expect(d.background).toBe(false)
+  })
+
+  test("non-string arg values are coerced via String()", () => {
+    const d = workflowPermissionDisplay({ name: "x", args: { flag: true, count: 2, obj: { a: 1 } } })
+    expect(d.args).toEqual([
+      ["flag", "true"],
+      ["count", "2"],
+      ["obj", "[object Object]"],
+    ])
+  })
+})
+
+describe("phaseTitles (Item 9 — structured phase normalization)", () => {
+  test("plain string phases pass through", () => {
+    expect(phaseTitles(["plan", "build"])).toEqual(["plan", "build"])
+  })
+
+  test("structured entries are reduced to their titles (no [object Object])", () => {
+    expect(phaseTitles(["plan", { title: "build" }, { title: "verify" }])).toEqual(["plan", "build", "verify"])
+  })
+
+  test("undefined phases yield an empty list", () => {
+    expect(phaseTitles(undefined)).toEqual([])
   })
 })
