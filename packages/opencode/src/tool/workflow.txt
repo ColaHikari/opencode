@@ -39,6 +39,11 @@ model?} — a phase declared with model becomes the default model while that pha
 active), arguments ({name: {type: "string"|"number"|"boolean", default?, description?}}
 — values are type-coerced and passed as `run(args, ctx)`).
 
+Discovery precedence is project workflow file, then global workflow file, then plugin-provided
+workflow, then built-in workflow. When multiple plugins register the same workflow name, the
+first loaded plugin wins. Plugin workflow names use the same letters/numbers/underscore/dash
+constraints as file workflow names.
+
 ctx API (the only orchestration surface)
 
 - ctx.agent({prompt, agent?, model?, variant?, tools?, skills?, files?, schema?, isolation?,
@@ -65,6 +70,10 @@ ctx API (the only orchestration surface)
 - ctx.shell(cmd, {timeout?, cwd?}) -> Promise<{output, exitCode}>. Deterministic non-LLM
   step. A non-zero exit is RETURNED, never thrown. Costs no budget. Commands run through
   the caller's bash permission rules (a denied command fails the step).
+- ctx.tool(name, args?, {timeout?, onError?}) -> Promise<{output, metadata?} | null>.
+  Call an available native/custom/MCP tool directly without an agent step. Permissions still
+  run through the caller workflow/session context. Default errors throw; onError: "null"
+  resolves null except for cancellation.
 - ctx.question({question, options?, timeout?}) -> Promise<{answer}>. Ask the human and
   wait. On timeout (default 10 min) the run PARKS as paused; a later answer resumes it.
 - ctx.setPhase(title) / ctx.log(message). Progress + audit trail; log every decision that

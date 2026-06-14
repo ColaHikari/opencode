@@ -175,7 +175,7 @@ export const WORKFLOW_TRIGGER_GUIDANCE: string[] = [
 
 export function workflowDescription(ultracode: boolean): string {
   return [
-    "Manage workflows (project .opencode/workflows, global config workflows, and built-in workflows) through one action-based tool.",
+    "Manage workflows (project .opencode/workflows, global config workflows, plugin workflows, and built-in workflows) through one action-based tool.",
     ultracode ? WORKFLOW_GATE_ULTRACODE : WORKFLOW_GATE_DEFAULT,
     ...WORKFLOW_TRIGGER_GUIDANCE,
     // Item 3: one-line authoring doctrine (the full version lives in the
@@ -183,7 +183,7 @@ export function workflowDescription(ultracode: boolean): string {
     "Inside workflow source, default to per-item ctx.pipeline chains; insert a parallel barrier only when a step must see all items at once.",
     "Actions:",
     "- read: with name, return one workflow's metadata, arguments, phases, and path; WITHOUT name, return the workflow AUTHORING GUIDE (module shape, ctx API, patterns, copyable examples) plus all available workflows. Read the guide before writing or editing any workflow source.",
-    "- start: start a workflow (project, global, or built-in). Waits a short grace window (default 45s); a run still going then continues in the background and notifies this session on completion. background=true returns immediately; background=false or an explicit timeout keeps the old foreground wait. script_path starts a script file directly (edit + re-invoke to iterate).",
+    "- start: start a workflow (project, global, plugin-provided, or built-in). Waits a short grace window (default 45s); a run still going then continues in the background and notifies this session on completion. background=true returns immediately; background=false or an explicit timeout keeps the old foreground wait. script_path starts a script file directly (edit + re-invoke to iterate).",
     "- wait: wait for a running workflow by run_id.",
     "- inspect: inspect workflow history, logs, agents, a specific agent, result, or all details (all also includes the workflow source).",
     "- create: write a persistent project-local .opencode/workflows/<name>.ts workflow file.",
@@ -947,7 +947,7 @@ export const WorkflowTool = Tool.define(
             // the start. Read BEFORE the ask (Item 23) so the static lint findings
             // can ride into the approval metadata — a plain file read is as
             // side-effect-free as the static list pre-check above.
-            const source = yield* fs.readFileStringSafe(info.path)
+            const source = (yield* workflow.read(safeName))?.source
             // Item 23 (Stufe 2): static lint of the named workflow's source.
             // 'deny' fails before the ask; 'warn' findings feed the approval UI.
             const lintFindings = source !== undefined ? yield* lintSource(source, info.path) : []

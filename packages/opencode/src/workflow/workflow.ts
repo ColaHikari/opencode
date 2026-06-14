@@ -11,7 +11,7 @@ import { Identifier } from "@/id/id"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import type { SessionPrompt } from "@/session/prompt"
-import { SessionID } from "@/session/schema"
+import { SessionID, MessageID, PartID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { Global } from "@opencode-ai/core/global"
 import { Permission } from "@/permission"
@@ -22,6 +22,11 @@ import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner
 import { scanCommand } from "@/tool/shell"
 import { ShellID } from "@/tool/shell/id"
 import { TurnBudget } from "@/session/turn-budget"
+import { ToolCatalog } from "@/tool/catalog"
+import { MCP } from "@/mcp"
+import { Plugin } from "@/plugin"
+import { Truncate } from "@/tool/truncate"
+import { Tool } from "@/tool/tool"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -49,12 +54,16 @@ import {
   Semaphore,
   SynchronizedRef,
 } from "effect"
+import type { Hooks } from "@opencode-ai/plugin"
 import type {
   WorkflowContext,
+  WorkflowDefinition,
   WorkflowParallelOptions,
   WorkflowPipelineFn,
   WorkflowPipelineOptions,
   WorkflowPipelineStage,
+  WorkflowToolFn,
+  WorkflowToolResult,
 } from "@opencode-ai/plugin/workflow"
 import { WorkflowRunTable } from "./workflow.sql"
 import { MetaReader } from "./meta-reader"
@@ -667,6 +676,11 @@ export type AgentInput = {
   onError?: "fail" | "null"
 }
 
+export type ToolInput = {
+  timeout?: number
+  onError?: "fail" | "null"
+}
+
 // Pipeline/parallel option and stage shapes are the public workflow-authoring
 // contract, owned by `@opencode-ai/plugin` (opencode depends on the plugin, so
 // the plugin is the single source of truth). The engine re-exports them under
@@ -704,6 +718,7 @@ export type ContextApi = {
    * dereferencing (`if (!r) …`).
    */
   readonly agent: (input: AgentInput) => Promise<{ data: unknown; text: string } | null>
+  readonly tool: WorkflowToolFn
   /**
    * Deterministic non-LLM step: run a shell command in the run's workspace and
    * resolve to `{ output, exitCode }`. Does NOT consume an LLM turn or the run's
@@ -1893,12 +1908,18 @@ async function withinWorkflowsDir(file: string, workflowsDir: string): Promise<b
 
 // `directories` is ordered by precedence (project before global, see
 // discoverWorkflows): the first directory that contributes a given workflow
-// NAME wins, so a project workflow shadows a same-named global one. Within a
-// directory the glob excludes temp copies by extension; TEMP_FILE_RE filters
-// any remaining match defensively, and the symlink boundary check drops escapes.
-type Discovered = { name: string; path: string; source?: string }
+// NAME wins, so a project workflow shadows a same-named global one. Plugin
+// workflows are appended after project/global files and before builtins; if
+// multiple plugins register the same name, the first loaded plugin wins.
+type Discovered = { name: string; path: string; source?: string; kind?: "builtin" | "plugin"; error?: string }
 
-async function discover(directories: readonly string[]) {
+const PLUGIN_PATH_PREFIX = "plugin:"
+
+function pluginPath(name: string) {
+  return `${PLUGIN_PATH_PREFIX}${name}`
+}
+
+async function discover(directories: readonly string[], pluginWorkflows: readonly Discovered[]) {
   const seen = new Set<string>()
   const result: Discovered[] = []
   for (const dir of directories) {
@@ -1925,17 +1946,65 @@ async function discover(directories: readonly string[]) {
       result.push({ name, path: file })
     }
   }
+  // Plugin workflows sit between project/global files and builtins. Hook order is
+  // deterministic from plugin loading; first plugin wins on duplicate names.
+  for (const workflow of pluginWorkflows) {
+    if (seen.has(workflow.name)) continue
+    seen.add(workflow.name)
+    result.push(workflow)
+  }
   // Built-in workflows are the LOWEST-precedence root: appended after every
-  // project/global directory so a same-named file already in `seen` shadows the
-  // builtin (first-wins). A builtin carries its module SOURCE inline and a
-  // synthetic `builtin:<name>` path marker — list() reads meta from that source
-  // string and start() loads the module from it, neither touching the filesystem.
+  // project/global/plugin source so a same-named earlier entry shadows the builtin
+  // (first-wins). A builtin carries its module SOURCE inline and a synthetic
+  // `builtin:<name>` path marker — list() reads meta from that source string and
+  // start() loads the module from it, neither touching the filesystem.
   for (const [name, source] of Object.entries(BUILTIN_WORKFLOWS)) {
     if (seen.has(name)) continue
     seen.add(name)
-    result.push({ name, path: builtinPath(name), source })
+    result.push({ name, path: builtinPath(name), source, kind: "builtin" })
   }
   return result.toSorted((a, b) => a.name.localeCompare(b.name))
+}
+
+function registeredPluginWorkflows(hooks: readonly Hooks[]): Discovered[] {
+  return hooks.flatMap((hook) =>
+    Object.entries(hook.workflow ?? {}).map(([name, definition]) => {
+      const path = pluginPath(name)
+      if (!SAVE_NAME_PATTERN.test(name)) {
+        return {
+          name,
+          path,
+          kind: "plugin" as const,
+          error: "Workflow names may only contain letters, numbers, underscores, and dashes",
+        }
+      }
+      const source = pluginWorkflowSource(name, definition)
+      return source.ok ? { name, path, source: source.source, kind: "plugin" as const } : { name, path, kind: "plugin" as const, error: source.error }
+    }),
+  )
+}
+
+function pluginWorkflowSource(name: string, definition: WorkflowDefinition | string) {
+  if (typeof definition === "string") return { ok: true as const, source: definition }
+  if (!isRecord(definition) || !isRecord(definition.meta) || typeof definition.run !== "function")
+    return { ok: false as const, error: `Plugin workflow ${name} must be a source string or workflow definition` }
+  const meta = JSON.stringify(definition.meta)
+  if (!meta) return { ok: false as const, error: `Plugin workflow ${name} meta must be JSON serializable` }
+  return {
+    ok: true as const,
+    source: [`export const meta = ${meta}`, `export const run = ${workflowRunSource(definition.run)}`].join("\n"),
+  }
+}
+
+function workflowRunSource(run: WorkflowDefinition["run"]) {
+  const source = Function.prototype.toString.call(run).trim()
+  return source.replace(/^(async\s+)?([A-Za-z_$][\w$]*)\s*\(/, "$1function $2(")
+}
+
+function pluginWorkflowMismatch(workflow: Discovered, meta: Meta) {
+  return workflow.kind === "plugin" && meta.name !== workflow.name
+    ? `Plugin workflow ${workflow.name} meta.name must match the registered workflow name`
+    : undefined
 }
 
 function projectConfigDir(ctx: { directory: string; worktree: string }) {
@@ -1963,6 +2032,7 @@ function saveTargetPath(ctx: { directory: string; worktree: string }, scope: Sav
 function createContext(input: {
   active: Active
   agent: (input: AgentInput, callOpts?: { phaseModel?: string }) => Promise<{ data: unknown; text: string } | null>
+  tool: WorkflowToolFn
   shell: ContextApi["shell"]
   question: ContextApi["question"]
   workflow: ContextApi["workflow"]
@@ -2201,10 +2271,35 @@ function createContext(input: {
       const declared = input.phases?.find((entry) => entry.title === ai.phase)
       return input.agent({ ...ai, phase: (input.logPrefix ?? "") + ai.phase }, { phaseModel: declared?.model })
     },
+    tool: input.tool,
     shell: input.shell,
     question: input.question,
     workflow: input.workflow,
   }
+}
+
+function mcpOutput(result: unknown) {
+  if (!isRecord(result)) return { output: String(result), metadata: {} }
+  const content = Array.isArray(result.content) ? result.content : []
+  const output = content
+    .flatMap((item) => {
+      if (!isRecord(item)) return []
+      if (item.type === "text" && typeof item.text === "string") return [item.text]
+      if (item.type === "resource" && isRecord(item.resource)) {
+        if (typeof item.resource.text === "string") return [item.resource.text]
+        if (typeof item.resource.blob === "string") return [item.resource.blob]
+      }
+      return []
+    })
+    .join("\n\n")
+  return {
+    output,
+    metadata: isRecord(result.metadata) ? result.metadata : {},
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 export function fmt(list: Info[]) {
@@ -2245,6 +2340,7 @@ export const layer = Layer.effect(
     const config = yield* Config.Service
     const agents = yield* Agent.Service
     const sessions = yield* Session.Service
+    const providers = yield* Provider.Service
     const { db } = yield* Database.Service
     const events = yield* EventV2Bridge.Service
     // Item 23 (Stufe 1): the permission service gates ctx.shell; FSUtil and the
@@ -2253,6 +2349,10 @@ export const layer = Layer.effect(
     const permission = yield* Permission.Service
     const fsUtil = yield* FSUtil.Service
     const spawner = yield* ChildProcessSpawner
+    const catalog = yield* ToolCatalog.Service
+    const mcp = yield* MCP.Service
+    const plugin = yield* Plugin.Service
+    const truncate = yield* Truncate.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Workflow.state")(function* (ctx) {
         const runs = yield* SynchronizedRef.make(new Map<string, Active>())
@@ -2322,7 +2422,8 @@ export const layer = Layer.effect(
     const discoverWorkflows = Effect.fn("Workflow.discover")(function* () {
       const ctx = yield* InstanceState.context
       const directories = [...new Set([projectConfigDir(ctx), ...(yield* config.directories())])]
-      return yield* Effect.promise(() => discover(directories))
+      const hooks = yield* plugin.list()
+      return yield* Effect.promise(() => discover(directories, registeredPluginWorkflows(hooks)))
     })
 
     const list: Interface["list"] = Effect.fn("Workflow.list")(function* () {
@@ -2343,27 +2444,36 @@ export const layer = Layer.effect(
           // the source string directly either way, so a builtin is meta-extracted
           // through the identical static (never-executed) path. `source_kind` is
           // stamped only on builtins so consumers can tell them apart.
-          Effect.promise(() =>
-            workflow.source !== undefined ? Promise.resolve(workflow.source) : fs.readFile(workflow.path, "utf8"),
-          ).pipe(
-            Effect.map((source): Info => {
-              const kind = workflow.source !== undefined ? ({ source_kind: "builtin" } as const) : {}
-              const result = MetaReader.read(source, workflow.path)
-              return result.valid
-                ? { name: workflow.name, path: workflow.path, meta: result.meta, valid: true, ...kind }
-                : // Synthesize a minimal meta so the schema stays satisfied and
-                  // consumers can still show the file's name; `valid: false`
-                  // signals the entry is not runnable.
-                  {
-                    name: workflow.name,
-                    path: workflow.path,
-                    meta: { name: workflow.name },
-                    valid: false,
-                    error: result.error,
-                    ...kind,
-                  }
-            }),
-          ),
+          workflow.error
+            ? Effect.succeed<Info>({
+                name: workflow.name,
+                path: workflow.path,
+                meta: { name: workflow.name },
+                valid: false,
+                error: workflow.error,
+              })
+            : Effect.promise(() =>
+                workflow.source !== undefined ? Promise.resolve(workflow.source) : fs.readFile(workflow.path, "utf8"),
+              ).pipe(
+                Effect.map((source): Info => {
+                  const kind = workflow.kind === "builtin" ? ({ source_kind: "builtin" } as const) : {}
+                  const result = MetaReader.read(source, workflow.path)
+                  const mismatch = result.valid ? pluginWorkflowMismatch(workflow, result.meta) : undefined
+                  return result.valid && !mismatch
+                    ? { name: workflow.name, path: workflow.path, meta: result.meta, valid: true, ...kind }
+                    : // Synthesize a minimal meta so the schema stays satisfied and
+                      // consumers can still show the file's name; `valid: false`
+                      // signals the entry is not runnable.
+                      {
+                        name: workflow.name,
+                        path: workflow.path,
+                        meta: { name: workflow.name },
+                        valid: false,
+                        error: mismatch ?? (result.valid ? "invalid workflow" : result.error),
+                        ...kind,
+                      }
+                }),
+              ),
         { concurrency: "unbounded" },
       )
     })
@@ -2383,7 +2493,7 @@ export const layer = Layer.effect(
         name: found.name,
         path: found.path,
         source,
-        ...(found.source !== undefined ? ({ source_kind: "builtin" } as const) : {}),
+        ...(found.kind === "builtin" ? ({ source_kind: "builtin" } as const) : {}),
       }
     })
 
@@ -2557,6 +2667,7 @@ export const layer = Layer.effect(
         const discovered = yield* discoverWorkflows()
         const found = discovered.find((item) => item.name === input.name)
         if (!found) return yield* new NotFoundError({ name: input.name ?? "" })
+        if (found.error) return yield* new InvalidError({ path: found.path, message: found.error })
         target = { name: found.name, path: found.path, source: found.source }
         // Static meta gate, IDENTICAL to the inline path above: validate the
         // source AST-only (never executing the module) BEFORE loadModule imports
@@ -2581,6 +2692,8 @@ export const layer = Layer.effect(
               })
         const gate = MetaReader.read(sourceText, target.path)
         if (gate.valid === false) return yield* new InvalidError({ path: target.path, message: gate.error })
+        const mismatch = pluginWorkflowMismatch(target, gate.meta)
+        if (mismatch) return yield* new InvalidError({ path: target.path, message: mismatch })
       }
       // tryPromise so a load failure (bad meta / missing run / syntax error)
       // surfaces as a typed InvalidError naming the file, not as an unhandled
@@ -3648,6 +3761,177 @@ export const layer = Layer.effect(
           throw error
         })
 
+      const tool: WorkflowToolFn = ((name: string, args?: Record<string, unknown>, options?: ToolInput) => {
+        if (runSignal?.aborted || active.cancelling || active.pausing || active.removed) throw new CancelledError()
+        const toolArgs = args ?? {}
+        active.run.logs.push({
+          time: Date.now(),
+          phase: active.run.current_phase,
+          message: `tool ${name} started`,
+        })
+        persistInScope(active, bridge, db, events)
+
+        return dispatch(
+          Effect.gen(function* () {
+            const selected = input.caller?.agent
+              ? yield* agents.get(input.caller.agent).pipe(Effect.catchCause(() => agents.defaultInfo()))
+              : yield* agents.defaultInfo()
+            const modelInfo = active.callerModel
+              ? {
+                  providerID: ProviderV2.ID.make(active.callerModel.providerID),
+                  modelID: ModelV2.ID.make(active.callerModel.modelID),
+                }
+              : (selected.model ?? (yield* providers.defaultModel()))
+            const model = yield* providers.getModel(modelInfo.providerID, modelInfo.modelID)
+            const messageID = MessageID.ascending()
+            const callID = `workflow_${active.run.id}_${name}_${Date.now()}`
+            const controller = new AbortController()
+            const sessionID = SessionID.make(active.run.session_id!)
+            const ruleset = Permission.merge(selected.permission, active.shellRuleset)
+            const ctx: Tool.Context = {
+              sessionID,
+              messageID,
+              callID,
+              agent: selected.name,
+              abort: controller.signal,
+              messages: [],
+              extra: {
+                model,
+                promptOps: input.prompt,
+                turnBudget: active.pool,
+              },
+              metadata: (val) =>
+                Effect.sync(() => {
+                  active.run.logs.push({
+                    time: Date.now(),
+                    phase: active.run.current_phase,
+                    message: `tool ${name} metadata${val.title ? `: ${val.title}` : ""}`,
+                  })
+                  persistInScope(active, bridge, db, events)
+                }),
+              ask: (req) =>
+                permission
+                  .ask({
+                    ...req,
+                    sessionID: input.permissionSessionID ?? sessionID,
+                    tool: { messageID, callID },
+                    ruleset,
+                  })
+                  .pipe(Effect.orDie),
+            }
+
+            const native = (
+              yield* catalog.tools({
+                providerID: model.providerID,
+                modelID: ModelV2.ID.make(model.id),
+                agent: selected,
+                ultracode: false,
+              })
+            ).find((tool) => tool.id === name)
+            if (native) {
+              yield* plugin.trigger(
+                "tool.execute.before",
+                { tool: name, sessionID: ctx.sessionID, callID: ctx.callID },
+                { args: toolArgs },
+              )
+              const result = yield* native.execute(toolArgs, ctx).pipe(
+                Effect.onInterrupt(() => Effect.sync(() => controller.abort())),
+              )
+              const output = {
+                ...result,
+                attachments: result.attachments?.map((attachment) => ({
+                  ...attachment,
+                  id: PartID.ascending(),
+                  sessionID: ctx.sessionID,
+                  messageID,
+                })),
+              }
+              yield* plugin.trigger(
+                "tool.execute.after",
+                { tool: name, sessionID: ctx.sessionID, callID: ctx.callID, args: toolArgs },
+                output,
+              )
+              return { output: output.output, metadata: output.metadata } satisfies WorkflowToolResult
+            }
+
+            const mcpTool = (yield* mcp.tools())[name]
+            const execute = mcpTool?.execute
+            if (!execute) {
+              const available = [
+                ...(yield* catalog.tools({
+                  providerID: model.providerID,
+                  modelID: ModelV2.ID.make(model.id),
+                  agent: selected,
+                  ultracode: false,
+                })).map((tool) => tool.id),
+                ...Object.keys(yield* mcp.tools()),
+              ].toSorted()
+              return yield* Effect.fail(
+                new Error(`ctx.tool unknown tool: ${name}. Available tools: ${available.join(", ")}`),
+              )
+            }
+
+            yield* ctx.ask({ permission: name, metadata: {}, patterns: ["*"], always: ["*"] })
+            yield* plugin.trigger(
+              "tool.execute.before",
+              { tool: name, sessionID: ctx.sessionID, callID: ctx.callID },
+              { args: toolArgs },
+            )
+            const result = yield* Effect.tryPromise(() =>
+              Promise.resolve(
+                execute(toolArgs, {
+                  toolCallId: callID,
+                  messages: [],
+                  abortSignal: controller.signal,
+                }),
+              ),
+            ).pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
+            yield* plugin.trigger(
+              "tool.execute.after",
+              { tool: name, sessionID: ctx.sessionID, callID, args: toolArgs },
+              result,
+            )
+            const output = mcpOutput(result)
+            const truncated = yield* truncate.output(output.output, {}, selected)
+            return {
+              output: truncated.content,
+              metadata: {
+                ...output.metadata,
+                truncated: truncated.truncated,
+                ...(truncated.truncated && { outputPath: truncated.outputPath }),
+              },
+            } satisfies WorkflowToolResult
+          }).pipe(
+            options?.timeout
+              ? Effect.timeoutOrElse({
+                  duration: options.timeout,
+                  orElse: () => Effect.fail(new Error(`ctx.tool ${name} timed out after ${options.timeout}ms`)),
+                })
+              : (effect) => effect,
+          ),
+        ).then(
+          (result) => {
+            active.run.logs.push({
+              time: Date.now(),
+              phase: active.run.current_phase,
+              message: `tool ${name} completed`,
+            })
+            persistInScope(active, bridge, db, events)
+            return result
+          },
+          (error) => {
+            active.run.logs.push({
+              time: Date.now(),
+              phase: active.run.current_phase,
+              message: `tool ${name} failed: ${errorText(error)}`,
+            })
+            persistInScope(active, bridge, db, events)
+            if (options?.onError === "null" && !(error instanceof CancelledError)) return null
+            throw error
+          },
+        )
+      }) as WorkflowToolFn
+
       // Deterministic non-LLM step. Runs a shell command in the run's workspace
       // (or an explicit `cwd`) and resolves to `{ output, exitCode }` WITHOUT
       // touching `costSpent`/budget or starting an agent — it deliberately does
@@ -3887,6 +4171,7 @@ export const layer = Layer.effect(
         createContext({
           active,
           agent,
+          tool,
           shell,
           question,
           workflow: (name, childArgs) => runNested(ctxInput.depth, name, childArgs),
@@ -3928,6 +4213,7 @@ export const layer = Layer.effect(
         if (!target) {
           throw new InvalidError({ path: active.run.workflow, message: `Workflow not found: ${name}` })
         }
+        if (target.error) throw new InvalidError({ path: target.path, message: target.error })
         // Static meta gate, same as start()'s name branch: a nested child module
         // is validated AST-only BEFORE loadModule imports (and thereby executes)
         // it, so computed meta cannot slip in through the ctx.workflow seam
@@ -3946,6 +4232,8 @@ export const layer = Layer.effect(
               )
         const childGate = MetaReader.read(childSource, target.path)
         if (childGate.valid === false) throw new InvalidError({ path: target.path, message: childGate.error })
+        const childMismatch = pluginWorkflowMismatch(target, childGate.meta)
+        if (childMismatch) throw new InvalidError({ path: target.path, message: childMismatch })
         const childModule = await loadModule(target.path, target.source)
         const coerced = coerceArgs(childArgs, childModule.meta.arguments, target.path)
         if (coerced instanceof InvalidError) throw coerced
@@ -4496,6 +4784,10 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Permission.defaultLayer),
   Layer.provide(FSUtil.defaultLayer),
   Layer.provide(CrossSpawnSpawner.defaultLayer),
+  Layer.provide(ToolCatalog.defaultLayer),
+  Layer.provide(MCP.defaultLayer),
+  Layer.provide(Plugin.defaultLayer),
+  Layer.provide(Truncate.defaultLayer),
 )
 
 export const node = LayerNode.make(layer, [
@@ -4509,6 +4801,10 @@ export const node = LayerNode.make(layer, [
   Permission.node,
   FSUtil.node,
   CrossSpawnSpawner.node,
+  ToolCatalog.node,
+  MCP.node,
+  Plugin.node,
+  Truncate.node,
 ])
 
 export * as Workflow from "./workflow"

@@ -6,6 +6,7 @@ import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
+import { pathToFileURL } from "url"
 import type { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { WorkflowTool, workflowDescription, WORKFLOW_GATE_DEFAULT, WORKFLOW_GATE_ULTRACODE } from "@/tool/workflow"
@@ -60,6 +61,35 @@ async function writeWorkflow(dir: string, name: string, source: string) {
   const workflows = path.join(dir, ".opencode", "workflows")
   await fs.mkdir(workflows, { recursive: true })
   await Bun.write(path.join(workflows, `${name}.ts`), source)
+}
+
+async function writePluginFile(dir: string, fileName: string, workflows: Record<string, string>) {
+  const file = path.join(dir, fileName)
+  await Bun.write(
+    file,
+    `export default async function Plugin() {
+  return {
+    workflow: ${JSON.stringify(workflows, null, 6)}
+  }
+}
+`,
+  )
+  return pathToFileURL(file).href
+}
+
+async function writePlugin(dir: string, workflows: Record<string, string>) {
+  const spec = await writePluginFile(dir, "workflow-plugin.ts", workflows)
+  await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ $schema: "https://opencode.ai/config.json", plugin: [spec] }))
+}
+
+function pluginWorkflowSource(name: string, marker: string) {
+  return `export default {
+  meta: { name: ${JSON.stringify(name)}, description: ${JSON.stringify(marker)} },
+  async run(args, ctx) {
+    ctx.log(${JSON.stringify(`${marker} ran`)})
+    return { marker: ${JSON.stringify(marker)}, value: args.value ?? null }
+  }
+}`
 }
 
 // Item 18: temporary starts persist their script under the GLOBAL data dir
@@ -222,6 +252,7 @@ export async function run() { return "ok" }
         "ctx.log",
         "ctx.workflow",
         "ctx.budget",
+        "ctx.tool",
         "filter((x) => x !== null)",
         "run(args, ctx)",
       ]) {
@@ -315,6 +346,234 @@ export async function run(args, ctx) { ctx.setPhase("run"); ctx.log("running"); 
         expect(recorder.requests[0].always).toEqual(["hello"])
         expect(result.output).toContain(`<workflow_run id="${result.metadata.runId}" state="completed">`)
         expect(result.output).toContain('"value": 42')
+      }),
+    ),
+  )
+
+  it.live("plugin workflow appears in discovery", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => writePlugin(dir, { "plugin-list": pluginWorkflowSource("plugin-list", "from plugin") }))
+
+        const workflow = yield* Workflow.Service
+        const info = (yield* workflow.list()).find((item) => item.name === "plugin-list")
+
+        expect(info?.valid).toBe(true)
+        expect(info?.path).toBe("plugin:plugin-list")
+        expect(info?.meta.description).toBe("from plugin")
+      }),
+    ),
+    15000,
+  )
+
+  it.live("first loaded plugin wins duplicate workflow names", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(async () => {
+          const first = await writePluginFile(dir, "workflow-plugin-first.ts", {
+            duplicate: pluginWorkflowSource("duplicate", "from first plugin"),
+          })
+          const second = await writePluginFile(dir, "workflow-plugin-second.ts", {
+            duplicate: pluginWorkflowSource("duplicate", "from second plugin"),
+          })
+          await Bun.write(
+            path.join(dir, "opencode.json"),
+            JSON.stringify({ $schema: "https://opencode.ai/config.json", plugin: [first, second] }),
+          )
+        })
+
+        const workflow = yield* Workflow.Service
+        const info = (yield* workflow.list()).find((item) => item.name === "duplicate")
+
+        expect(info?.valid).toBe(true)
+        expect(info?.meta.description).toBe("from first plugin")
+      }),
+    ),
+    15000,
+  )
+
+  it.live("project workflow shadows plugin workflow with same name", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(async () => {
+          await writePlugin(dir, { shadowed: pluginWorkflowSource("shadowed", "from plugin") })
+          await writeWorkflow(
+            dir,
+            "shadowed",
+            `export const meta = { name: "shadowed", description: "from project" }
+export async function run() { return { marker: "from project" } }
+`,
+          )
+        })
+
+        const workflow = yield* Workflow.Service
+        const info = (yield* workflow.list()).find((item) => item.name === "shadowed")
+
+        expect(info?.valid).toBe(true)
+        expect(info?.path.endsWith(path.join(".opencode", "workflows", "shadowed.ts"))).toBe(true)
+        expect(info?.meta.description).toBe("from project")
+      }),
+    ),
+    15000,
+  )
+
+  it.live("global workflow shadows plugin workflow with same name", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        const name = `global-plugin-shadow-${Date.now()}`
+        const globalFile = path.join(Global.Path.config, "workflows", `${name}.ts`)
+        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(globalFile, { force: true })))
+        yield* Effect.promise(async () => {
+          await writePlugin(dir, { [name]: pluginWorkflowSource(name, "from plugin") })
+          await fs.mkdir(path.dirname(globalFile), { recursive: true })
+          await Bun.write(
+            globalFile,
+            `export const meta = { name: ${JSON.stringify(name)}, description: "from global" }
+export async function run() { return { marker: "from global" } }
+`,
+          )
+        })
+
+        const workflow = yield* Workflow.Service
+        const info = (yield* workflow.list()).find((item) => item.name === name)
+
+        expect(info?.valid).toBe(true)
+        expect(info?.path).toBe(globalFile)
+        expect(info?.meta.description).toBe("from global")
+      }),
+    ),
+    15000,
+  )
+
+  it.live("plugin workflow shadows built-in workflow with same name", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => writePlugin(dir, { "deep-research": pluginWorkflowSource("deep-research", "from plugin") }))
+
+        const workflow = yield* Workflow.Service
+        const info = (yield* workflow.list()).find((item) => item.name === "deep-research")
+
+        expect(info?.valid).toBe(true)
+        expect(info?.path).toBe("plugin:deep-research")
+        expect(info?.source_kind).toBeUndefined()
+        expect(info?.meta.description).toBe("from plugin")
+      }),
+    ),
+    15000,
+  )
+
+  it.live("starts plugin workflow", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => writePlugin(dir, { "plugin-run": pluginWorkflowSource("plugin-run", "from plugin") }))
+
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute(
+          { action: "start", name: "plugin-run", args: { value: 42 } },
+          requestRecorder().ctx,
+        )
+
+        expect(result.output).toContain('"marker": "from plugin"')
+        expect(result.output).toContain('"value": 42')
+      }),
+    ),
+    15000,
+  )
+
+  it.live("invalid plugin workflow source fails clearly", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writePlugin(dir, {
+            "bad-plugin": `export const meta = { name: dynamicName }
+export async function run() { return null }
+`,
+          }),
+        )
+
+        const tool = yield* workflowTool()
+        const exit = yield* Effect.exit(tool.execute({ action: "start", name: "bad-plugin" }, requestRecorder().ctx))
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("Invalid workflow plugin:bad-plugin")
+      }),
+    ),
+    15000,
+  )
+
+  it.live("workflow ctx.tool calls a native read tool", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => fs.writeFile(path.join(dir, "target.txt"), "hello from ctx.tool\n"))
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "toolread",
+            `export const meta = { name: "ToolRead", description: "Read via ctx.tool." }
+export async function run(args, ctx) {
+  const result = await ctx.tool("read", { filePath: "target.txt" })
+  return { hasContent: result.output.includes("hello from ctx.tool"), truncated: result.metadata?.truncated }
+}
+`,
+          ),
+        )
+
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "start", name: "toolread" }, requestRecorder().ctx)
+        const workflow = yield* Workflow.Service
+        const run = yield* workflow.get(Workflow.RunID.make(result.metadata.runId as string))
+
+        expect(result.output).toContain('"hasContent": true')
+        expect(result.output).toContain('"truncated": false')
+        expect(run?.logs.some((entry) => entry.message === "tool read completed")).toBe(true)
+      }),
+    ),
+  )
+
+  it.live("workflow ctx.tool onError null resolves null", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "toolnullable",
+            `export const meta = { name: "ToolNullable", description: "Null failed tool." }
+export async function run(args, ctx) {
+  const result = await ctx.tool("missing_tool", {}, { onError: "null" })
+  return { isNull: result === null }
+}
+`,
+          ),
+        )
+
+        const tool = yield* workflowTool()
+        const result = yield* tool.execute({ action: "start", name: "toolnullable" }, requestRecorder().ctx)
+
+        expect(result.output).toContain('"isNull": true')
+      }),
+    ),
+  )
+
+  it.live("workflow ctx.tool invalid name fails clearly", () =>
+    provideTmpdirInstance((dir) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeWorkflow(
+            dir,
+            "toolmissing",
+            `export const meta = { name: "ToolMissing", description: "Missing tool." }
+export async function run(args, ctx) {
+  await ctx.tool("missing_tool")
+}
+`,
+          ),
+        )
+
+        const tool = yield* workflowTool()
+        const exit = yield* Effect.exit(tool.execute({ action: "start", name: "toolmissing" }, requestRecorder().ctx))
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain("ctx.tool unknown tool: missing_tool")
       }),
     ),
   )

@@ -82,6 +82,20 @@ export type WorkflowAgentResult = {
   text: string
 }
 
+export type WorkflowToolOptions = {
+  timeout?: number
+  onError?: "fail" | "null"
+}
+
+export type WorkflowToolResult = {
+  output: string
+  metadata?: Record<string, unknown>
+}
+
+export interface WorkflowToolFn {
+  (name: string, args?: Record<string, unknown>, options?: WorkflowToolOptions & { onError: "null" }): Promise<WorkflowToolResult | null>
+  (name: string, args?: Record<string, unknown>, options?: WorkflowToolOptions): Promise<WorkflowToolResult>
+}
 export type WorkflowParallelOptions = { concurrencyLimit?: number }
 export type WorkflowPipelineOptions = { concurrencyLimit?: number }
 
@@ -178,6 +192,12 @@ export type WorkflowContext = {
    */
   agent(input: WorkflowAgentInput): Promise<WorkflowAgentResult | null>
   /**
+   * Call an available opencode tool directly from the workflow without dispatching
+   * an agent step. Uses the same permission path as normal tool calls. With
+   * `onError: "null"`, a failing tool call resolves `null` instead of failing the run.
+   */
+  tool: WorkflowToolFn
+  /**
    * Deterministic non-LLM step: run a shell command in the run's workspace (or an
    * explicit `cwd`) and resolve to `{ output, exitCode }`. Unlike `agent()`, this
    * consumes NO LLM turn and does NOT touch the run's budget — `budget.spent()`
@@ -212,6 +232,17 @@ export type WorkflowContext = {
  */
 export type WorkflowPhase = string | { title: string; detail?: string; model?: string }
 
+export type WorkflowDefinition<Args extends WorkflowArguments | undefined = WorkflowArguments | undefined> = {
+  meta: {
+    name: string
+    description?: string
+    whenToUse?: string
+    phases?: readonly WorkflowPhase[]
+    arguments?: Args
+  }
+  run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
+}
+
 export function workflow<const Args extends WorkflowArguments | undefined = undefined>(input: {
   name: string
   description?: string
@@ -219,7 +250,7 @@ export function workflow<const Args extends WorkflowArguments | undefined = unde
   phases?: readonly WorkflowPhase[]
   arguments?: Args
   run(args: WorkflowArgs<Args>, ctx: WorkflowContext): Promise<unknown>
-}) {
+}): WorkflowDefinition<Args> {
   return {
     meta: {
       name: input.name,
