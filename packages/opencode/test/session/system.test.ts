@@ -1,14 +1,14 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
 import type { Agent } from "../../src/agent/agent"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
+import type { Provider } from "../../src/provider/provider"
 import { SystemPrompt } from "../../src/session/system"
-import { ULTRACODE_SYSTEM_SECTION, WORKFLOW_TRIGGER_GUIDANCE } from "../../src/tool/workflow"
-import { LocationServiceMap } from "@opencode-ai/core/location-layer"
+import { MCP } from "../../src/mcp"
 import { testEffect } from "../lib/effect"
-import { Workflow } from "../../src/workflow/workflow"
 
 const skills: Skill.Info[] = [
   {
@@ -43,55 +43,28 @@ const build: Agent.Info = {
   options: {},
 }
 
-// Item 13: an agent whose ruleset denies the workflow tool outright — the
-// ultracode section must never appear for it.
-const noWorkflow: Agent.Info = {
-  name: "no-workflow",
-  mode: "primary",
-  permission: Permission.fromConfig({ "*": "allow", workflow: "deny" }),
-  options: {},
-}
-
 const it = testEffect(
-  SystemPrompt.layer.pipe(
-    Layer.provide(LocationServiceMap.layer),
-    Layer.provide(
-      Layer.succeed(
-        Workflow.Service,
-        Workflow.Service.of({
-          list: () =>
-            Effect.succeed([
-              {
-                name: "release_notes",
-                path: "/tmp/release_notes.ts",
-                meta: {
-                  name: "Release Notes",
-                  description: "Draft release notes.",
-                  phases: [{ title: "draft" }, { title: "review" }],
-                  arguments: {
-                    version: { type: "string", description: "Version to summarize." },
-                  },
-                },
-                valid: true,
-              },
-            ]),
-          read: () => Effect.succeed(undefined),
-          runs: () => Effect.succeed([]),
-          get: () => Effect.succeed(undefined),
-          start: () => Effect.fail(new Workflow.NotFoundError({ name: "test" })),
-          wait: () => Effect.succeed({ timedOut: false }),
-          cancel: () => Effect.succeed(undefined),
-          pause: () => Effect.succeed(undefined),
-          skipAgent: () => Effect.succeed(undefined),
-          answer: () => Effect.succeed(undefined),
-          save: () => Effect.succeed({ path: "/tmp/test.ts" }),
-          export: () => Effect.succeed(undefined),
-          remove: () => Effect.succeed(false),
-          sweep: () => Effect.void,
-        }),
-      ),
-    ),
-    Layer.provide(
+  LayerNode.compile(SystemPrompt.node, [
+    [
+      MCP.node,
+      Layer.mock(MCP.Service, {
+        instructions: () =>
+          Effect.succeed([
+            {
+              name: "guide-server",
+              instructions: "Use lookup before mutate.",
+              tools: [],
+            },
+            {
+              name: "tool-server",
+              instructions: "Prefer search before update.",
+              tools: ["tool-server_search", "tool-server_update"],
+            },
+          ]),
+      }),
+    ],
+    [
+      Skill.node,
       Layer.succeed(
         Skill.Service,
         Skill.Service.of({
@@ -106,11 +79,17 @@ const it = testEffect(
           available: () => Effect.succeed(skills),
         }),
       ),
-    ),
-  ),
+    ],
+  ]),
 )
 
 describe("session.system", () => {
+  test("selects the Meta prompt for Muse Spark model IDs", () => {
+    expect(SystemPrompt.provider({ api: { id: "meta/muse-spark-preview" } } as Provider.Model)[0]).toContain(
+      "Meta Muse Spark",
+    )
+  })
+
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
@@ -128,64 +107,43 @@ describe("session.system", () => {
       expect(middle).toBeGreaterThan(alpha)
       expect(zeta).toBeGreaterThan(middle)
       expect(output).not.toContain("manual-skill")
-      expect(output).toContain("<available_workflows>")
-      expect(output).toContain("<name>release_notes</name>")
     }),
   )
 
-  // Item 3: the workflow section carries the trigger list, the offer path with
-  // its cost mention, and the hybrid-scout recommendation — verbatim from the
-  // shared constant (the tool DESCRIPTION spreads the same one, so no drift).
-  it.effect("workflow section names triggers, offer path, and hybrid scouting", () =>
+  it.effect("MCP output includes connected server instructions", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.skills(build)
-      expect(output).toBeDefined()
-      for (const line of WORKFLOW_TRIGGER_GUIDANCE) expect(output).toContain(line)
-      expect(output).toContain("ultracode")
-      expect(output).toContain("OFFER a workflow")
-      expect(output).toContain("extra cost")
-      expect(output).toContain("discover the work list inline first")
+      const output = yield* prompt.mcp(build)
+
+      expect(output).toBe(
+        [
+          "<mcp_instructions>",
+          '  <server name="guide-server">',
+          "    Use lookup before mutate.",
+          "  </server>",
+          '  <server name="tool-server">',
+          "    Prefer search before update.",
+          "  </server>",
+          "</mcp_instructions>",
+        ].join("\n"),
+      )
     }),
   )
 
-  // Item 13: session.metadata.ultracode appends the standing opt-in section
-  // (quality over cost) AFTER the workflow section — replacing the clients'
-  // former per-message session directive.
-  it.effect("ultracode opt-in section is appended after the workflow section", () =>
+  it.effect("MCP output omits servers when all advertised tools are denied", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.skills(build, { ultracode: true })
-      expect(output).toBeDefined()
-      expect(output).toContain(ULTRACODE_SYSTEM_SECTION)
-      expect(output).toContain("quality over cost")
-      expect(output).toContain("standing opt-in for the whole session")
-      const workflowSection = output!.indexOf("<available_workflows>")
-      const ultracodeSection = output!.indexOf(ULTRACODE_SYSTEM_SECTION)
-      expect(workflowSection).toBeGreaterThan(-1)
-      expect(ultracodeSection).toBeGreaterThan(workflowSection)
-    }),
-  )
+      const output = yield* prompt.mcp(build, Permission.fromConfig({ "tool-server_*": "deny" }))
 
-  it.effect("no ultracode section without the flag", () =>
-    Effect.gen(function* () {
-      const prompt = yield* SystemPrompt.Service
-      const plain = yield* prompt.skills(build)
-      const explicit = yield* prompt.skills(build, { ultracode: false })
-      expect(plain).not.toContain(ULTRACODE_SYSTEM_SECTION)
-      expect(explicit).not.toContain(ULTRACODE_SYSTEM_SECTION)
-    }),
-  )
-
-  it.effect("workflow-permission deny suppresses the ultracode section", () =>
-    Effect.gen(function* () {
-      const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.skills(noWorkflow, { ultracode: true })
-      expect(output).toBeDefined()
-      expect(output).not.toContain(ULTRACODE_SYSTEM_SECTION)
-      expect(output).not.toContain("quality over cost")
-      // The deny also hides the workflow roster itself (pre-existing behavior).
-      expect(output).not.toContain("<available_workflows>")
+      expect(output).toBe(
+        [
+          "<mcp_instructions>",
+          '  <server name="guide-server">',
+          "    Use lookup before mutate.",
+          "  </server>",
+          "</mcp_instructions>",
+        ].join("\n"),
+      )
     }),
   )
 })

@@ -1,8 +1,7 @@
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
-import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { afterEach, describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber } from "effect"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -22,24 +21,14 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import type { SessionPrompt } from "@/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { PartID } from "@/session/schema"
+import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 
-// Session.defaultLayer is merged so a test can create a REAL caller session and
-// drive ctx.sessionID with its id. Effect layer memoization shares the single
-// Session service the ToolRegistry already builds internally, so a session
-// created here is the same one the workflow tool's background completion path
-// reads via `sessions.get(ctx.sessionID)` before delivering its message.
-// Workflow.defaultLayer is merged so a test can read the engine's run state via
-// `Workflow.Service` (e.g. asserting a started run carries resume_of). Effect
-// layer memoization shares the single Workflow service the ToolRegistry already
-// builds internally, so a run started through the tool is the same run this
-// service reads back — mirroring why Session.defaultLayer is merged here.
 const it = testEffect(
-  Layer.mergeAll(
-    ToolRegistry.defaultLayer,
-    Session.defaultLayer,
-    Workflow.defaultLayer,
-    CrossSpawnSpawner.defaultLayer,
-  ).pipe(Layer.provide(Ripgrep.defaultLayer)),
+  AppNodeBuilderV1.build(
+    LayerNode.group([ToolRegistry.node, Session.node, Workflow.node, CrossSpawnSpawner.node, SessionProjector.node]),
+  ),
 )
 
 const baseCtx: Omit<Tool.Context, "ask"> = {

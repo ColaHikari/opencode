@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
-import { jsonSchema, type Tool as AITool, type ToolExecutionOptions } from "ai"
+import type { ToolExecutionOptions } from "ai"
 import type { Agent } from "@/agent/agent"
 import { MCP } from "@/mcp"
 import { Permission } from "@/permission"
@@ -16,6 +16,7 @@ import { SessionTools } from "@/session/tools"
 import { McpLazyActivation } from "@/session/mcp-lazy"
 import { MessageID, SessionID } from "@/session/schema"
 import { testEffect } from "../lib/effect"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 
 // Item 28: MCP tools lazy via the tool_search meta-tool. The MCP service is a
 // stub with two fake tools; everything else resolve() touches is stubbed to a
@@ -30,24 +31,36 @@ const it = testEffect(Layer.mergeAll(McpLazyActivation.defaultLayer))
 // Fresh tool objects per call — the eager registration mutates item.inputSchema
 // and item.execute in place, exactly like the real MCP.tools() result (built
 // fresh per call).
-function fakeMcpTools(): Record<string, AITool> {
+function fakeMcpTools(): Record<string, MCP.McpTool> {
+  const client = {
+    callTool: async (input: { name: string }) => ({
+      content: [{ type: "text" as const, text: input.name.includes("forecast") ? "sunny" : "created" }],
+    }),
+  }
   return {
     "weather_get-forecast": {
-      description: "Get the weather forecast for a city",
-      inputSchema: jsonSchema({ type: "object", properties: { city: { type: "string" } }, required: ["city"] }),
-      execute: async () => ({ content: [{ type: "text", text: "sunny" }] }),
-    } as unknown as AITool,
+      def: {
+        name: "get-forecast",
+        description: "Get the weather forecast for a city",
+        inputSchema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+      },
+      client,
+    } as unknown as MCP.McpTool,
     "tickets_create-issue": {
-      description: "Create an issue in the ticket tracker",
-      inputSchema: jsonSchema({ type: "object", properties: { title: { type: "string" } } }),
-      execute: async () => ({ content: [{ type: "text", text: "created" }] }),
-    } as unknown as AITool,
+      def: {
+        name: "create-issue",
+        description: "Create an issue in the ticket tracker",
+        inputSchema: { type: "object", properties: { title: { type: "string" } } },
+      },
+      client,
+    } as unknown as MCP.McpTool,
   }
 }
 
-const mcpStub = (tools: () => Record<string, AITool>) =>
+const mcpStub = (tools: () => Record<string, MCP.McpTool>) =>
   MCP.Service.of({
     tools: () => Effect.sync(tools),
+    clients: () => Effect.succeed({}),
   } as unknown as MCP.Interface)
 
 const pluginStub = Plugin.Service.of({
@@ -92,7 +105,7 @@ function resolveInput(sessionID: SessionID, mcpMode?: "eager" | "lazy") {
 }
 
 const provideStubs =
-  (tools: () => Record<string, AITool>) =>
+  (tools: () => Record<string, MCP.McpTool>) =>
   <A, E, R>(self: Effect.Effect<A, E, R>) =>
     self.pipe(
       Effect.provideService(Plugin.Service, pluginStub),
@@ -100,6 +113,7 @@ const provideStubs =
       Effect.provideService(ToolRegistry.Service, registryStub),
       Effect.provideService(MCP.Service, mcpStub(tools)),
       Effect.provideService(Truncate.Service, truncateStub),
+      Effect.provide(RuntimeFlags.layer()),
     )
 
 const callOptions = { toolCallId: "call_lazy_test", messages: [] } as unknown as ToolExecutionOptions

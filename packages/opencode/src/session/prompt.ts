@@ -16,7 +16,7 @@ import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
 import { Plugin } from "../plugin"
-import MAX_STEPS from "../session/prompt/max-steps.txt"
+import { MAX_STEPS_PROMPT as MAX_STEPS } from "@opencode-ai/core/session/runner/max-steps"
 import { ToolRegistry } from "@/tool/registry"
 import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
@@ -1045,12 +1045,12 @@ export const layer = Layer.effect(
           }
           if (part.type === "file") {
             result.files.push(
-              new FileAttachment({
+              FileAttachment.make({
                 uri: part.url,
                 mime: part.mime,
                 name: part.filename,
                 source: part.source
-                  ? new Source({
+                  ? Source.make({
                       start: part.source.text.start,
                       end: part.source.text.end,
                       text: part.source.text.value,
@@ -1061,10 +1061,10 @@ export const layer = Layer.effect(
           }
           if (part.type === "agent") {
             result.agents.push(
-              new AgentAttachment({
+              AgentAttachment.make({
                 name: part.name,
                 source: part.source
-                  ? new Source({
+                  ? Source.make({
                       start: part.source.start,
                       end: part.source.end,
                       text: part.source.value,
@@ -1089,7 +1089,7 @@ export const layer = Layer.effect(
           messageID: SessionMessage.ID.create(),
           timestamp: DateTime.makeUnsafe(info.time.created),
           delivery: "steer",
-          prompt: new Prompt({
+          prompt: Prompt.make({
             text: nextPrompt.text.join("\n"),
             files: nextPrompt.files,
             agents: nextPrompt.agents,
@@ -1322,6 +1322,7 @@ export const layer = Layer.effect(
             Effect.provideService(MCP.Service, mcp),
             Effect.provideService(Truncate.Service, truncate),
             Effect.provideService(McpLazyActivation.Service, mcpLazy),
+            Effect.provideService(RuntimeFlags.Service, flags),
           )
 
           if (lastUser.format?.type === "json_schema") {
@@ -1585,44 +1586,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = Layer.suspend(() =>
-  layer.pipe(
-    Layer.provide(SessionRunState.defaultLayer),
-    Layer.provide(SessionStatus.defaultLayer),
-    Layer.provide(SessionCompaction.defaultLayer),
-    Layer.provide(SessionProcessor.defaultLayer),
-    Layer.provide(Command.defaultLayer),
-    Layer.provide(Permission.defaultLayer),
-    Layer.provide(MCP.defaultLayer),
-    Layer.provide(LSP.defaultLayer),
-    Layer.provide(ToolRegistry.defaultLayer),
-    Layer.provide(Truncate.defaultLayer),
-    Layer.provide(Provider.defaultLayer),
-    Layer.provide(Config.defaultLayer),
-    Layer.provide(Instruction.defaultLayer),
-    Layer.provide(FSUtil.defaultLayer),
-    Layer.provide(Plugin.defaultLayer),
-    Layer.provide(Session.defaultLayer),
-    Layer.provide(SessionRevert.defaultLayer),
-    Layer.provide(SessionSummary.defaultLayer),
-    Layer.provide(Image.defaultLayer),
-    Layer.provide(
-      Layer.mergeAll(
-        Agent.defaultLayer,
-        Database.defaultLayer,
-        SystemPrompt.defaultLayer,
-        LLM.defaultLayer,
-        CrossSpawnSpawner.defaultLayer,
-        RuntimeFlags.defaultLayer,
-        EventV2Bridge.defaultLayer,
-        // Item 28: lazy-MCP activation state. Lives in this mergeAll (not as
-        // another pipe step) — the surrounding pipe is at the overload limit,
-        // one more argument collapses its inference to Layer<unknown, …>.
-        McpLazyActivation.defaultLayer,
-      ),
-    ),
-  ),
-)
 const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
@@ -1751,35 +1714,38 @@ const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
 
-export const node = LayerNode.make(layer, [
-  SessionStatus.node,
-  Session.node,
-  Agent.node,
-  Provider.node,
-  SessionProcessor.node,
-  SessionCompaction.node,
-  Plugin.node,
-  Command.node,
-  Config.node,
-  Permission.node,
-  FSUtil.node,
-  MCP.node,
-  LSP.node,
-  ToolRegistry.node,
-  Truncate.node,
-  // Item 28: lazy-MCP activation state.
-  McpLazyActivation.node,
-  Image.node,
-  CrossSpawnSpawner.node,
-  Instruction.node,
-  SessionRunState.node,
-  SessionRevert.node,
-  SessionSummary.node,
-  SystemPrompt.node,
-  LLM.node,
-  EventV2Bridge.node,
-  RuntimeFlags.node,
-  Database.node,
-])
+export const node = LayerNode.make({
+  service: Service,
+  layer,
+  deps: [
+    SessionStatus.node,
+    Session.node,
+    Agent.node,
+    Provider.node,
+    SessionProcessor.node,
+    SessionCompaction.node,
+    Plugin.node,
+    Command.node,
+    Config.node,
+    Permission.node,
+    FSUtil.node,
+    MCP.node,
+    LSP.node,
+    ToolRegistry.node,
+    Truncate.node,
+    McpLazyActivation.node,
+    Image.node,
+    CrossSpawnSpawner.node,
+    Instruction.node,
+    SessionRunState.node,
+    SessionRevert.node,
+    SessionSummary.node,
+    SystemPrompt.node,
+    LLM.node,
+    EventV2Bridge.node,
+    RuntimeFlags.node,
+    Database.node,
+  ],
+})
 
 export * as SessionPrompt from "./prompt"

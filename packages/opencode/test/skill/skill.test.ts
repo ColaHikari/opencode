@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
 import { Skill } from "../../src/skill"
 import { Discovery } from "../../src/skill/discovery"
@@ -13,33 +14,19 @@ import { testEffect } from "../lib/effect"
 import path from "path"
 import fs from "fs/promises"
 
-const node = CrossSpawnSpawner.defaultLayer
+const node = LayerNode.compile(CrossSpawnSpawner.node)
 
-const it = testEffect(Layer.mergeAll(Skill.defaultLayer, node, testInstanceStoreLayer))
+const it = testEffect(Layer.mergeAll(LayerNode.compile(Skill.node), node, testInstanceStoreLayer))
 const itWithoutClaudeCodeSkills = testEffect(
   Layer.mergeAll(
-    Skill.layer.pipe(
-      Layer.provide(Discovery.defaultLayer),
-      Layer.provide(Config.defaultLayer),
-      Layer.provide(EventV2Bridge.defaultLayer),
-      Layer.provide(FSUtil.defaultLayer),
-      Layer.provide(Global.layer),
-      Layer.provide(RuntimeFlags.layer({ disableClaudeCodeSkills: true })),
-    ),
+    LayerNode.compile(Skill.node, [[RuntimeFlags.node, RuntimeFlags.layer({ disableClaudeCodeSkills: true })]]),
     node,
     testInstanceStoreLayer,
   ),
 )
 const itWithoutExternalSkills = testEffect(
   Layer.mergeAll(
-    Skill.layer.pipe(
-      Layer.provide(Discovery.defaultLayer),
-      Layer.provide(Config.defaultLayer),
-      Layer.provide(EventV2Bridge.defaultLayer),
-      Layer.provide(FSUtil.defaultLayer),
-      Layer.provide(Global.layer),
-      Layer.provide(RuntimeFlags.layer({ disableExternalSkills: true })),
-    ),
+    LayerNode.compile(Skill.node, [[RuntimeFlags.node, RuntimeFlags.layer({ disableExternalSkills: true })]]),
     node,
     testInstanceStoreLayer,
   ),
@@ -77,14 +64,30 @@ const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
   )
 
 describe("skill", () => {
-  it.instance("includes workflows instructions built-in skill", () =>
-    Effect.gen(function* () {
-      const skill = yield* Skill.Service
-      const info = yield* skill.require("workflows-instructions")
-      expect(info.location).toBe("<built-in>")
-      expect(info.description).toContain("workflow")
-      expect(info.content).toContain('action: "start"')
-      expect(info.content).toContain('action: "inspect"')
+  it.effect("formats verbose locations as XML-safe filesystem paths", () =>
+    Effect.sync(() => {
+      const output = Skill.fmt(
+        [
+          {
+            name: "tagged-skill",
+            description: "A tagged skill.",
+            location: "/tmp/plugin.git#v1.3.0/SKILL.md",
+            content: "",
+          },
+          {
+            name: "built-in-skill",
+            description: "A built-in skill.",
+            location: "<built-in>",
+            content: "",
+          },
+        ],
+        { verbose: true },
+      )
+
+      expect(output).toContain("<location>/tmp/plugin.git#v1.3.0/SKILL.md</location>")
+      expect(output).toContain("<location>&lt;built-in&gt;</location>")
+      expect(output).not.toContain("file://")
+      expect(output).not.toContain("%23")
     }),
   )
 

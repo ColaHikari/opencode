@@ -5,7 +5,6 @@ import { encodeFilePath } from "@/context/file/path"
 import type { AgentPart, FileAttachmentPart, ImageAttachmentPart, Prompt } from "@/context/prompt"
 import { Identifier } from "@/utils/id"
 import { createCommentMetadata, formatCommentNote } from "@/utils/comment-note"
-import { systemReminder } from "./ultracode"
 
 type PromptRequestPart = (TextPartInput | FilePartInput | AgentPartInput) & { id: string }
 
@@ -25,10 +24,6 @@ type BuildRequestPartsInput = {
   context: ContextFile[]
   images: ImageAttachmentPart[]
   text: string
-  // Ultracode directives (submit.ts) that ride AHEAD of the user text as
-  // separate synthetic <system-reminder> parts instead of being fused into the
-  // visible text (TUI parity: prompt/index.tsx ultracodeParts).
-  directives?: string[]
   messageID: string
   sessionID: string
   sessionDirectory: string
@@ -94,43 +89,43 @@ const toOptimisticPart = (part: PromptRequestPart, sessionID: string, messageID:
 }
 
 export function buildRequestParts(input: BuildRequestPartsInput) {
-  // Directive reminders lead the message; synthetic:true keeps them out of the
-  // visible transcript (message-part.tsx renders the first NON-synthetic text
-  // part) while they still reach the model as message parts.
-  const requestParts: PromptRequestPart[] = [
-    ...(input.directives ?? []).map(
-      (directive) =>
-        ({
+  const requestParts: PromptRequestPart[] = input.text.trim()
+    ? [
+        {
           id: Identifier.ascending("part"),
           type: "text",
-          text: systemReminder(directive),
-          synthetic: true,
-        }) satisfies PromptRequestPart,
-    ),
-    {
-      id: Identifier.ascending("part"),
-      type: "text",
-      text: input.text,
-    },
-  ]
+          text: input.text,
+        },
+      ]
+    : []
 
   const files = input.prompt.filter(isFileAttachment).map((attachment) => {
     const path = absolute(input.sessionDirectory, attachment.path)
+    const source = attachment.source
+      ? {
+          ...attachment.source,
+          text: {
+            value: attachment.content,
+            start: attachment.start,
+            end: attachment.end,
+          },
+        }
+      : {
+          type: "file" as const,
+          text: {
+            value: attachment.content,
+            start: attachment.start,
+            end: attachment.end,
+          },
+          path,
+        }
     return {
       id: Identifier.ascending("part"),
       type: "file",
-      mime: "text/plain",
-      url: `file://${encodeFilePath(path)}${fileQuery(attachment.selection)}`,
-      filename: getFilename(attachment.path),
-      source: {
-        type: "file",
-        text: {
-          value: attachment.content,
-          start: attachment.start,
-          end: attachment.end,
-        },
-        path,
-      },
+      mime: attachment.mime ?? "text/plain",
+      url: attachment.url ?? `file://${encodeFilePath(path)}${fileQuery(attachment.selection)}`,
+      filename: attachment.filename ?? getFilename(attachment.path),
+      source,
     } satisfies PromptRequestPart
   })
 
@@ -205,7 +200,7 @@ export function buildRequestParts(input: BuildRequestPartsInput) {
       type: "file",
       mime: attachment.mime,
       url: attachment.dataUrl,
-      filename: attachment.filename,
+      filename: attachment.sourcePath ?? attachment.filename,
     } satisfies PromptRequestPart
   })
 

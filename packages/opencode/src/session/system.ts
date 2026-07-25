@@ -9,6 +9,7 @@ import PROMPT_BEAST from "./prompt/beast.txt"
 import PROMPT_GEMINI from "./prompt/gemini.txt"
 import PROMPT_GPT from "./prompt/gpt.txt"
 import PROMPT_KIMI from "./prompt/kimi.txt"
+import PROMPT_META from "./prompt/meta.txt"
 
 import PROMPT_CODEX from "./prompt/codex.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
@@ -22,11 +23,13 @@ import { ULTRACODE_SYSTEM_SECTION, WORKFLOW_TRIGGER_GUIDANCE } from "@/tool/work
 import { Workflow } from "@/workflow/workflow"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Location } from "@opencode-ai/core/location"
-import { LocationServiceMap } from "@opencode-ai/core/location-layer"
-import { PluginBoot } from "@opencode-ai/core/plugin/boot"
+import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Reference } from "@opencode-ai/core/reference"
+import { MCP } from "@/mcp"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 
 export function provider(model: Provider.Model) {
+  if (model.api.id.includes("muse-spark")) return [PROMPT_META]
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
     return [PROMPT_BEAST]
   if (model.api.id.includes("gpt")) {
@@ -50,22 +53,23 @@ export interface Interface {
    * an ultracode session needs no per-message directive.
    */
   readonly skills: (agent: Agent.Info, opts?: { ultracode?: boolean }) => Effect.Effect<string | undefined>
+  readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
 
-export const layer = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
     const workflow = yield* Workflow.Service
-    const locations = yield* LocationServiceMap
+    const mcp = yield* MCP.Service
+    const locations = yield* LocationServiceMap.Service
 
     return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
         const ctx = yield* InstanceState.context
         const references = yield* Effect.gen(function* () {
-          yield* (yield* PluginBoot.Service).wait()
           return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
         }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
         return [
@@ -138,17 +142,38 @@ export const layer = Layer.effect(
           .filter((section): section is string => section !== undefined)
           .join("\n\n")
       }),
+
+      mcp: Effect.fn("SystemPrompt.mcp")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
+        const ruleset = Permission.merge(agent.permission, permission ?? [])
+        const instructions = (yield* mcp.instructions()).filter(
+          (item) => item.tools.length === 0 || Permission.disabled(item.tools, ruleset).size < item.tools.length,
+        )
+        if (instructions.length === 0) return
+
+        return [
+          "<mcp_instructions>",
+          ...instructions.flatMap((item) => [
+            `  <server name="${item.name}">`,
+            ...item.instructions.split("\n").map((line) => `    ${line}`),
+            "  </server>",
+          ]),
+          "</mcp_instructions>",
+        ].join("\n")
+      }),
     })
   }),
 )
 
-export const defaultLayer = layer.pipe(
-  Layer.provide(Layer.mergeAll(Skill.defaultLayer, Workflow.defaultLayer)),
-  Layer.provide(LocationServiceMap.layer),
-)
+const locationServiceMapNode = LayerNode.make({
+  service: LocationServiceMap.Service,
+  layer: locationServiceMapLayer,
+  deps: [],
+})
 
-const locationServiceMapNode = LayerNode.make(LocationServiceMap.layer, [])
-
-export const node = LayerNode.make(layer, [Skill.node, locationServiceMapNode, Workflow.node])
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [Skill.node, MCP.node, Workflow.node, locationServiceMapNode],
+})
 
 export * as SystemPrompt from "./system"

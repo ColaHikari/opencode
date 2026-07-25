@@ -18,35 +18,28 @@ import { eq, sql } from "drizzle-orm"
 import { TestInstance, provideInstance, tmpdirScoped, reloadInstance, testInstanceStoreLayer } from "../fixture/fixture"
 import { InstanceState } from "@/effect/instance-state"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Schema } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import { spawnSync } from "child_process"
 import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
+import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 
-// Database.defaultLayer is merged so the orphan-sweep tests can seed a row
-// directly through the same in-memory SQLite connection the engine uses.
-// Session/Agent.defaultLayer are merged so the subagent-permission-inheritance
-// tests can create a caller session (with a deny ruleset) and read back the
-// child session the engine spawns — through the SAME memoised services the
-// engine resolves (Effect dedupes shared layer builds, exactly as for Database).
 const it = testEffect(
-  Layer.mergeAll(
-    Workflow.defaultLayer,
-    Database.defaultLayer,
-    Session.defaultLayer,
-    Agent.defaultLayer,
-    CrossSpawnSpawner.defaultLayer,
-    // EventV2Bridge.defaultLayer is merged so a test can subscribe to the SAME bus
-    // instance the engine publishes run-lifecycle events on. It is the identical
-    // exported const reference the Workflow layer provides internally, so Effect's
-    // layer memoisation resolves both to ONE instance (exactly as for Database).
-    EventV2Bridge.defaultLayer,
-    // Item 23: Permission.defaultLayer is merged so the ctx.shell gate tests can
-    // observe/reply to the SAME permission instance the engine asks through
-    // (identical const reference ⇒ one memoised instance, as above).
-    Permission.defaultLayer,
+  AppNodeBuilderV1.build(
+    LayerNode.group([
+      Workflow.node,
+      Database.node,
+      Session.node,
+      Agent.node,
+      EventV2Bridge.node,
+      Permission.node,
+      CrossSpawnSpawner.node,
+      SessionProjector.node,
+    ]),
   ),
 )
 

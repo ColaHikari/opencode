@@ -6,8 +6,9 @@ import { Config, Effect, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
-import { InstanceBootstrap as InstanceBootstrapService } from "../../src/project/bootstrap-service"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Project } from "../../src/project/project"
 import { Session } from "@/session/session"
@@ -15,6 +16,7 @@ import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdirScoped } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
+import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 
 // Full HTTP lifecycle through the REAL instance httpapi (the answer-route test
 // only checks registration; this drives the actual request sequence). The
@@ -28,10 +30,8 @@ import { pollWithTimeout, testEffect } from "../lib/effect"
 // HttpClientResponse: `response.status` is a property and `response.json` is an
 // Effect (yield it). Directory is carried via the x-opencode-directory header
 // (request() drops the query string by setting the URL to the pathname).
-const instanceStoreLayer = InstanceStore.defaultLayer.pipe(
-  Layer.provide(
-    Layer.succeed(InstanceBootstrapService.Service, InstanceBootstrapService.Service.of({ run: Effect.void })),
-  ),
+const instanceLayer = AppNodeBuilderV1.build(
+  LayerNode.group([InstanceStore.node, Project.node, Session.node, Database.node, SessionProjector.node]),
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
   HttpApiApp.routes,
@@ -46,7 +46,7 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeServices.layer),
 )
 const it = testEffect(
-  Layer.mergeAll(instanceStoreLayer, Project.defaultLayer, Session.defaultLayer, Database.defaultLayer, httpApiLayer),
+  Layer.mergeAll(instanceLayer, httpApiLayer),
 )
 
 function requestInDirectory(reqPath: string, directory: string, init: RequestInit = {}) {
@@ -136,7 +136,7 @@ describe("workflow HTTP lifecycle e2e", () => {
         "run completed via GET",
       )
       expect(done["result"]).toEqual({ answer: "yes" })
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   it.live("start -> park (timeout) -> answer-as-resume -> completed through the httpapi", () =>
@@ -183,7 +183,7 @@ describe("workflow HTTP lifecycle e2e", () => {
         "resumed run completed via GET",
       )
       expect(done["result"]).toEqual({ answer: "no" })
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   it.live("start by name on a computed-meta file is a 400 through the httpapi", () =>
@@ -210,7 +210,7 @@ export async function run(args, ctx) { return { ok: true } }
       expect(startRes.status).toBe(400)
       const body = yield* bodyJson(startRes)
       expect(JSON.stringify(body)).toContain("statically analyzable")
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   it.live("save -> file written + discoverable; duplicate is 409; bad name is 400", () =>
@@ -252,7 +252,7 @@ export async function run(args, ctx) { return { ok: true } }
         body: JSON.stringify({ name: "../escape", source }),
       })
       expect(badRes.status).toBe(400)
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   it.live("source -> resolves on-disk file text, builtin string, and 404 for unknown through the httpapi", () =>
@@ -284,7 +284,7 @@ export async function run(args, ctx) { return { ok: true } }
       // Unknown name → 404 (matching the *NotFound → 404 convention).
       const missingRes = yield* requestInDirectory("/workflow/does-not-exist-xyz/source", directory)
       expect(missingRes.status).toBe(404)
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   // Item 15: the skip route's status contract. 404 for an unknown run id; 409
@@ -330,7 +330,7 @@ export async function run(args, ctx) { return { ok: true } }
       // Cleanup: stop the live run.
       const cancelRes = yield* requestInDirectory(`/workflow/run/${id}/cancel`, directory, { method: "POST" })
       expect(cancelRes.status).toBe(200)
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   // Item 27: the export route. POST /workflow/run/:id/export materializes the
@@ -397,7 +397,7 @@ export async function run(args, ctx) { return { ok: true } }
       yield* Effect.promise(() =>
         fs.rm(path.dirname(exported["path"] as string), { recursive: true, force: true }),
       )
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 
   it.live("start -> cancel (live-waiting question) transitions to cancelled through the httpapi", () =>
@@ -434,6 +434,6 @@ export async function run(args, ctx) { return { ok: true } }
         body: JSON.stringify({ answer: "yes" }),
       })
       expect(lateAnswer.status).toBe(409)
-    }).pipe(Effect.provide(CrossSpawnSpawner.defaultLayer)),
+    }).pipe(Effect.provide(AppNodeBuilderV1.build(CrossSpawnSpawner.node))),
   )
 })

@@ -13,6 +13,7 @@ import { useData } from "../../context/data"
 import { getScrollAcceleration } from "../../util/scroll"
 import { useTuiPaths } from "../../context/runtime"
 import { useTuiConfig } from "../../config"
+import { useLocation } from "../../context/location"
 import { useTheme, selectedForeground } from "../../context/theme"
 import { SplitBorder } from "../../ui/border"
 import { useTerminalDimensions } from "@opentui/solid"
@@ -33,6 +34,7 @@ import {
   workflowOptions,
   WORKFLOW_COMMAND_PREFIX,
 } from "./workflow-autocomplete"
+import type { FileSystemEntry } from "@opencode-ai/sdk/v2"
 
 function removeLineRange(input: string) {
   const hashIndex = input.lastIndexOf("#")
@@ -106,6 +108,7 @@ export function Autocomplete(props: {
   const frecency = useFrecency()
   const tuiConfig = useTuiConfig()
   const paths = useTuiPaths()
+  const location = useLocation()
   const [store, setStore] = createStore({
     index: 0,
     selected: 0,
@@ -260,16 +263,18 @@ export function Autocomplete(props: {
     }
   }
 
-  function createFilePart(item: string, lineRange?: { startLine: number; endLine?: number }) {
-    const baseDir = (sync.path.directory || paths.cwd).replace(/\/+$/, "")
-    const fullPath = path.isAbsolute(item) ? item : path.join(baseDir, item)
-    const urlObj = pathToFileURL(fullPath)
+  function createFilePart(
+    item: FileSystemEntry,
+    filePath: string,
+    lineRange?: { startLine: number; endLine?: number },
+  ) {
+    const urlObj = pathToFileURL(filePath)
     const filename =
-      lineRange && !item.endsWith("/")
-        ? `${item}#${lineRange.startLine}${lineRange.endLine ? `-${lineRange.endLine}` : ""}`
-        : item
+      lineRange && item.type !== "directory"
+        ? `${item.path}#${lineRange.startLine}${lineRange.endLine ? `-${lineRange.endLine}` : ""}`
+        : item.path
 
-    if (lineRange && !item.endsWith("/")) {
+    if (lineRange && item.type !== "directory") {
       urlObj.searchParams.set("start", String(lineRange.startLine))
       if (lineRange.endLine !== undefined) {
         urlObj.searchParams.set("end", String(lineRange.endLine))
@@ -278,10 +283,9 @@ export function Autocomplete(props: {
 
     return {
       filename,
-      url: urlObj.href,
       part: {
         type: "file" as const,
-        mime: "text/plain",
+        mime: item.type === "directory" ? "application/x-directory" : "text/plain",
         filename,
         url: urlObj.href,
         source: {
@@ -291,7 +295,7 @@ export function Autocomplete(props: {
             end: 0,
             value: "",
           },
-          path: item,
+          path: item.path,
         },
       },
     }
@@ -308,7 +312,7 @@ export function Autocomplete(props: {
   })
 
   function normalizeMentionPath(filePath: string) {
-    const baseDir = sync.path.directory || paths.cwd
+    const baseDir = location()?.directory || sync.path.directory || paths.cwd
     const absolute = path.resolve(filePath)
     const relative = path.relative(baseDir, absolute)
 
@@ -325,7 +329,7 @@ export function Autocomplete(props: {
       startLine: input.lineStart,
       endLine: input.lineEnd > input.lineStart ? input.lineEnd : undefined,
     }
-    const { filename, part } = createFilePart(item, lineRange)
+    const { filename, part } = createFilePart({ path: item, type: "file" }, input.filePath, lineRange)
     const index = store.visible === "@" ? store.index : props.input().cursorOffset
 
     setStore("visible", false)
@@ -334,17 +338,20 @@ export function Autocomplete(props: {
   }
 
   const [files] = createResource(
-    () => search(),
-    async (query) => {
+    () => ({ query: search(), location: location() }),
+    async (input) => {
       if (!store.visible || store.visible === "/") return []
       if (referenceMatch()) return []
-      const { lineRange, baseQuery } = extractLineRange(query ?? "")
+      const { lineRange, baseQuery } = extractLineRange(input.query ?? "")
 
       // Get files from SDK
       const result = await sdk.client.v2.fs.find({
         query: baseQuery,
         limit: "20",
-        location: { workspace: project.workspace.current() },
+        location: {
+          directory: input.location?.directory,
+          workspace: input.location?.workspaceID ?? project.workspace.current(),
+        },
       })
 
       const options: AutocompleteOption[] = []
@@ -355,7 +362,11 @@ export function Autocomplete(props: {
         const width = props.anchor().width - 4
         options.push(
           ...result.data.data.map((item): AutocompleteOption => {
-            const { filename, url, part } = createFilePart(item.path, lineRange)
+            const { filename, part } = createFilePart(
+              item,
+              path.join(result.data.location.directory, item.path),
+              lineRange,
+            )
             return {
               display: Locale.truncateMiddle(filename, width),
               value: filename,
@@ -383,9 +394,8 @@ export function Autocomplete(props: {
     const width = props.anchor().width - 4
 
     for (const res of Object.values(sync.data.mcp_resource)) {
-      const text = `${res.name} (${res.uri})`
       options.push({
-        display: Locale.truncateMiddle(text, width),
+        display: Locale.truncateMiddle(res.name, width),
         // Match the name only; matching the URI caused unrelated fuzzy hits.
         value: res.name,
         description: res.description,
@@ -611,6 +621,7 @@ export function Autocomplete(props: {
           ...(store.visible === "/" ? ["description" as const] : []),
           (obj) => obj.aliases?.join(" ") ?? "",
         ],
+        threshold: store.visible === "@" ? 0.5 : 0,
         limit: 10,
         scoreFn: (objResults) => {
           const displayResult = objResults[0]
@@ -888,12 +899,9 @@ export function Autocomplete(props: {
                 {option().display}
               </text>
               <Show when={option().description}>
-                <>
-                  <text flexShrink={0}> </text>
-                  <text fg={index === store.selected ? selectedForeground(theme) : theme.textMuted} wrapMode="none">
-                    {option().description}
-                  </text>
-                </>
+                <text fg={index === store.selected ? selectedForeground(theme) : theme.textMuted} wrapMode="none">
+                  {" " + option().description?.trimStart()}
+                </text>
               </Show>
             </box>
           )}

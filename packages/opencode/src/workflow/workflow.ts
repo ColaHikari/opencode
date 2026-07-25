@@ -1,10 +1,11 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { statics } from "@opencode-ai/core/schema"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { deriveSubagentSessionPermission } from "@/agent/subagent-permissions"
 import { EffectBridge } from "@/effect/bridge"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { EventV2 } from "@opencode-ai/core/event"
+import { WorkflowEvent } from "@opencode-ai/schema/workflow-event"
 import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef } from "@/effect/instance-ref"
 import { Identifier } from "@/id/id"
@@ -24,13 +25,14 @@ import { ShellID } from "@/tool/shell/id"
 import { TurnBudget } from "@/session/turn-budget"
 import { ToolCatalog } from "@/tool/catalog"
 import { MCP } from "@/mcp"
+import { McpCatalog } from "@/mcp/catalog"
 import { Plugin } from "@/plugin"
 import { Truncate } from "@/tool/truncate"
 import { Tool } from "@/tool/tool"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { type DeepMutable, withStatics } from "@opencode-ai/core/schema"
+import { type DeepMutable } from "@opencode-ai/core/schema"
 import type { WorkflowAgentRow, WorkflowDefinitionRow, WorkflowLogRow } from "@opencode-ai/core/workflow/sql"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { and, desc, eq, isNotNull, notInArray } from "drizzle-orm"
@@ -81,7 +83,7 @@ import { Shell } from "@opencode-ai/core/shell"
 // (the prefix the engine already used via `Identifier.ascending("job")`).
 export const RunID = Schema.String.check(Schema.isStartsWith("job")).pipe(
   Schema.brand("WorkflowRunID"),
-  withStatics((schema) => ({
+  statics((schema) => ({
     ascending: (id?: string) => schema.make(Identifier.ascending("job", id)),
   })),
 )
@@ -287,28 +289,9 @@ export type Run = DeepMutable<Schema.Schema.Type<typeof Run>>
 // consumers (dashboard, plugins) can render run progress without the heavy
 // logs/agents/result blobs (those stay readable via `get()`). `updated` fires on
 // every non-terminal write; `finished` fires once on the terminal write.
-const RunEventData = {
-  id: Schema.String,
-  workflow: Schema.String,
-  status: Status,
-  current_phase: Schema.NullOr(Schema.String),
-  directory: Schema.String,
-  agents: Schema.Struct({
-    total: Schema.Number,
-    running: Schema.Number,
-    failed: Schema.Number,
-  }),
-  // `true` while this run is waiting on an open human-in-the-loop question
-  // (`ctx.question` awaited, not yet answered — Tasks 12/13), so a non-TUI
-  // consumer can surface the prompt without reading the full run. The detail
-  // (question text/options) stays on `get()`'s `pending_question`; the event
-  // only flags THAT one pends, keeping the payload slim.
-  pending_question: Schema.Boolean,
-  error: Schema.NullOr(Schema.String),
-}
 export const Event = {
-  Updated: EventV2.define({ type: "workflow.run.updated", schema: RunEventData }),
-  Finished: EventV2.define({ type: "workflow.run.finished", schema: RunEventData }),
+  Updated: WorkflowEvent.Updated,
+  Finished: WorkflowEvent.Finished,
 }
 
 // Non-negative finite number — the only shape a budget cap may take: a
@@ -3537,24 +3520,27 @@ export const layer = Layer.effect(
               // `message` is itself one of those persisted rows, so it is NOT added on
               // top. A single-turn session yields exactly one assistant message ⇒ the
               // sum equals that message ⇒ identical to the prior single-message read.
-              const assistants = (yield* sessions.messages({ sessionID: session.id }).pipe(Effect.orDie))
+              const history = yield* sessions
+                .messages({ sessionID: session.id })
+                .pipe(Effect.catchCause(() => Effect.succeed([] as SessionV1.WithParts[])))
+              const assistants = (history.some((item) => item.info.id === message.info.id) ? history : [...history, message])
                 .map((m) => m.info)
                 .filter((info) => info.role === "assistant")
-              node.cost = assistants.reduce((sum, info) => sum + info.cost, 0)
+              node.cost = assistants.reduce((sum, info) => sum + (info.cost ?? 0), 0)
               // Keep `total` optional exactly as the per-message tokens schema has it:
               // only emit a summed total when at least one message actually carried one,
               // otherwise leave it `undefined` so a single-message session is byte-for-byte
               // identical to the prior `node.tokens = message.info.tokens` assignment.
-              const totals = assistants.map((info) => info.tokens.total).filter((t) => t !== undefined)
+              const totals = assistants.map((info) => info.tokens?.total).filter((t) => t !== undefined)
               node.tokens = assistants.reduce(
                 (acc, info) => ({
                   total: acc.total,
-                  input: acc.input + info.tokens.input,
-                  output: acc.output + info.tokens.output,
-                  reasoning: acc.reasoning + info.tokens.reasoning,
+                  input: acc.input + (info.tokens?.input ?? 0),
+                  output: acc.output + (info.tokens?.output ?? 0),
+                  reasoning: acc.reasoning + (info.tokens?.reasoning ?? 0),
                   cache: {
-                    read: acc.cache.read + info.tokens.cache.read,
-                    write: acc.cache.write + info.tokens.cache.write,
+                    read: acc.cache.read + (info.tokens?.cache.read ?? 0),
+                    write: acc.cache.write + (info.tokens?.cache.write ?? 0),
                   },
                 }),
                 {
@@ -3855,7 +3841,7 @@ export const layer = Layer.effect(
             }
 
             const mcpTool = (yield* mcp.tools())[name]
-            const execute = mcpTool?.execute
+            const execute = mcpTool && McpCatalog.convertTool(mcpTool.def, mcpTool.client, mcpTool.timeout).execute
             if (!execute) {
               const available = [
                 ...(yield* catalog.tools({
@@ -4772,39 +4758,26 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(
-  Layer.provide(Database.defaultLayer),
-  Layer.provide(Session.defaultLayer),
-  Layer.provide(Agent.defaultLayer),
-  Layer.provide(Provider.defaultLayer),
-  Layer.provide(Config.defaultLayer),
-  Layer.provide(EventV2Bridge.defaultLayer),
-  // Item 23 (Stufe 1): Permission gates ctx.shell; FSUtil + the spawner feed
-  // the bash tool's scanCommand the gate reuses.
-  Layer.provide(Permission.defaultLayer),
-  Layer.provide(FSUtil.defaultLayer),
-  Layer.provide(CrossSpawnSpawner.defaultLayer),
-  Layer.provide(ToolCatalog.defaultLayer),
-  Layer.provide(MCP.defaultLayer),
-  Layer.provide(Plugin.defaultLayer),
-  Layer.provide(Truncate.defaultLayer),
-)
-
-export const node = LayerNode.make(layer, [
-  Database.node,
-  Session.node,
-  Agent.node,
-  Provider.node,
-  Config.node,
-  EventV2Bridge.node,
-  // Item 23 (Stufe 1): see defaultLayer.
-  Permission.node,
-  FSUtil.node,
-  CrossSpawnSpawner.node,
-  ToolCatalog.node,
-  MCP.node,
-  Plugin.node,
-  Truncate.node,
-])
+export const node = LayerNode.make({
+  service: Service,
+  layer,
+  deps: [
+    Database.node,
+    Session.node,
+    Agent.node,
+    Provider.node,
+    Config.node,
+    EventV2Bridge.node,
+    // Item 23 (Stufe 1): Permission gates ctx.shell; FSUtil + the spawner feed
+    // the bash tool's scanCommand the gate reuses.
+    Permission.node,
+    FSUtil.node,
+    CrossSpawnSpawner.node,
+    ToolCatalog.node,
+    MCP.node,
+    Plugin.node,
+    Truncate.node,
+  ],
+})
 
 export * as Workflow from "./workflow"

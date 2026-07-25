@@ -1,13 +1,15 @@
-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { afterEach, describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect } from "effect"
 import fs from "fs/promises"
 import path from "path"
 import { Command } from "@/command"
 import { disposeAllInstances, provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
-const it = testEffect(Layer.mergeAll(Command.defaultLayer, CrossSpawnSpawner.defaultLayer))
+const it = testEffect(AppNodeBuilderV1.build(LayerNode.group([Command.node, CrossSpawnSpawner.node])))
 
 async function writeWorkflow(dir: string, name: string, source: string) {
   const workflows = path.join(dir, ".opencode", "workflows")
