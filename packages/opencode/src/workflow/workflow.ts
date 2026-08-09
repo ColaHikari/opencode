@@ -3285,6 +3285,12 @@ export const layer = Layer.effect(
               ? deriveSubagentSessionPermission({
                   parentSessionPermission: callerSession.permission ?? [],
                   subagent: selected,
+                  // A workflow step is a fresh spawn below the caller session;
+                  // depth is only used for the task-tool auto-deny, which does
+                  // not apply to workflow steps (they never re-delegate unless
+                  // the author composes ctx.workflow explicitly).
+                  childDepth: 2,
+                  maxDepth: 2,
                 })
               : undefined
             // Security (compose, never override): per-step tool scoping must NEVER

@@ -12,21 +12,24 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import type { SessionID } from "@/session/schema"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { testInstanceStoreLayer } from "../fixture/fixture"
 import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
-  Layer.mergeAll(
-    SessionNs.layer.pipe(
-      Layer.provide(Storage.defaultLayer),
-      Layer.provide(Database.defaultLayer),
-      Layer.provideMerge(EventV2Bridge.defaultLayer),
-      Layer.provide(SessionProjector.defaultLayer),
-      Layer.provide(RuntimeFlags.layer({ experimentalWorkspaces: false })),
-      Layer.provide(BackgroundJob.defaultLayer),
+  Layer.merge(
+    LayerNode.compile(
+      LayerNode.group([
+        SessionNs.node,
+        Storage.node,
+        Database.node,
+        EventV2Bridge.node,
+        SessionProjector.node,
+        BackgroundJob.node,
+        CrossSpawnSpawner.node,
+      ]),
+      [[RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })]],
     ),
-    Database.defaultLayer,
-    CrossSpawnSpawner.defaultLayer,
     testInstanceStoreLayer,
   ),
 )

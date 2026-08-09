@@ -7,6 +7,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { FetchHttpClient } from "effect/unstable/http"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import path from "path"
@@ -33,6 +34,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { SessionProcessor } from "@/session/processor"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { LLM } from "@/session/llm"
@@ -95,6 +97,8 @@ const mcp = Layer.succeed(
     supportsOAuth: () => Effect.succeed(false),
     hasStoredTokens: () => Effect.succeed(false),
     getAuthStatus: () => Effect.succeed("not_authenticated" as const),
+    instructions: () => Effect.succeed([]),
+    resourceTemplates: () => Effect.succeed({}),
   }),
 )
 
@@ -118,73 +122,53 @@ const lsp = Layer.succeed(
   }),
 )
 
-const status = SessionStatus.layer.pipe(Layer.provideMerge(EventV2Bridge.defaultLayer))
-const run = SessionRunState.layer.pipe(Layer.provide(status))
-const infra = Layer.mergeAll(NodeFileSystem.layer, CrossSpawnSpawner.defaultLayer)
+const promptRoot = LayerNode.group([
+  SessionPrompt.node,
+  Session.node,
+  SessionProjector.node,
+  MessageV2.node,
+  Snapshot.node,
+  LLM.node,
+  Env.node,
+  AgentSvc.node,
+  Command.node,
+  Permission.node,
+  Plugin.node,
+  Config.node,
+  ProviderSvc.node,
+  LSP.node,
+  MCP.node,
+  FSUtil.node,
+  BackgroundJob.node,
+  SessionStatus.node,
+  SessionRunState.node,
+  Database.node,
+  EventV2Bridge.node,
+  Question.node,
+  Todo.node,
+  ToolRegistry.node,
+  Skill.node,
+  Git.node,
+  Ripgrep.node,
+  Format.node,
+  Truncate.node,
+  SessionProcessor.node,
+  Image.node,
+  SessionCompaction.node,
+  SessionRevert.node,
+  Instruction.node,
+  SystemPrompt.node,
+  CrossSpawnSpawner.node,
+  RuntimeFlags.node,
+])
 
-// Full SessionPrompt stack against the fake LLM (mirrors nested-task.test.ts).
-function makePrompt() {
-  const flagLayer = () => RuntimeFlags.layer({ experimentalEventSystem: true })
-  const deps = Layer.mergeAll(
-    Session.defaultLayer,
-    Snapshot.defaultLayer,
-    LLM.defaultLayer,
-    Env.defaultLayer,
-    AgentSvc.defaultLayer,
-    Command.defaultLayer,
-    Permission.defaultLayer,
-    Plugin.defaultLayer,
-    Config.defaultLayer,
-    ProviderSvc.defaultLayer,
-    lsp,
-    mcp,
-    FSUtil.defaultLayer,
-    BackgroundJob.defaultLayer,
-    status,
-    Database.defaultLayer,
-    EventV2Bridge.defaultLayer,
-  ).pipe(Layer.provideMerge(infra))
-  const question = Question.layer.pipe(Layer.provideMerge(deps))
-  const todo = Todo.layer.pipe(Layer.provideMerge(deps))
-  const registry = ToolRegistry.layer.pipe(
-    Layer.provide(Skill.defaultLayer),
-    Layer.provide(FetchHttpClient.layer),
-    Layer.provide(CrossSpawnSpawner.defaultLayer),
-    Layer.provide(Git.defaultLayer),
-    Layer.provide(Ripgrep.defaultLayer),
-    Layer.provide(Format.defaultLayer),
-    Layer.provide(flagLayer()),
-    Layer.provideMerge(todo),
-    Layer.provideMerge(question),
-    Layer.provideMerge(deps),
-  )
-  const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
-  const proc = SessionProcessor.layer.pipe(
-    Layer.provide(summary),
-    Layer.provide(Image.defaultLayer),
-    Layer.provide(flagLayer()),
-    Layer.provideMerge(deps),
-  )
-  const compact = SessionCompaction.layer.pipe(
-    Layer.provide(flagLayer()),
-    Layer.provideMerge(proc),
-    Layer.provideMerge(deps),
-  )
-  return SessionPrompt.layer.pipe(
-    Layer.provide(SessionRevert.defaultLayer),
-    Layer.provide(Image.defaultLayer),
-    Layer.provide(summary),
-    Layer.provideMerge(run),
-    Layer.provideMerge(compact),
-    Layer.provideMerge(proc),
-    Layer.provideMerge(registry),
-    Layer.provideMerge(trunc),
-    Layer.provide(Instruction.defaultLayer),
-    Layer.provide(SystemPrompt.defaultLayer),
-    Layer.provide(flagLayer()),
-    Layer.provideMerge(deps),
-    Layer.provide(summary),
-  )
+function makePrompt(flags?: Partial<RuntimeFlags.Info>) {
+  return LayerNode.compile(promptRoot, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, mcp],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true, ...flags })],
+  ] as const)
 }
 
 const it = testEffect(Layer.mergeAll(TestLLMServer.layer, makePrompt()))

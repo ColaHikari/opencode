@@ -1,4 +1,5 @@
 import { afterEach, describe, expect } from "bun:test"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { MessageTable } from "@opencode-ai/core/session/sql"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -46,16 +47,21 @@ afterEach(async () => {
   await disposeAllInstances()
 })
 
-const base = Layer.mergeAll(
-  BackgroundJob.defaultLayer,
-  Database.defaultLayer,
-  EventV2Bridge.defaultLayer,
-  Session.defaultLayer,
-  SessionRunState.defaultLayer,
-  SessionStatus.defaultLayer,
+const it = testEffect(
+  LayerNode.compile(
+    LayerNode.group([
+      BackgroundJob.node,
+      Database.node,
+      EventV2Bridge.node,
+      Session.node,
+      SessionRunState.node,
+      SessionStatus.node,
+      RuntimeFlags.node,
+      CrossSpawnSpawner.node,
+    ]),
+    [[RuntimeFlags.node, RuntimeFlags.layer({})]],
+  ),
 )
-
-const it = testEffect(base)
 
 // SessionPrompt with every service the cancel path never touches stubbed out:
 // the tests pin the real cancel wiring (Session.descendants seeding
@@ -63,31 +69,44 @@ const it = testEffect(base)
 // Any call into a stub would fail the test — which is exactly right, because
 // cancel must not depend on prompt-path services.
 const dead = <I>() => ({}) as unknown as I
-const stubs = Layer.mergeAll(
-  Layer.succeed(Agent.Service, dead<Agent.Interface>()),
-  Layer.succeed(Provider.Service, dead<Provider.Interface>()),
-  Layer.succeed(SessionProcessor.Service, dead<SessionProcessor.Interface>()),
-  Layer.succeed(SessionCompaction.Service, dead<SessionCompaction.Interface>()),
-  Layer.succeed(Plugin.Service, dead<Plugin.Interface>()),
-  Layer.succeed(Command.Service, dead<Command.Interface>()),
-  Layer.succeed(Config.Service, dead<Config.Interface>()),
-  Layer.succeed(Permission.Service, dead<Permission.Interface>()),
-  Layer.succeed(FSUtil.Service, dead<FSUtil.Interface>()),
-  Layer.succeed(MCP.Service, dead<MCP.Interface>()),
-  Layer.succeed(LSP.Service, dead<LSP.Interface>()),
-  Layer.succeed(ToolRegistry.Service, dead<ToolRegistry.Interface>()),
-  Layer.succeed(Truncate.Service, dead<Truncate.Interface>()),
-  Layer.succeed(Image.Service, dead<Image.Interface>()),
-  Layer.succeed(Instruction.Service, dead<Instruction.Interface>()),
-  Layer.succeed(SessionRevert.Service, dead<SessionRevert.Interface>()),
-  Layer.succeed(SessionSummary.Service, dead<SessionSummary.Interface>()),
-  Layer.succeed(SystemPrompt.Service, dead<SystemPrompt.Interface>()),
-  Layer.succeed(LLM.Service, dead<LLM.Interface>()),
-  CrossSpawnSpawner.defaultLayer,
-  RuntimeFlags.layer({}),
-)
+const stubReplacements = [
+  [Agent.node, Layer.succeed(Agent.Service, dead<Agent.Interface>())],
+  [Provider.node, Layer.succeed(Provider.Service, dead<Provider.Interface>())],
+  [SessionProcessor.node, Layer.succeed(SessionProcessor.Service, dead<SessionProcessor.Interface>())],
+  [SessionCompaction.node, Layer.succeed(SessionCompaction.Service, dead<SessionCompaction.Interface>())],
+  [Plugin.node, Layer.succeed(Plugin.Service, dead<Plugin.Interface>())],
+  [Command.node, Layer.succeed(Command.Service, dead<Command.Interface>())],
+  [Config.node, Layer.succeed(Config.Service, dead<Config.Interface>())],
+  [Permission.node, Layer.succeed(Permission.Service, dead<Permission.Interface>())],
+  [FSUtil.node, Layer.succeed(FSUtil.Service, dead<FSUtil.Interface>())],
+  [MCP.node, Layer.succeed(MCP.Service, dead<MCP.Interface>())],
+  [LSP.node, Layer.succeed(LSP.Service, dead<LSP.Interface>())],
+  [ToolRegistry.node, Layer.succeed(ToolRegistry.Service, dead<ToolRegistry.Interface>())],
+  [Truncate.node, Layer.succeed(Truncate.Service, dead<Truncate.Interface>())],
+  [Image.node, Layer.succeed(Image.Service, dead<Image.Interface>())],
+  [Instruction.node, Layer.succeed(Instruction.Service, dead<Instruction.Interface>())],
+  [SessionRevert.node, Layer.succeed(SessionRevert.Service, dead<SessionRevert.Interface>())],
+  [SessionSummary.node, Layer.succeed(SessionSummary.Service, dead<SessionSummary.Interface>())],
+  [SystemPrompt.node, Layer.succeed(SystemPrompt.Service, dead<SystemPrompt.Interface>())],
+  [LLM.node, Layer.succeed(LLM.Service, dead<LLM.Interface>())],
+] as const
 
-const prompt = testEffect(SessionPrompt.layer.pipe(Layer.provide(stubs), Layer.provideMerge(base)))
+const prompt = testEffect(
+  LayerNode.compile(
+    LayerNode.group([
+      BackgroundJob.node,
+      Database.node,
+      EventV2Bridge.node,
+      Session.node,
+      SessionRunState.node,
+      SessionStatus.node,
+      SessionPrompt.node,
+      RuntimeFlags.node,
+      CrossSpawnSpawner.node,
+    ]),
+    [...stubReplacements, [RuntimeFlags.node, RuntimeFlags.layer({})]],
+  ),
+)
 
 /** Root → child → grandchild session tree (depths 1–3). */
 const seedTree = Effect.fn("NestedCancelTest.seedTree")(function* () {

@@ -9,6 +9,7 @@ import type { Provider } from "@/provider/provider"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import type { Session } from "@/session/session"
+import { Session as SessionSvc } from "@/session/session"
 import type { SessionProcessor } from "@/session/processor"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { TaskPromptOps } from "@/tool/task"
@@ -26,7 +27,14 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 //  (3) the next resolve of the SAME session registers the activated tool fully
 //  (4) default/eager ⇒ identical to today (all MCP keys, no tool_search)
 //  (5) no MCP servers ⇒ no tool_search either
-const it = testEffect(Layer.mergeAll(McpLazyActivation.defaultLayer))
+const it = testEffect(
+  Layer.mergeAll(
+    McpLazyActivation.defaultLayer,
+    // resolve() walks the session lineage for ask-origin attribution; a
+    // parentless session takes the depth-1 short path and never calls it.
+    Layer.succeed(SessionSvc.Service, {} as unknown as SessionSvc.Interface),
+  ),
+)
 
 // Fresh tool objects per call — the eager registration mutates item.inputSchema
 // and item.execute in place, exactly like the real MCP.tools() result (built

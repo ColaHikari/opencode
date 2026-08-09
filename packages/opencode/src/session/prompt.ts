@@ -1333,6 +1333,9 @@ export const layer = Layer.effect(
             Effect.provideService(Truncate.Service, truncate),
             Effect.provideService(McpLazyActivation.Service, mcpLazy),
             Effect.provideService(RuntimeFlags.Service, flags),
+            // Nested subagents: resolve walks the session lineage for the
+            // origin attribution of routed permission asks.
+            Effect.provideService(Session.Service, sessions),
           )
 
           if (lastUser.format?.type === "json_schema") {

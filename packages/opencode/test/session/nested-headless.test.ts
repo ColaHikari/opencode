@@ -6,6 +6,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { afterEach, describe, expect } from "bun:test"
 import { Config, Effect, Layer } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { InstanceBootstrap } from "../../src/project/bootstrap-service"
@@ -48,10 +49,15 @@ const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap
 
 const it = testEffect(
   Layer.mergeAll(
-    FSUtil.defaultLayer,
-    CrossSpawnSpawner.defaultLayer,
-    InstanceStore.defaultLayer.pipe(Layer.provide(noopBootstrap)),
-    Database.defaultLayer,
+    LayerNode.compile(
+      LayerNode.group([
+        FSUtil.node,
+        CrossSpawnSpawner.node,
+        Database.node,
+        InstanceStore.node,
+      ]),
+      [[InstanceStore.bootstrapNode, noopBootstrap]],
+    ),
     httpApiLayer,
     TestLLMServer.layer,
   ),

@@ -117,11 +117,6 @@ const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(
-  Layer.provide(BackgroundJob.defaultLayer),
-  Layer.provide(SessionStatus.defaultLayer),
-)
-
 // Convergence cap for the cancel cascade's re-listing passes: jobs that
 // start detached while the cascade runs escape a one-shot list() snapshot,
 // so the cascade re-lists until a fresh snapshot has no new running matches.

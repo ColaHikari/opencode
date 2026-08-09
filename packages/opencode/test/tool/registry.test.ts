@@ -232,13 +232,11 @@ describe("tool.registry", () => {
           agent: build,
           ...(depth !== undefined ? { depth } : {}),
         })
-      const tasks = yield* Effect.all([
-        at().then((tools) => tools.map((t) => t.id)),
-        at(3).then((tools) => tools.map((t) => t.id)),
-      ])
+      const tools0 = yield* at()
+      const tools3 = yield* at(3)
 
-      expect(tasks[0]).toContain("task")
-      expect(tasks[1]).toContain("task")
+      expect(tools0.map((t) => t.id)).toContain("task")
+      expect(tools3.map((t) => t.id)).toContain("task")
     }),
   )
 

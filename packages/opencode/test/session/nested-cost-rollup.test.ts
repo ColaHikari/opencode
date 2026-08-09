@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -16,17 +17,19 @@ import { testInstanceStoreLayer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
-  Layer.mergeAll(
-    SessionNs.layer.pipe(
-      Layer.provide(Storage.defaultLayer),
-      Layer.provide(Database.defaultLayer),
-      Layer.provideMerge(EventV2Bridge.defaultLayer),
-      Layer.provide(SessionProjector.defaultLayer),
-      Layer.provide(RuntimeFlags.layer({ experimentalWorkspaces: false })),
-      Layer.provide(BackgroundJob.defaultLayer),
+  Layer.merge(
+    LayerNode.compile(
+      LayerNode.group([
+        SessionNs.node,
+        Storage.node,
+        Database.node,
+        EventV2Bridge.node,
+        SessionProjector.node,
+        BackgroundJob.node,
+        CrossSpawnSpawner.node,
+      ]),
+      [[RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })]],
     ),
-    Database.defaultLayer,
-    CrossSpawnSpawner.defaultLayer,
     testInstanceStoreLayer,
   ),
 )
