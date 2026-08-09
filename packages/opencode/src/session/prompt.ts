@@ -519,15 +519,6 @@ export const layer = Layer.effect(
               },
             }
             yield* sessions.updatePart(part)
-            if (flags.experimentalEventSystem) {
-              yield* events.publish(SessionEvent.Shell.Started, {
-                sessionID: input.sessionID,
-                messageID: SessionMessage.ID.create(),
-                timestamp: DateTime.makeUnsafe(started),
-                callID: part.callID,
-                command: input.command,
-              })
-            }
             return { msg, part, cwd: ctx.directory }
           }).pipe(Effect.ensuring(markReady))
 
@@ -543,14 +534,6 @@ export const layer = Layer.effect(
                 output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
               }
               const completed = Date.now()
-              if (flags.experimentalEventSystem) {
-                yield* events.publish(SessionEvent.Shell.Ended, {
-                  sessionID: input.sessionID,
-                  timestamp: DateTime.makeUnsafe(completed),
-                  callID: part.callID,
-                  output,
-                })
-              }
               if (!msg.time.completed) {
                 msg.time.completed = completed
                 yield* sessions.updateMessage(msg)
@@ -663,12 +646,6 @@ export const layer = Layer.effect(
         throw error
       }
 
-      const current = yield* db
-        .select({ agent: SessionTable.agent, model: SessionTable.model })
-        .from(SessionTable)
-        .where(eq(SessionTable.id, input.sessionID))
-        .get()
-        .pipe(Effect.orDie)
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
@@ -695,28 +672,23 @@ export const layer = Layer.effect(
         format: input.format,
       }
 
-      if (current?.agent !== info.agent) {
-        yield* events.publish(SessionEvent.AgentSwitched, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
-          agent: info.agent,
-        })
-      }
+
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (
-        current?.model?.providerID !== info.model.providerID ||
-        current.model.id !== info.model.modelID ||
-        (current.model.variant === "default" ? undefined : current.model.variant) !== info.model.variant
+        current.agent !== info.agent ||
+        current.model?.providerID !== info.model.providerID ||
+        current.model?.id !== info.model.modelID ||
+        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
       ) {
-        yield* events.publish(SessionEvent.ModelSwitched, {
+        yield* sessions.setAgentModel({
           sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
+          agent: info.agent,
           model: {
-            id: ModelV2.ID.make(info.model.modelID),
-            providerID: ProviderV2.ID.make(info.model.providerID),
-            variant: ModelV2.VariantID.make(info.model.variant ?? "default"),
+            id: info.model.modelID,
+            providerID: info.model.providerID,
+            variant: info.model.variant ?? "default",
           },
+          time: info.time.created,
         })
       }
 
@@ -1047,77 +1019,6 @@ export const layer = Layer.effect(
 
       yield* sessions.updateMessage(info)
       for (const part of parts) yield* sessions.updatePart(part)
-      const nextPrompt = parts.reduce(
-        (result, part) => {
-          if (part.type === "text") {
-            if (part.synthetic) result.synthetic.push(part.text)
-            else result.text.push(part.text)
-          }
-          if (part.type === "file") {
-            result.files.push(
-              FileAttachment.make({
-                uri: part.url,
-                mime: part.mime,
-                name: part.filename,
-                source: part.source
-                  ? Source.make({
-                      start: part.source.text.start,
-                      end: part.source.text.end,
-                      text: part.source.text.value,
-                    })
-                  : undefined,
-              }),
-            )
-          }
-          if (part.type === "agent") {
-            result.agents.push(
-              AgentAttachment.make({
-                name: part.name,
-                source: part.source
-                  ? Source.make({
-                      start: part.source.start,
-                      end: part.source.end,
-                      text: part.source.value,
-                    })
-                  : undefined,
-              }),
-            )
-          }
-          return result
-        },
-        {
-          text: [] as string[],
-          files: [] as FileAttachment[],
-          agents: [] as AgentAttachment[],
-          synthetic: [] as string[],
-        },
-      )
-      // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-      if (flags.experimentalEventSystem) {
-        yield* events.publish(SessionEvent.Prompted, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
-          delivery: "steer",
-          prompt: Prompt.make({
-            text: nextPrompt.text.join("\n"),
-            files: nextPrompt.files,
-            agents: nextPrompt.agents,
-          }),
-        })
-      }
-      for (const text of nextPrompt.synthetic) {
-        // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-        if (flags.experimentalEventSystem) {
-          yield* events.publish(SessionEvent.Synthetic, {
-            sessionID: input.sessionID,
-            messageID: SessionMessage.ID.create(),
-            timestamp: DateTime.makeUnsafe(info.time.created),
-            text,
-          })
-        }
-      }
-
       return { info, parts }
     }, Effect.scoped)
 
@@ -1196,7 +1097,7 @@ export const layer = Layer.effect(
           lastAssistant?.finish &&
           !["tool-calls"].includes(lastAssistant.finish) &&
           !hasToolCalls &&
-          lastUser.id < lastAssistant.id
+          lastAssistant.parentID === lastUser.id
         ) {
           const orphan = lastAssistantMsg?.parts.find(
             (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -1350,35 +1251,24 @@ export const layer = Layer.effect(
           if (step === 1)
             yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          if (step > 1 && lastFinished) {
-            for (const m of msgs) {
-              if (m.info.role !== "user" || m.info.id <= lastFinished.id) continue
-              for (const p of m.parts) {
-                if (p.type !== "text" || p.ignored || p.synthetic) continue
-                if (!p.text.trim()) continue
-                p.text = [
-                  "<system-reminder>",
-                  "The user sent the following message:",
-                  p.text,
-                  "",
-                  "Please address this message and continue with your tasks.",
-                  "</system-reminder>",
-                ].join("\n")
-              }
-            }
-          }
 
           yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-          const [skills, env, instructions, modelMsgs] = yield* Effect.all([
+          const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
             // Item 13: session.metadata.ultracode appends the standing workflow
             // opt-in section (replaces the clients' per-message session directive).
             sys.skills(agent, { ultracode: session.metadata?.["ultracode"] === true }),
             sys.environment(model),
             instruction.system().pipe(Effect.orDie),
+            sys.mcp(agent, session.permission),
             MessageV2.toModelMessagesEffect(msgs, model),
           ])
-          const system = [...env, ...instructions, ...(skills ? [skills] : [])]
+          const system = [
+            ...env,
+            ...instructions,
+            ...(mcpInstructions ? [mcpInstructions] : []),
+            ...(skills ? [skills] : []),
+          ]
           const format = lastUser.format ?? { type: "text" as const }
           if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
           const result = yield* handle.process({
