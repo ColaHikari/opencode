@@ -23,6 +23,7 @@ import { createPromptSubmissionState } from "./submission-state"
 import { normalizeSessionInfo } from "@/utils/session"
 import { Event } from "@opencode-ai/schema/event"
 import { buildBudgetPart, buildUltracodeParts } from "./ultracode"
+import { blobDataUrl } from "@/utils/draft-store"
 
 type PendingPrompt = {
   abort: AbortController
@@ -58,7 +59,13 @@ const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttac
 
 export async function sendFollowupDraft(input: FollowupSendInput) {
   const text = draftText(input.draft.prompt)
-  const images = draftImages(input.draft.prompt)
+  const encodedImages = await Promise.all(
+    draftImages(input.draft.prompt).map(async (attachment) => ({
+      ...attachment,
+      dataUrl: await blobDataUrl(attachment.blob, attachment.mime),
+    })),
+  )
+  const images = encodedImages
   const setBusy = () => {
     if (!input.optimisticBusy) return
     input.serverSync.session.set("session_status", input.draft.sessionID, { type: "busy" })
@@ -536,16 +543,17 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             arguments: args.join(" "),
             agent,
             model: { id: model.modelID, providerID: model.providerID, variant },
-            files: images.map((attachment) => ({
-              uri: attachment.dataUrl,
-              name: attachment.filename,
-            })),
+            files: await Promise.all(
+              images.map(async (attachment) => ({
+                uri: await blobDataUrl(attachment.blob, attachment.mime),
+                name: attachment.filename,
+              })),
+            ),
           })
           .catch((err) => {
             serverSync().session.set("session_status", session.id, { type: "idle" })
             showToast({
-              title: language.t("prompt.toast.commandSendFailed.title"),
-              description: formatServerError(err, language.t, language.t("common.requestFailed")),
+              title: language.t("prompt.toast.commandSendFailed.title"),              description: formatServerError(err, language.t, language.t("common.requestFailed")),
             })
             restoreInput()
           })
