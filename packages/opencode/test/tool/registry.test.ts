@@ -80,7 +80,6 @@ const withCodeMode = testEffect(
     ],
   ]),
 )
-<<<<<<< HEAD
 const withEmptyCodeMode = testEffect(
   LayerNode.compile(root, [
     [Config.node, configLayer],
@@ -95,7 +94,7 @@ const withEmptyCodeMode = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
-=======
+
 // Kill-switch fixture (T6.5 / design-final §2.5): subagent_max_depth = 1
 // removes the task tool even from the ROOT session (which never has a
 // persisted deny), so the resolve-time filter must be config-aware.
@@ -104,11 +103,11 @@ const killSwitchConfigLayer = TestConfig.layer({
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
 })
 const withKillSwitch = testEffect(
-  LayerNode.buildLayer(root, {
-    replacements: [LayerNode.replace(Config.node, killSwitchConfigLayer), replacements[1]!],
-  }),
+  LayerNode.compile(root, [
+    [Config.node, killSwitchConfigLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer()],
+  ]),
 )
->>>>>>> aa5e8b85ff (feat(opencode): open nested subagent spawning by default up to depth 5)
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -179,6 +178,83 @@ describe("tool.registry", () => {
 
       expect(task?.jsonSchema).toBeDefined()
       expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+    }),
+  )
+
+  // T6.5 (design-final §4.1, defense line 2): the resolve-time depth filter
+  // removes the task tool from the tool list at depth >= maxDepth, and the
+  // task description carries a depth hint on levels 2..max-1.
+  it.instance("filters task from the tool list at the maximum depth", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("build")
+      if (!build) throw new Error("build agent not found")
+      const ids = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+        depth: 5,
+      })).map((tool) => tool.id)
+
+      expect(ids).not.toContain("task")
+      expect(ids).toContain("read")
+    }),
+  )
+
+  it.instance("treats an unresolved lineage depth (Infinity) as at-limit", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("build")
+      if (!build) throw new Error("build agent not found")
+      const ids = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+        depth: Number.POSITIVE_INFINITY,
+      })).map((tool) => tool.id)
+
+      expect(ids).not.toContain("task")
+    }),
+  )
+
+  it.instance("keeps task below the limit and tells mid-level agents their depth", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("build")
+      if (!build) throw new Error("build agent not found")
+      const at = (depth?: number) =>
+        registry.tools({
+          providerID: ProviderV2.ID.opencode,
+          modelID: ModelV2.ID.make("test"),
+          agent: build,
+          ...(depth !== undefined ? { depth } : {}),
+        })
+      const tasks = yield* Effect.all([
+        at().then((tools) => tools.map((t) => t.id)),
+        at(3).then((tools) => tools.map((t) => t.id)),
+      ])
+
+      expect(tasks[0]).toContain("task")
+      expect(tasks[1]).toContain("task")
+    }),
+  )
+
+  withKillSwitch.instance("kill switch removes task from the ROOT session", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("build")
+      if (!build) throw new Error("build agent not found")
+      const ids = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+      })).map((tool) => tool.id)
+
+      expect(ids).not.toContain("task")
     }),
   )
 
