@@ -13,6 +13,7 @@ import { Session } from "@/session/session"
 import type { SessionPrompt } from "@/session/prompt"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionRunState } from "@/session/run-state"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionStatus } from "@/session/status"
 import { SubagentLimits } from "@/session/subagent-limits"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
@@ -50,6 +51,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Config.node,
       CrossSpawnSpawner.node,
       Session.node,
+      SessionProjector.node,
       SessionRunState.node,
       SessionStatus.node,
       Truncate.node,

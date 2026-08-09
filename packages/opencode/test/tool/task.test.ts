@@ -13,6 +13,7 @@ import { Session } from "@/session/session"
 import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionStatus } from "@/session/status"
 import { SubagentLimits } from "@/session/subagent-limits"
 import { TurnBudget } from "@/session/turn-budget"
@@ -44,6 +45,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Config.node,
       CrossSpawnSpawner.node,
       Session.node,
+      SessionProjector.node,
       SessionRunState.node,
       SessionStatus.node,
       Truncate.node,
